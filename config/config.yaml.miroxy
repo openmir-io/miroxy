@@ -1,0 +1,67 @@
+server:
+  port: 3333
+  # When a client sends an unknown model name, route to this model_name.
+  # Set ANTHROPIC_MODEL=miroxy in your shell to always use this default route.
+  default_model: miroxy
+  commands:
+    allow_dump: false    # /miroxy dump on|off — disabled by default (captures all traffic)
+
+admin:
+  enabled: true              # omit or set false to disable the admin server entirely
+  addr: "127.0.0.1:3334"    # localhost only; use 0.0.0.0:8090 inside containers/k8s
+
+log:
+  level: debug                          # debug | info | warn | error | fatal
+  file: ./miroxy.log            # optional; logs also go to stderr
+
+auth:
+  allowed_keys:
+    - ${MIROXY_CLIENT_KEY_1}
+    # - ${MIROXY_CLIENT_KEY_2}
+
+providers:
+  # DeepSeek via OpenAI-compatible endpoint
+  deepseek-openai:
+    base_url: https://api.deepseek.com/v1
+    protocol: openai
+    auth_style: bearer
+
+  # DeepSeek via Anthropic-compatible endpoint
+  deepseek-anthropic:
+    base_url: https://api.deepseek.com/anthropic
+    protocol: anthropic
+    auth_style: bearer
+
+  # Local Ollama (no auth)
+  ollama:
+    base_url: http://localhost:11434/v1
+    protocol: openai
+    auth_style: none
+
+keypools:
+  gemini-flash:
+    strategy: least_requests
+    circuit_break_threshold: 5
+    cooldown_seconds: 60
+    rate_limit_rpm: 20                # Gemini free tier flash limit
+    rate_soft_limit: 18
+    keys:
+      - ${GEMINI_KEY_1}
+      - ${GEMINI_KEY_2}
+      - ${GEMINI_KEY_3}
+
+  
+model_list:
+  - model_name: miroxy
+    description: "Default — balanced cost and quality"
+    routing:
+      strategy: fallback
+      targets:
+        - provider: gemini
+          provider_model: gemini-2.5-flash
+          keypool_ref: gemini-flash
+          timeout_seconds: 30
+
+metrics:
+  enabled: false
+  path: /metrics

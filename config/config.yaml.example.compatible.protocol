@@ -1,0 +1,105 @@
+# config.yaml.example.compatible.protocol
+# OpenAI-compatible and Anthropic-compatible third-party providers.
+# These services expose standard API protocols, so miroxy can route to them
+# without any special integration — just point api_base at their endpoint.
+#
+# Tested providers in this file:
+#   - DeepSeek (OpenAI protocol)
+#   - Grok / xAI (OpenAI protocol)
+#   - GLM / Zhipu AI (OpenAI protocol)
+#   - OpenRouter (OpenAI protocol, aggregator)
+#   - Corporate LLM gateway (OpenAI protocol)
+#   - Anthropic-compatible caching relay
+
+server:
+  default_model: miroxy
+
+auth:
+  allowed_keys:
+    - ${MIROXY_CLIENT_KEY}
+
+providers:
+  # ── DeepSeek ──────────────────────────────────────────────────────────────
+  # Native DeepSeek protocol (recommended — miroxy speaks deepseek natively)
+  deepseek: {}
+
+  # DeepSeek via OpenAI-compatible endpoint (alternative)
+  deepseek-openai:
+    base_url: https://api.deepseek.com/v1
+    protocol: openai
+    auth_style: bearer
+
+  # ── Grok / xAI ────────────────────────────────────────────────────────────
+  grok: {}    # built-in default: api.x.ai/v1, openai-compatible
+
+  # ── GLM / Zhipu AI ────────────────────────────────────────────────────────
+  glm: {}     # built-in default: api.z.ai/api/paas/v4
+
+  # ── OpenRouter (third-party aggregator) ───────────────────────────────────
+  # OpenRouter exposes an OpenAI-compatible API and routes to many providers.
+  # Set provider_model to the OpenRouter model name (e.g. "anthropic/claude-3-5-sonnet").
+  openrouter:
+    base_url: https://openrouter.ai/api/v1
+    protocol: openai
+    auth_style: bearer
+
+  # ── Corporate / internal LLM gateway ──────────────────────────────────────
+  # A company proxy that enforces policy and logging before hitting the real LLM.
+  # Replace the URL with your internal gateway address.
+  # corp-gateway:
+  #   base_url: https://llm-gateway.corp.internal/v1
+  #   protocol: openai
+  #   auth_style: bearer
+
+  # ── Anthropic-compatible caching relay ────────────────────────────────────
+  # A proxy that speaks Anthropic protocol and caches responses.
+  # miroxy detects client_protocol == protocol == anthropic and passthroughs.
+  # anthropic-relay:
+  #   base_url: https://anthropic-cache.internal
+  #   protocol: anthropic
+  #   auth_style: bearer
+
+keypools:
+  deepseek-pool:
+    strategy: round_robin
+    keys:
+      - main:   ${DEEPSEEK_KEY_1}
+      - backup: ${DEEPSEEK_KEY_2}
+
+  grok-pool:
+    keys:
+      - main_key: ${GROK_KEY}
+
+  glm-pool:
+    keys:
+      - main_key: ${GLM_KEY}
+
+  openrouter-pool:
+    keys:
+      - main_key: ${OPENROUTER_KEY}
+
+model_routes:
+  - model_name: miroxy
+    routing:
+      strategy: fallback
+      targets:
+        - provider: deepseek
+          provider_model: deepseek-chat
+          keypool_ref: deepseek-pool
+          timeout_seconds: 30
+        - provider: grok
+          provider_model: grok-3-mini
+          keypool_ref: grok-pool
+          timeout_seconds: 30
+
+  - model_name: miroxy-reasoning
+    provider: deepseek
+    provider_model: deepseek-reasoner
+    keypool_ref: deepseek-pool
+    timeout_seconds: 120
+
+  - model_name: miroxy-openrouter
+    provider: openrouter
+    provider_model: anthropic/claude-sonnet-4-5   # OpenRouter model name
+    keypool_ref: openrouter-pool
+    timeout_seconds: 60

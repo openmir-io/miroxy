@@ -1,0 +1,98 @@
+# config.yaml.example.n-keys.n-pools.n-providers.n-routermodels
+# Full configuration: multiple keypools, multiple providers, multiple route models.
+# Use case: enterprise setup with distinct routes for different workload types.
+#
+#   miroxy         → fast/cheap (Gemini Flash, fallback to DeepSeek)
+#   miroxy-code    → coding tasks (Claude Sonnet → Gemini Pro fallback)
+#   miroxy-think   → reasoning (DeepSeek R1 → Gemini Pro fallback)
+#   miroxy-fast    → cheapest/fastest (round-robin across Flash keys)
+
+server:
+  default_model: miroxy
+
+auth:
+  allowed_keys:
+    - ${MIROXY_CLIENT_KEY_1}
+    - ${MIROXY_CLIENT_KEY_2}
+
+providers:
+  gemini: {}
+  anthropic: {}
+  deepseek: {}
+
+keypools:
+  gemini-flash:
+    strategy: least_requests
+    rate_limit_rpm: 20
+    keys:
+      - key_1: ${GEMINI_KEY_1}
+      - key_2: ${GEMINI_KEY_2}
+      - key_3: ${GEMINI_KEY_3}
+
+  gemini-pro:
+    strategy: least_requests
+    rate_limit_rpm: 5
+    keys:
+      - pro_key: ${GEMINI_PRO_KEY}
+
+  anthropic-pool:
+    strategy: least_requests
+    keys:
+      - main:   ${ANTHROPIC_KEY_1}
+      - backup: ${ANTHROPIC_KEY_2}
+
+  deepseek-pool:
+    strategy: round_robin
+    keys:
+      - ds_key_1: ${DEEPSEEK_KEY_1}
+      - ds_key_2: ${DEEPSEEK_KEY_2}
+
+model_routes:
+  # Default: fast + cheap, Gemini Flash with DeepSeek fallback
+  - model_name: miroxy
+    routing:
+      strategy: fallback
+      targets:
+        - provider: gemini
+          provider_model: gemini-2.5-flash
+          keypool_ref: gemini-flash
+          timeout_seconds: 30
+        - provider: deepseek
+          provider_model: deepseek-chat
+          keypool_ref: deepseek-pool
+          timeout_seconds: 30
+
+  # Coding: Claude Sonnet first (best for code), Gemini Pro fallback
+  - model_name: miroxy-code
+    routing:
+      strategy: fallback
+      targets:
+        - provider: anthropic
+          provider_model: claude-sonnet-4-6
+          keypool_ref: anthropic-pool
+          timeout_seconds: 60
+        - provider: gemini
+          provider_model: gemini-2.5-pro
+          keypool_ref: gemini-pro
+          timeout_seconds: 60
+
+  # Reasoning: DeepSeek R1 first, Gemini Pro fallback
+  - model_name: miroxy-think
+    routing:
+      strategy: fallback
+      targets:
+        - provider: deepseek
+          provider_model: deepseek-reasoner
+          keypool_ref: deepseek-pool
+          timeout_seconds: 120
+        - provider: gemini
+          provider_model: gemini-2.5-pro
+          keypool_ref: gemini-pro
+          timeout_seconds: 120
+
+  # Throughput: round-robin across Gemini Flash keys
+  - model_name: miroxy-fast
+    provider: gemini
+    provider_model: gemini-2.5-flash
+    keypool_ref: gemini-flash
+    timeout_seconds: 20

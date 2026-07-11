@@ -1,0 +1,10 @@
+# oapi-codegen v2 configuration for miroxy admin API.
+# Usage: make gen
+# Docs: https://github.com/oapi-codegen/oapi-codegen#configuration-file
+
+package: api
+output: admin_api.gen.go
+
+generate:
+  models: true          # request/response types from components.schemas
+  embedded-spec: false  # skip embedding raw spec (saves binary size)

@@ -1,0 +1,347 @@
+package server
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"log/slog"
+	"net/http"
+	"strings"
+	"time"
+
+	"miroxy/core/selector"
+	"miroxy/internal/idgen"
+	"miroxy/internal/irc"
+	"miroxy/internal/pipeline"
+	"miroxy/internal/stats"
+	"miroxy/internal/types"
+)
+
+// --- UpstreamExecutor (pipeline plugin) ---
+
+// keyAttempt records the outcome of one upstream call for error reporting.
+type keyAttempt struct {
+	keyID  string
+	status int
+	msg    string
+	body   []byte // raw upstream response body (for invisible pass-through)
+}
+
+// allKeysFailed builds the error returned when every retry attempt ended in failure.
+func allKeysFailed(modelName, providerModel string, attempts []keyAttempt, invisible bool) *pipeline.PipelineError {
+	if invisible && len(attempts) > 0 {
+		last := attempts[len(attempts)-1]
+		return &pipeline.PipelineError{
+			Status:  last.status,
+			RawBody: last.body,
+		}
+	}
+	parts := make([]string, len(attempts))
+	for i, a := range attempts {
+		parts[i] = fmt.Sprintf("%s: %d %s", a.keyID, a.status, a.msg)
+	}
+	msg := fmt.Sprintf("%s <=> %s - %s", modelName, providerModel, strings.Join(parts, "; "))
+	return &pipeline.PipelineError{
+		Status:  http.StatusServiceUnavailable,
+		ErrType: "overloaded_error",
+		Msg:     msg,
+	}
+}
+
+// maxRetries caps the retry loop. ErrNoSelection terminates early when all keys are exhausted.
+const maxRetries = 10
+
+// UpstreamExecutor is the terminal pipeline plugin. It owns the retry loops for
+// both streaming and non-streaming upstream calls, using c.Target.Dispatcher for
+// physical transport (HTTPDispatcher by default; future: SDKDispatcher for AWS Bedrock).
+type UpstreamExecutor struct {
+	probers map[string]*keyProber
+	stats   *stats.Registry
+}
+
+func newUpstreamExecutor(probers map[string]*keyProber, reg *stats.Registry) *UpstreamExecutor {
+	return &UpstreamExecutor{probers: probers, stats: reg}
+}
+
+func (e *UpstreamExecutor) Name() string  { return "upstream" }
+func (e *UpstreamExecutor) Priority() int { return pipeline.PriorityTerminal }
+
+func (e *UpstreamExecutor) Execute(c *pipeline.LLMContext, _ pipeline.Handler) error {
+	if c.Request.Stream {
+		return e.executeStream(c)
+	}
+	return e.executeNonStream(c)
+}
+
+// --- Non-streaming retry loop ---
+
+func (e *UpstreamExecutor) executeNonStream(c *pipeline.LLMContext) error {
+	ctx, cancel := context.WithTimeout(c.RequestCtx, c.Target.Timeout)
+	defer cancel()
+
+	sel := c.Target.Selector
+	req := c.Request
+	if req.MaxTokens <= 0 {
+		req.MaxTokens = 1024
+	}
+	model := c.Target.Model
+	invisible := c.Target.Invisible
+
+	var attempts []keyAttempt
+
+	for attempt := range maxRetries {
+		slog.Debug("upstream attempt", "attempt", attempt+1, "max", maxRetries, "model", model.Name)
+
+		plan, err := sel.Select(ctx, req)
+		if errors.Is(err, selector.ErrNoSelection) {
+			slog.Debug("upstream: no healthy credential available",
+				"attempt", attempt+1, "model", model.Name, "past_attempts", len(attempts))
+			if p := e.probers[model.Name]; p != nil {
+				p.trigger()
+			}
+			return allKeysFailed(model.Name, model.ProviderModel, attempts, invisible)
+		}
+		slog.Debug("upstream key selected", "attempt", attempt+1, "key_id", plan.SelectionID, "model", model.Name)
+
+		upstreamReq, err := plan.Upstream.ToUpstream(ctx, req, plan.Credential)
+		if err != nil {
+			sel.Release(plan, nil)
+			return &pipeline.PipelineError{Status: http.StatusBadRequest, ErrType: "invalid_request_error", Msg: err.Error()}
+		}
+
+		resp, err := c.Target.Dispatcher.Do(ctx, upstreamReq)
+		if err != nil {
+			sel.Release(plan, err)
+			attempts = append(attempts, keyAttempt{keyID: plan.SelectionID, status: http.StatusBadGateway, msg: err.Error()})
+			slog.Warn("upstream request failed, retrying", "attempt", attempt+1, "error", err)
+			continue
+		}
+
+		if resp.StatusCode == 429 || resp.StatusCode >= 500 {
+			body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+			resp.Body.Close()
+			trimmed := string(bytes.TrimSpace(body))
+			attempts = append(attempts, keyAttempt{keyID: plan.SelectionID, status: resp.StatusCode, msg: trimmed, body: body})
+			if resp.StatusCode == 429 {
+				sel.Release(plan, &selector.RateLimitError{RetryAfter: parseRetryDelay(body)})
+				slog.Warn("upstream rate limited (429), retrying with next key", "attempt", attempt+1, "model", model.Name)
+			} else {
+				sel.Release(plan, &selector.ServerOverloadError{})
+				slog.Warn("upstream 5xx, parking key and retrying with next",
+					"attempt", attempt+1, "status", resp.StatusCode, "key_id", plan.SelectionID, "model", model.Name)
+			}
+			continue
+		}
+
+		anthropicResp, err := plan.Upstream.FromUpstream(resp)
+		if err != nil {
+			var upstreamErr *irc.UpstreamError
+			if errors.As(err, &upstreamErr) {
+				switch {
+				case upstreamErr.HTTPStatus == 429:
+					attempts = append(attempts, keyAttempt{keyID: plan.SelectionID, status: 429, msg: upstreamErr.Message})
+					sel.Release(plan, &selector.RateLimitError{})
+					slog.Warn("upstream body 429 (relay pattern), rate-limit cooldown applied", "attempt", attempt+1, "model", model.Name)
+				case upstreamErr.HTTPStatus >= 500:
+					attempts = append(attempts, keyAttempt{keyID: plan.SelectionID, status: upstreamErr.HTTPStatus, msg: upstreamErr.Message})
+					sel.Release(plan, &selector.ServerOverloadError{})
+					slog.Warn("upstream body 5xx (relay pattern), parking key and retrying with next",
+						"attempt", attempt+1, "status", upstreamErr.HTTPStatus, "key_id", plan.SelectionID, "model", model.Name)
+				default:
+					sel.Release(plan, nil)
+					return &pipeline.PipelineError{Status: http.StatusBadRequest, ErrType: "api_error", Msg: upstreamErr.Message}
+				}
+				continue
+			}
+			attempts = append(attempts, keyAttempt{keyID: plan.SelectionID, status: http.StatusBadGateway, msg: err.Error()})
+			sel.Release(plan, err)
+			slog.Warn("upstream response error, retrying",
+				"attempt", attempt+1, "key_id", plan.SelectionID, "model", model.Name, "error", err)
+			continue
+		}
+
+		sel.Release(plan, nil)
+		anthropicResp.Model = req.Model
+		slog.Debug("non-stream response",
+			"model", req.Model,
+			"stop_reason", anthropicResp.StopReason,
+			"input_tokens", anthropicResp.Usage.InputTokens,
+			"output_tokens", anthropicResp.Usage.OutputTokens,
+		)
+		if e.stats != nil {
+			e.stats.Record(req.Model, plan.SelectionID,
+				int64(anthropicResp.Usage.InputTokens),
+				int64(anthropicResp.Usage.OutputTokens))
+		}
+		c.Response = anthropicResp
+		return nil
+	}
+
+	return allKeysFailed(model.Name, model.ProviderModel, attempts, invisible)
+}
+
+// --- Streaming retry loop ---
+
+func (e *UpstreamExecutor) executeStream(c *pipeline.LLMContext) error {
+	ctx, cancel := context.WithTimeout(c.RequestCtx, c.Target.Timeout)
+
+	sel := c.Target.Selector
+	req := c.Request
+	if req.MaxTokens <= 0 {
+		req.MaxTokens = 1024
+	}
+	model := c.Target.Model
+	invisible := c.Target.Invisible
+
+	var (
+		plan     *selector.ExecutionPlan
+		resp     *http.Response
+		attempts []keyAttempt
+	)
+
+	for attempt := range maxRetries {
+		slog.Debug("stream upstream attempt", "attempt", attempt+1, "max", maxRetries, "model", model.Name)
+
+		p, err := sel.Select(ctx, req)
+		if errors.Is(err, selector.ErrNoSelection) {
+			slog.Debug("stream: no healthy credential available",
+				"attempt", attempt+1, "model", model.Name, "past_attempts", len(attempts))
+			if pr := e.probers[model.Name]; pr != nil {
+				pr.trigger()
+			}
+			cancel()
+			return allKeysFailed(model.Name, model.ProviderModel, attempts, invisible)
+		}
+		slog.Debug("stream key selected", "attempt", attempt+1, "key_id", p.SelectionID, "model", model.Name)
+
+		upstreamReq, err := p.Upstream.ToUpstreamStream(ctx, req, p.Credential)
+		if err != nil {
+			sel.Release(p, nil)
+			cancel()
+			return &pipeline.PipelineError{Status: http.StatusBadRequest, ErrType: "invalid_request_error", Msg: err.Error()}
+		}
+
+		upstreamResp, err := c.Target.Dispatcher.Do(ctx, upstreamReq)
+		if err != nil {
+			sel.Release(p, err)
+			attempts = append(attempts, keyAttempt{keyID: p.SelectionID, status: http.StatusBadGateway, msg: err.Error()})
+			slog.Warn("stream upstream request failed, retrying", "attempt", attempt+1, "error", err)
+			continue
+		}
+
+		if upstreamResp.StatusCode == 429 {
+			body, _ := io.ReadAll(io.LimitReader(upstreamResp.Body, 4096))
+			upstreamResp.Body.Close()
+			trimmed := string(bytes.TrimSpace(body))
+			attempts = append(attempts, keyAttempt{keyID: p.SelectionID, status: 429, msg: trimmed, body: body})
+			sel.Release(p, &selector.RateLimitError{RetryAfter: parseRetryDelay(body)})
+			slog.Warn("stream upstream rate-limited (429), retrying with next key", "attempt", attempt+1, "model", model.Name)
+			continue
+		}
+		if upstreamResp.StatusCode >= 500 {
+			body, _ := io.ReadAll(io.LimitReader(upstreamResp.Body, 4096))
+			upstreamResp.Body.Close()
+			trimmed := string(bytes.TrimSpace(body))
+			attempts = append(attempts, keyAttempt{keyID: p.SelectionID, status: upstreamResp.StatusCode, msg: trimmed, body: body})
+			sel.Release(p, &selector.ServerOverloadError{})
+			slog.Warn("stream upstream 5xx, parking key and retrying with next",
+				"attempt", attempt+1, "status", upstreamResp.StatusCode, "key_id", p.SelectionID, "model", model.Name)
+			continue
+		}
+		if upstreamResp.StatusCode >= 400 {
+			body, _ := io.ReadAll(io.LimitReader(upstreamResp.Body, 4096))
+			upstreamResp.Body.Close()
+			slog.Debug("stream upstream 4xx (non-retryable)",
+				"attempt", attempt+1, "status", upstreamResp.StatusCode, "key_id", p.SelectionID, "model", model.Name)
+			sel.Release(p, nil)
+			cancel()
+			return &pipeline.PipelineError{
+				Status:  http.StatusBadRequest,
+				ErrType: "api_error",
+				Msg:     fmt.Sprintf("upstream error %d: %s", upstreamResp.StatusCode, bytes.TrimSpace(body)),
+			}
+		}
+
+		plan = p
+		resp = upstreamResp
+		break
+	}
+
+	if plan == nil {
+		cancel()
+		return allKeysFailed(model.Name, model.ProviderModel, attempts, invisible)
+	}
+
+	msgID := idgen.NewMsgID()
+	slog.Debug("stream starting", "model", req.Model, "key_id", plan.SelectionID, "msg_id", msgID)
+	events, _ := plan.Upstream.StreamFromUpstream(ctx, resp, msgID, req.Model)
+	if e.stats != nil {
+		events = trackUsageStream(events, e.stats, req.Model, plan.SelectionID)
+	}
+
+	c.SetStream(events, func(streamErr error) {
+		sel.Release(plan, streamErr)
+		cancel()
+	})
+	return nil
+}
+
+// trackUsageStream wraps a SSE event channel, accumulates token usage from
+// message_start (input) and message_delta (output) events, and records the
+// totals to reg when the channel closes.
+func trackUsageStream(src <-chan types.SSEEvent, reg *stats.Registry, model, keyID string) <-chan types.SSEEvent {
+	out := make(chan types.SSEEvent, 64)
+	go func() {
+		defer close(out)
+		var totalIn, totalOut int64
+		for ev := range src {
+			switch ev.Event {
+			case "message_start":
+				if ms, ok := ev.Data.(types.MessageStartData); ok {
+					totalIn += int64(ms.Message.Usage.InputTokens)
+				}
+			case "message_delta":
+				if md, ok := ev.Data.(types.MessageDeltaData); ok {
+					totalOut += int64(md.Usage.OutputTokens)
+				}
+			}
+			out <- ev
+		}
+		if totalIn > 0 || totalOut > 0 {
+			reg.Record(model, keyID, totalIn, totalOut)
+		}
+	}()
+	return out
+}
+
+// --- parseRetryDelay ---
+// Extracts the retry wait duration from a Gemini 429 response body.
+// Gemini encodes it as a duration string in RetryInfo: {"error":{"details":[{"retryDelay":"42s"}]}}.
+func parseRetryDelay(body []byte) time.Duration {
+	var payload struct {
+		Error struct {
+			Details []json.RawMessage `json:"details"`
+		} `json:"error"`
+	}
+	if json.Unmarshal(body, &payload) != nil {
+		return 0
+	}
+	var detail struct {
+		RetryDelay string `json:"retryDelay"`
+	}
+	for _, raw := range payload.Error.Details {
+		if json.Unmarshal(raw, &detail) != nil || detail.RetryDelay == "" {
+			continue
+		}
+		d, err := time.ParseDuration(detail.RetryDelay)
+		if err != nil || d <= 0 {
+			continue
+		}
+		slog.Debug("parsed retryDelay from 429 body", "retryDelay", detail.RetryDelay, "duration", d)
+		return d
+	}
+	return 0
+}

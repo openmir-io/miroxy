@@ -1,0 +1,134 @@
+// ir.proto — Miroxy Intermediate Representation schema
+//
+// This file is the source of truth for the IR type contract.
+// The Go structs in ir.go are hand-written to match this schema.
+//
+// At Epic 2 start:
+//   1. Install protoc + protoc-gen-go
+//   2. Run: protoc --go_out=pb --go_opt=paths=source_relative ir.proto
+//   3. Replace ir.go hand-written structs with generated pb.go types
+//   4. Move this repo to miroxy-ir
+
+syntax = "proto3";
+package miroxy.ir.v1;
+option go_package = "miroxy/internal/ir/pb";
+
+// IRRequest is the normalized form of an Anthropic MessageRequest.
+// All format ambiguities are resolved at the FromRequest() boundary.
+message IRRequest {
+    string              system      = 1;
+    repeated IRMessage  messages    = 2;
+    repeated IRTool     tools       = 3;
+    optional IRToolChoice tool_choice = 4;
+    IRGenerationConfig  gen         = 5;
+    bool                stream      = 6;
+}
+
+message IRMessage {
+    string                 role  = 1; // "user" | "assistant"
+    repeated IRContentPart parts = 2;
+}
+
+message IRContentPart {
+    oneof part {
+        IRTextPart       text        = 1;
+        IRToolUsePart    tool_use    = 2;
+        IRToolResultPart tool_result = 3;
+    }
+}
+
+message IRTextPart {
+    string text = 1;
+}
+
+message IRToolUsePart {
+    string id         = 1;
+    string name       = 2;
+    bytes  input_json = 3; // JSON-encoded object
+}
+
+message IRToolResultPart {
+    reserved 2; // was function_name — resolved in the provider converter (IR stays neutral)
+    string                 tool_use_id    = 1;
+    repeated IRContentPart content        = 3;
+    bool                   is_error       = 4;
+}
+
+message IRTool {
+    string name              = 1;
+    string description       = 2;
+    bytes  input_schema_json = 3; // JSON Schema, passed through verbatim
+}
+
+message IRToolChoice {
+    string type = 1; // "auto" | "any" | "tool" | "none"
+    string name = 2; // only when type="tool"
+}
+
+message IRGenerationConfig {
+    optional float  temperature = 1;
+    optional float  top_p       = 2;
+    optional int32  top_k       = 3;
+    optional int32  max_tokens  = 4;
+    repeated string stop_seqs   = 5;
+}
+
+// --- Response ---
+
+message IRResponse {
+    repeated IRResponseBlock content     = 1;
+    string                   stop_reason = 2;
+    optional string          stop_seq    = 3;
+    IRUsage                  usage       = 4;
+}
+
+message IRResponseBlock {
+    oneof block {
+        IRTextPart    text     = 1;
+        IRToolUsePart tool_use = 2;
+    }
+}
+
+message IRUsage {
+    int32 input_tokens  = 1;
+    int32 output_tokens = 2;
+}
+
+// --- gRPC service (for miroxy-ir sidecar, Epic 3) ---
+
+service TranslatorService {
+    rpc Translate(TranslateRequest)       returns (TranslateResponse);
+    rpc TranslateStream(TranslateRequest) returns (stream IRStreamEvent);
+    rpc HealthCheck(HealthRequest)        returns (HealthResponse);
+    rpc GetCapabilities(CapRequest)       returns (Capabilities);
+}
+
+message TranslateRequest {
+    IRRequest request   = 1;
+    Direction direction = 2;
+    string    provider  = 3;
+}
+
+message TranslateResponse {
+    IRResponse response = 1;
+}
+
+message IRStreamEvent {
+    string event_type = 1;
+    bytes  data_json  = 2;
+}
+
+enum Direction {
+    TO_UPSTREAM   = 0;
+    FROM_UPSTREAM = 1;
+}
+
+message HealthRequest  {}
+message HealthResponse { bool ok = 1; }
+message CapRequest     {}
+message Capabilities {
+    bool  vision      = 1;
+    bool  tool_use    = 2;
+    bool  thinking    = 3;
+    int32 max_context = 4;
+}

@@ -1,0 +1,7 @@
+# Operator-supplied config and secrets — never commit
+config/config.yaml
+config/secrets.env
+
+# Go build output
+/miroxy
+build/

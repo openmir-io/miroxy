@@ -1,0 +1,473 @@
+openapi: "3.0.3"
+
+info:
+  title: miroxy Admin API
+  version: "1.0"
+  description: |
+    Runtime management and observability API for a running miroxy instance.
+    Served on the admin port (default 127.0.0.1:9001), never the proxy port.
+
+    **Authentication**
+
+    All `/v1/config/*` endpoints accept either:
+    - `Authorization: Bearer <token>` where token is any value from `auth.allowed_keys`
+    - `X-Admin-Token: <token>` using the admin session token
+
+    `/health`, `/stat`, and `/admin/*` management endpoints have their own
+    auth rules (see individual operation descriptions).
+
+servers:
+  - url: http://127.0.0.1:9001
+    description: Local admin server (default)
+
+security:
+  - BearerAuth: []
+
+components:
+  responses:
+    Unauthorized:
+      description: Missing or invalid authentication token.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      description: Any value from auth.allowed_keys OR the admin session token.
+
+    AdminToken:
+      type: apiKey
+      in: header
+      name: X-Admin-Token
+      description: Admin session token obtained from POST /admin/login.
+
+  schemas:
+    ProviderDef:
+      type: object
+      description: Connection parameters for an upstream LLM provider.
+      properties:
+        base_url:
+          type: string
+          example: "https://generativelanguage.googleapis.com"
+        protocol:
+          type: string
+          enum: [gemini, openai, anthropic, deepseek, glm, grok]
+          example: gemini
+        auth_style:
+          type: string
+          enum: [bearer, api_key, none, query_key]
+          example: query_key
+
+    KeyEntry:
+      type: object
+      properties:
+        name:
+          type: string
+          example: "key_alice"
+        key:
+          type: string
+          description: Masked — only last 4 characters are visible.
+          example: "****5678"
+
+    KeyPool:
+      type: object
+      properties:
+        provider:
+          type: string
+          description: Provider tag for auto-discovery (anthropic | openai).
+          example: "gemini"
+        strategy:
+          type: string
+          enum: [round_robin, least_requests]
+        circuit_break_threshold:
+          type: integer
+        cooldown_seconds:
+          type: integer
+        rate_limit_rpm:
+          type: integer
+        keys:
+          type: array
+          items:
+            $ref: "#/components/schemas/KeyEntry"
+
+    RoutingTarget:
+      type: object
+      properties:
+        provider:
+          type: string
+        provider_model:
+          type: string
+        keypool_ref:
+          type: string
+        timeout_seconds:
+          type: integer
+
+    RoutingConfig:
+      type: object
+      properties:
+        strategy:
+          type: string
+          enum: [fallback, round_robin, least_requests]
+        targets:
+          type: array
+          items:
+            $ref: "#/components/schemas/RoutingTarget"
+
+    ModelRoute:
+      type: object
+      properties:
+        model_name:
+          type: string
+          example: "miroxy"
+        display_name:
+          type: string
+          example: "Gemini 2.5 Flash (via miroxy)"
+        provider:
+          type: string
+          example: "gemini"
+        provider_model:
+          type: string
+          example: "gemini-2.5-flash"
+        protocol:
+          type: string
+          description: Resolved protocol after applying provider defaults.
+        api_base:
+          type: string
+          description: Resolved base URL after applying provider defaults.
+        auth_style:
+          type: string
+        keypool_ref:
+          type: string
+        routing:
+          $ref: "#/components/schemas/RoutingConfig"
+
+    KeyUsage:
+      type: object
+      properties:
+        name:
+          type: string
+        input_tokens:
+          type: integer
+          format: int64
+        output_tokens:
+          type: integer
+          format: int64
+        requests:
+          type: integer
+          format: int64
+
+    ModelUsage:
+      type: object
+      properties:
+        model:
+          type: string
+        input_tokens:
+          type: integer
+          format: int64
+        output_tokens:
+          type: integer
+          format: int64
+        requests:
+          type: integer
+          format: int64
+        keys:
+          type: array
+          items:
+            $ref: "#/components/schemas/KeyUsage"
+
+    UsageStats:
+      type: object
+      properties:
+        total_input_tokens:
+          type: integer
+          format: int64
+        total_output_tokens:
+          type: integer
+          format: int64
+        total_tokens:
+          type: integer
+          format: int64
+        total_requests:
+          type: integer
+          format: int64
+        by_model:
+          type: array
+          items:
+            $ref: "#/components/schemas/ModelUsage"
+
+    CompressStats:
+      type: object
+      properties:
+        enabled:
+          type: boolean
+        requests:
+          type: integer
+          format: int64
+        original_tokens:
+          type: integer
+          format: int64
+        compressed_tokens:
+          type: integer
+          format: int64
+        saved_tokens:
+          type: integer
+          format: int64
+        reduction_pct:
+          type: number
+          format: double
+        latency_p50_ms:
+          type: number
+          format: double
+        latency_p95_ms:
+          type: number
+          format: double
+        latency_max_ms:
+          type: number
+          format: double
+
+    StatusResponse:
+      type: object
+      properties:
+        uptime:
+          type: string
+          example: "2h34m15s"
+        in_flight:
+          type: integer
+        config:
+          type: string
+          description: Path to the loaded config file.
+        usage:
+          $ref: "#/components/schemas/UsageStats"
+        compress:
+          $ref: "#/components/schemas/CompressStats"
+
+    ConfigFull:
+      type: object
+      description: Complete effective configuration with all defaults resolved and keys masked.
+      properties:
+        server:
+          type: object
+        admin:
+          type: object
+        log:
+          type: object
+        auth:
+          type: object
+        compress:
+          type: object
+        dump:
+          type: object
+        metrics:
+          type: object
+        providers:
+          type: object
+          additionalProperties:
+            $ref: "#/components/schemas/ProviderDef"
+        keypools:
+          type: object
+          additionalProperties:
+            $ref: "#/components/schemas/KeyPool"
+        model_routes:
+          type: array
+          items:
+            $ref: "#/components/schemas/ModelRoute"
+
+    Error:
+      type: object
+      properties:
+        type:
+          type: string
+          example: "error"
+        error:
+          type: object
+          properties:
+            type:
+              type: string
+              example: "auth_error"
+            message:
+              type: string
+
+paths:
+  /health:
+    get:
+      operationId: getHealth
+      summary: Liveness probe
+      description: Returns 200 when the admin server is up. No authentication required.
+      security: []
+      responses:
+        "200":
+          description: Server is healthy.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: "ok"
+
+  /stat:
+    get:
+      operationId: getStat
+      summary: Runtime status and token usage
+      description: Returns uptime, in-flight request count, token usage by model/key, and compression stats.
+      responses:
+        "200":
+          description: Status response.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StatusResponse"
+        "401":
+          description: Unauthorized.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /v1/config:
+    get:
+      operationId: getConfig
+      summary: Full effective configuration
+      description: |
+        Returns the complete runtime configuration with all provider defaults resolved
+        and API keys masked (last 4 characters visible). Equivalent to `kubectl get -o yaml`.
+        Includes auto-discovered model routes injected at startup.
+      responses:
+        "200":
+          description: Full effective config.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ConfigFull"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /v1/config/providers:
+    get:
+      operationId: getConfigProviders
+      summary: Resolved provider definitions
+      description: |
+        Returns the providers block with all defaults filled in from built-in constants.
+        Useful for verifying that provider base_url / protocol / auth_style are correct.
+      responses:
+        "200":
+          description: Provider definitions.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  providers:
+                    type: object
+                    additionalProperties:
+                      $ref: "#/components/schemas/ProviderDef"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /v1/config/keypools:
+    get:
+      operationId: getConfigKeypools
+      summary: Keypool configuration (keys masked)
+      description: |
+        Returns all configured keypools. API key values are masked — only the last
+        4 characters are visible (e.g. `****5678`). Shows strategy, circuit-break
+        settings, and rate limits alongside masked key entries.
+      responses:
+        "200":
+          description: Keypool configuration.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  keypools:
+                    type: object
+                    additionalProperties:
+                      $ref: "#/components/schemas/KeyPool"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /v1/config/routes:
+    get:
+      operationId: getConfigRoutes
+      summary: Model routes (including auto-discovered)
+      description: |
+        Returns all model routes with resolved protocol, api_base, and auth_style.
+        Includes routes injected at startup by auto-discovery (model_discovery: auto).
+        Passthrough routes (created from provider-tagged keypools) are also listed.
+      responses:
+        "200":
+          description: Model routes and providers.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  providers:
+                    type: object
+                    additionalProperties:
+                      $ref: "#/components/schemas/ProviderDef"
+                  model_routes:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/ModelRoute"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /admin/reload:
+    post:
+      operationId: adminReload
+      summary: Hot-reload configuration
+      description: Re-reads config.yaml from disk and atomically swaps the routing state. In-flight requests are not interrupted.
+      security:
+        - AdminToken: []
+      responses:
+        "200":
+          description: Reload result.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                  added:
+                    type: array
+                    items:
+                      type: string
+                  removed:
+                    type: array
+                    items:
+                      type: string
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /admin/proxy/stop:
+    post:
+      operationId: adminProxyStop
+      summary: Stop the proxy listener
+      description: Closes the proxy port. In-flight requests drain normally.
+      security:
+        - AdminToken: []
+      responses:
+        "200":
+          description: Proxy stopped.
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /admin/proxy/start:
+    post:
+      operationId: adminProxyStart
+      summary: Start the proxy listener
+      description: Reopens the proxy port after a stop.
+      security:
+        - AdminToken: []
+      responses:
+        "200":
+          description: Proxy started.
+        "401":
+          $ref: "#/components/responses/Unauthorized"

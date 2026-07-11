@@ -1,0 +1,34 @@
+# config.yaml.example.n-keys.1-pool
+# Multiple API keys in one keypool, one provider, one route model.
+# Use case: you have several Gemini keys and want miroxy to rotate between them.
+# miroxy picks the key with fewest active requests (least_requests) and backs off
+# automatically on 429s — no changes needed when keys hit rate limits.
+
+server:
+  default_model: miroxy
+
+auth:
+  allowed_keys:
+    - ${MIROXY_CLIENT_KEY}
+
+providers:
+  gemini: {}
+
+keypools:
+  gemini-pool:
+    strategy: least_requests       # pick key with fewest in-flight requests
+    circuit_break_threshold: 5     # mark key unhealthy after 5 consecutive failures
+    cooldown_seconds: 60
+    rate_limit_rpm: 20             # Gemini free tier: 20 req/min per key
+    rate_soft_limit: 18            # rotate proactively at 18 to stay under limit
+    keys:
+      - key_alice:   ${GEMINI_KEY_1}
+      - key_bob:     ${GEMINI_KEY_2}
+      - key_charlie: ${GEMINI_KEY_3}
+
+model_routes:
+  - model_name: miroxy
+    provider: gemini
+    provider_model: gemini-2.5-flash
+    keypool_ref: gemini-pool
+    timeout_seconds: 30

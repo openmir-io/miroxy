@@ -1,0 +1,93 @@
+# config.yaml.example.local.protocol
+# Local / self-hosted LLM configurations.
+# WARNING: These are provided as reference — not all have been tested.
+#          Model name compatibility with Anthropic clients depends on the
+#          local server's response format. Adjust as needed.
+#
+# Covered:
+#   - Ollama (OpenAI-compatible)
+#   - LM Studio (OpenAI-compatible)
+#   - vLLM (OpenAI-compatible)
+#   - LocalAI (OpenAI-compatible)
+
+server:
+  default_model: local
+
+auth:
+  allowed_keys:
+    - ${MIROXY_CLIENT_KEY}
+
+providers:
+  # ── Ollama ────────────────────────────────────────────────────────────────
+  # Run locally: `ollama pull llama3` then `ollama serve`
+  # Default port: 11434. No auth needed for local use.
+  ollama:
+    base_url: http://localhost:11434/v1
+    protocol: openai
+    auth_style: none
+
+  # ── LM Studio ─────────────────────────────────────────────────────────────
+  # Enable the local server in LM Studio, then use its OpenAI-compatible API.
+  # Default port: 1234. No auth for local use.
+  lmstudio:
+    base_url: http://localhost:1234/v1
+    protocol: openai
+    auth_style: none
+
+  # ── vLLM ──────────────────────────────────────────────────────────────────
+  # High-performance inference server with OpenAI-compatible API.
+  # Typical deployment: `python -m vllm.entrypoints.openai.api_server --model <model>`
+  vllm:
+    base_url: http://localhost:8000/v1
+    protocol: openai
+    auth_style: none     # or "bearer" if you configured --api-key
+
+  # ── LocalAI ───────────────────────────────────────────────────────────────
+  # Self-hosted, GPU-optional. OpenAI-compatible.
+  localai:
+    base_url: http://localhost:8080/v1
+    protocol: openai
+    auth_style: none
+
+keypools:
+  ollama-local:
+    keys:
+      - local: "ollama"    # placeholder — ollama ignores the key value
+
+  lmstudio-local:
+    keys:
+      - local: "lmstudio"
+
+  vllm-local:
+    keys:
+      - local: ${VLLM_API_KEY}    # set to "none" or your configured key
+
+  localai-local:
+    keys:
+      - local: "localai"
+
+model_routes:
+  # Ollama: set provider_model to the name you pulled (e.g. llama3, mistral, phi3)
+  - model_name: local
+    provider: ollama
+    provider_model: llama3.2        # `ollama list` to see available models
+    keypool_ref: ollama-local
+    timeout_seconds: 120            # local models can be slow on first token
+
+  - model_name: local-fast
+    provider: ollama
+    provider_model: phi3            # smaller, faster model
+    keypool_ref: ollama-local
+    timeout_seconds: 60
+
+  - model_name: local-lmstudio
+    provider: lmstudio
+    provider_model: local-model     # matches the model loaded in LM Studio
+    keypool_ref: lmstudio-local
+    timeout_seconds: 120
+
+  - model_name: local-vllm
+    provider: vllm
+    provider_model: meta-llama/Meta-Llama-3-8B-Instruct
+    keypool_ref: vllm-local
+    timeout_seconds: 60

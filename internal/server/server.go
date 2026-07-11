@@ -1,0 +1,744 @@
+package server
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"net/http"
+	"strings"
+	"sync/atomic"
+	"time"
+
+	"miroxy/core/cred"
+	coredown "miroxy/core/downstream"
+	"miroxy/core/dispatch"
+	"miroxy/core/router"
+	"miroxy/core/rpc"
+	"miroxy/core/selector"
+	coreup "miroxy/core/upstream"
+	"miroxy/internal/auth"
+	"miroxy/internal/compress"
+	"miroxy/internal/config"
+	intcred "miroxy/internal/cred"
+	intdown "miroxy/internal/downstream"
+	ccomp "miroxy/core/compress"
+	"miroxy/internal/dump"
+	"miroxy/internal/stats"
+	"encoding/json"
+	"miroxy/internal/idgen"
+	"miroxy/internal/pipeline"
+	"miroxy/internal/types"
+	intup "miroxy/internal/upstream"
+)
+
+// routingState is swapped atomically on hot reload.
+// All maps are read together so they stay consistent.
+type routingState struct {
+	selectors            map[string]selector.Selector
+	timeouts             map[string]time.Duration
+	// passthroughSelectors handles models not in model_routes.
+	// Keyed by provider name ("anthropic", "openai").
+	// Built from keypools that carry a provider: tag.
+	passthroughSelectors map[string]selector.Selector
+}
+
+// Server is the miroxy HTTP server.
+type Server struct {
+	mux        *http.ServeMux
+	cfgPath    string                        // config file path for reload
+	cfg        atomic.Pointer[config.Config] // swapped atomically on reload
+	routing    atomic.Pointer[routingState]  // selectors + timeouts, swapped atomically
+	pipe       *pipeline.Pipeline
+	dispatcher dispatch.Dispatcher
+	inFlight   atomic.Int64 // count of active requests, used for graceful shutdown logging
+	dumpStore     dump.Store        // nil when dump is disabled
+	tokenStats    *stats.Registry  // in-process token usage counters; never nil
+	compressStats *ccomp.Stats     // nil when compress is disabled
+	startTime     time.Time
+
+	// Proxy lifecycle — used by the serve loop and admin stop/start endpoints.
+	proxyRunning atomic.Bool
+	stopProxyCh  chan struct{} // buffered(1); admin writes, serve loop reads
+	startProxyCh chan struct{} // buffered(1); admin writes, serve loop reads
+}
+
+// credentialFromConfig wraps a raw key into the appropriate typed Credential.
+func credentialFromConfig(keyValue, authStyle string) cred.Credential {
+	switch authStyle {
+	case "bearer":
+		return &cred.HeaderCredential{Header: "Authorization", Value: "Bearer " + keyValue}
+	case "api_key":
+		return &cred.HeaderCredential{Header: "x-api-key", Value: keyValue}
+	case "none":
+		return &cred.HeaderCredential{Header: "", Value: ""}
+	default: // "query_key" or empty → Gemini-style ?key=
+		return &cred.QueryCredential{Param: "key", Value: keyValue}
+	}
+}
+
+// buildCredSpecsFromPool builds CredSpec slice from a KeyPoolCfg using a given authStyle.
+func buildCredSpecsFromPool(kp config.KeyPoolCfg, authStyle string) []selector.CredSpec {
+	specs := make([]selector.CredSpec, 0, len(kp.Keys)+1)
+	for _, k := range kp.Keys {
+		var src selector.CredentialSource
+		if kp.Type == "oauth_refresh" {
+			src = intcred.NewOAuthSource(kp.ClientID, kp.ClientSecret, k.Key)
+		} else {
+			src = selector.NewStaticSource(credentialFromConfig(k.Key, authStyle))
+		}
+		specs = append(specs, selector.CredSpec{Name: k.Name, Source: src})
+	}
+	if kp.CredBroker != nil {
+		cb := kp.CredBroker
+		refreshSecs := cb.RefreshSeconds
+		if refreshSecs <= 0 {
+			refreshSecs = 30
+		}
+		broker := intcred.NewConnectBrokerClient(cb.URL, cb.Token)
+		src := intcred.NewBrokerSource(broker, cb.Pool)
+		poller := intcred.NewBrokerPoller(src, broker, cb.Pool, time.Duration(refreshSecs)*time.Second)
+		poller.Start(context.Background())
+		specs = append(specs, selector.CredSpec{Name: "cred_broker:" + cb.Pool, Source: src})
+	}
+	return specs
+}
+
+// newCredPool builds a CredPool from a KeyPoolCfg and authStyle.
+func newCredPool(kp config.KeyPoolCfg, authStyle string) *selector.CredPool {
+	specs := buildCredSpecsFromPool(kp, authStyle)
+	return selector.NewCredPool(selector.CredPoolConfig{
+		Keys:      specs,
+		Strategy:  kp.Strategy,
+		Threshold: kp.CircuitBreakThreshold,
+		Cooldown:  time.Duration(kp.CooldownSeconds) * time.Second,
+		RateLimitRPM:  kp.RateLimitRPM,
+		RateSoftLimit: kp.RateSoftLimit,
+	})
+}
+
+// buildTranslator creates the appropriate Translator for the given protocol and model.
+func buildUpstreamAdapter(proto, clientProto, mode, providerModel, apiBase string) coreup.UpstreamAdapter {
+	if mode == "passthrough" || clientProto == proto {
+		return intup.NewPassthrough(apiBase, "")
+	}
+	switch proto {
+	case "openai":
+		return intup.NewOpenAI(providerModel, apiBase)
+	case "deepseek":
+		return intup.NewDeepSeek(providerModel, apiBase)
+	case "grok":
+		return intup.NewGrok(providerModel, apiBase)
+	case "glm":
+		return intup.NewGLM(providerModel, apiBase)
+	default: // "gemini" or empty
+		return intup.NewGeminiWithConfig(providerModel, apiBase)
+	}
+}
+
+// resolveProto resolves the effective outgoing protocol for a model entry.
+func resolveProto(m config.ModelEntry) (proto, clientProto string) {
+	proto = m.Protocol
+	if proto == "" {
+		proto = m.Provider
+	}
+	clientProto = m.ClientProtocol
+	if clientProto == "" {
+		clientProto = "anthropic"
+	}
+	return proto, clientProto
+}
+
+// namedPoolAuthStyle infers the auth_style for a named pool by scanning model
+// entries and routing targets that reference it. Returns "bearer" as default.
+func namedPoolAuthStyle(poolName string, cfg *config.Config) string {
+	for _, m := range cfg.ModelRoutes {
+		if m.Routing != nil {
+			for _, t := range m.Routing.Targets {
+				if t.KeypoolRef == poolName && t.AuthStyle != "" {
+					return t.AuthStyle
+				}
+			}
+			continue
+		}
+		if m.KeypoolRef == poolName && m.AuthStyle != "" {
+			return m.AuthStyle
+		}
+	}
+	return "bearer"
+}
+
+// buildRoutingState builds selectors and timeouts from a config.
+func buildRoutingState(cfg *config.Config) *routingState {
+	namedPools := make(map[string]*selector.CredPool, len(cfg.KeyPools))
+	for name, kp := range cfg.KeyPools {
+		authStyle := namedPoolAuthStyle(name, cfg)
+		namedPools[name] = newCredPool(kp, authStyle)
+	}
+	sels := make(map[string]selector.Selector, len(cfg.ModelRoutes))
+	timeouts := make(map[string]time.Duration, len(cfg.ModelRoutes))
+	for _, m := range cfg.ModelRoutes {
+		sels[m.ModelName] = buildModelSelector(m, namedPools, cfg)
+		timeouts[m.ModelName] = modelTimeout(m)
+	}
+
+	// Build passthrough selectors from keypools tagged with provider: "anthropic"|"openai".
+	// These handle models that are not in model_routes: the client's model name is forwarded
+	// as-is to the upstream provider (e.g. claude-opus-4-8 → Anthropic, gpt-5.4 → OpenAI).
+	passthrough := make(map[string]selector.Selector)
+	for poolName, kp := range cfg.KeyPools {
+		if kp.Provider == "" {
+			continue
+		}
+		pool, ok := namedPools[poolName]
+		if !ok {
+			continue
+		}
+		var apiBase string
+		if p, exists := cfg.Providers[kp.Provider]; exists {
+			apiBase = p.BaseURL
+		}
+		// clientProto "anthropic": miroxy always receives Anthropic-format requests.
+		// proto = provider: translator knows how to speak to that provider.
+		upstream := buildUpstreamAdapter(kp.Provider, "anthropic", "", "", apiBase)
+		passthrough[kp.Provider] = selector.NewTargetSelector(pool, upstream, "")
+		slog.Info("passthrough selector built", "provider", kp.Provider, "pool", poolName)
+	}
+
+	return &routingState{selectors: sels, timeouts: timeouts, passthroughSelectors: passthrough}
+}
+
+// New creates a production Server.
+func New(cfg *config.Config, cfgPath string) *Server {
+	if cfg.Server.ModelDiscovery != "strict" {
+		tryInjectAnthropicModels(cfg)
+		tryInjectOpenAIModels(cfg)
+	}
+
+	s := newBase(cfg, cfgPath)
+
+	// Wire dump store when enabled.
+	if cfg.Dump.Enabled {
+		if ds, err := dump.NewJSONLStoreWithLimits(cfg.Dump.Path, cfg.Dump.MaxSizeMB, cfg.Dump.MaxBackups); err != nil {
+			slog.Warn("dump: failed to open store, dump disabled", "error", err)
+		} else {
+			s.dumpStore = ds
+			slog.Info("dump enabled", "path", cfg.Dump.Path,
+				"max_size_mb", cfg.Dump.MaxSizeMB, "max_backups", cfg.Dump.MaxBackups)
+		}
+	}
+
+	rt := buildRoutingState(cfg)
+	s.routing.Store(rt)
+
+	probers := make(map[string]*keyProber, len(cfg.ModelRoutes))
+	for _, m := range cfg.ModelRoutes {
+		probers[m.ModelName] = newKeyProber(m.ModelName, rt.selectors[m.ModelName], s.dispatcher)
+	}
+
+	plugins := []pipeline.Plugin{newUpstreamExecutor(probers, s.tokenStats)}
+	if cfg.Compress.Enabled {
+		cp, cs := buildCompressPlugin(&cfg.Compress)
+		s.compressStats = cs
+		plugins = append([]pipeline.Plugin{cp}, plugins...)
+	}
+	// CommandPlugin runs at priority 5 (before everything else).
+	cmdCfg := pipeline.CommandConfig{Disabled: cfg.Server.Commands.Disabled, AllowDump: cfg.Server.Commands.AllowDump}
+	plugins = append([]pipeline.Plugin{pipeline.NewCommandPlugin(s, cmdCfg)}, plugins...)
+	s.pipe = pipeline.New(plugins)
+	s.registerRoutes(cfg)
+	return s
+}
+
+// buildCompressPlugin constructs a CompressPlugin from the config block.
+func buildCompressPlugin(cfg *config.CompressConfig) (*compress.CompressPlugin, *ccomp.Stats) {
+	bc := compress.BuiltinConfig{
+		ToolResultBudget: cfg.ToolResultBudget,
+		TotalBudget:      cfg.TotalBudget,
+		WindowRecentKeep: cfg.WindowRecentKeep,
+		AlignDynamic:     cfg.AlignDynamic,
+		CCR:              compress.NewMemCCRStore(), // bbolt: swap when CCRPath != ""
+	}
+	comp := compress.NewBuiltinCompressor(bc)
+	return compress.NewCompressPlugin(comp, cfg.Threshold), comp.Stats()
+}
+
+// buildModelSelector creates the Selector for one model_routes entry.
+func buildModelSelector(m config.ModelEntry, namedPools map[string]*selector.CredPool, cfg *config.Config) selector.Selector {
+	if m.Routing != nil {
+		return buildRoutingSelector(m, namedPools)
+	}
+	return buildSimpleSelector(m, namedPools, cfg)
+}
+
+// buildSimpleSelector handles a simple (single-provider) model_routes entry.
+func buildSimpleSelector(m config.ModelEntry, namedPools map[string]*selector.CredPool, cfg *config.Config) selector.Selector {
+	proto, clientProto := resolveProto(m)
+	trans := buildUpstreamAdapter(proto, clientProto, m.Mode, m.ProviderModel, m.APIBase)
+
+	var pool *selector.CredPool
+	if m.KeypoolRef != "" {
+		pool = namedPools[m.KeypoolRef]
+	} else {
+		// Inline keypool — backward-compatible path.
+		specs := buildCredSpecsFromPool(m.KeyPool, m.AuthStyle)
+		pool = selector.NewCredPool(selector.CredPoolConfig{
+			Keys:          specs,
+			Upstream:      trans,    // kept for inline pools (prober compat)
+			ProviderModel: m.ProviderModel,
+			Strategy:      m.KeyPool.Strategy,
+			Threshold:     m.KeyPool.CircuitBreakThreshold,
+			Cooldown:      time.Duration(m.KeyPool.CooldownSeconds) * time.Second,
+			RateLimitRPM:  m.KeyPool.RateLimitRPM,
+			RateSoftLimit: m.KeyPool.RateSoftLimit,
+		})
+		// Inline pool: translator is embedded in the pool, no TargetSelector needed.
+		return pool
+	}
+
+	return selector.NewTargetSelector(pool, trans, m.ProviderModel)
+}
+
+// buildRoutingSelector handles a routing (multi-provider) model_routes entry.
+func buildRoutingSelector(m config.ModelEntry, namedPools map[string]*selector.CredPool) selector.Selector {
+	inner := make([]selector.Selector, 0, len(m.Routing.Targets))
+	for _, t := range m.Routing.Targets {
+		pool, ok := namedPools[t.KeypoolRef]
+		if !ok {
+			slog.Error("routing target references unknown keypool, skipping",
+				"model", m.ModelName, "keypool_ref", t.KeypoolRef)
+			continue
+		}
+		clientProto := m.ClientProtocol
+		if clientProto == "" {
+			clientProto = "anthropic"
+		}
+		trans := buildUpstreamAdapter(t.Protocol, clientProto, m.Mode, t.ProviderModel, t.APIBase)
+		inner = append(inner, selector.NewTargetSelector(pool, trans, t.ProviderModel))
+	}
+	return selector.NewRoutingSelector(m.Routing.Strategy, inner)
+}
+
+// NewWithTranslators creates a Server with caller-supplied translators (integration tests).
+func NewWithTranslators(cfg *config.Config, translators map[string]coreup.UpstreamAdapter) *Server {
+	sels := make(map[string]selector.Selector, len(cfg.ModelRoutes))
+	timeouts := make(map[string]time.Duration, len(cfg.ModelRoutes))
+	for _, m := range cfg.ModelRoutes {
+		trans := translators[m.ModelName]
+		specs := buildCredSpecsFromPool(m.KeyPool, m.AuthStyle)
+		pool := selector.NewCredPool(selector.CredPoolConfig{
+			Keys:          specs,
+			Upstream:      trans,
+			ProviderModel: m.ProviderModel,
+			Strategy:      m.KeyPool.Strategy,
+			Threshold:     m.KeyPool.CircuitBreakThreshold,
+			Cooldown:      time.Duration(m.KeyPool.CooldownSeconds) * time.Second,
+			RateLimitRPM:  m.KeyPool.RateLimitRPM,
+			RateSoftLimit: m.KeyPool.RateSoftLimit,
+		})
+		sels[m.ModelName] = pool
+		timeouts[m.ModelName] = modelTimeout(m)
+	}
+	s := newBase(cfg, "")
+	s.routing.Store(&routingState{selectors: sels, timeouts: timeouts})
+
+	probers := make(map[string]*keyProber, len(cfg.ModelRoutes))
+	for _, m := range cfg.ModelRoutes {
+		probers[m.ModelName] = newKeyProber(m.ModelName, sels[m.ModelName], s.dispatcher)
+	}
+	s.pipe = pipeline.New([]pipeline.Plugin{newUpstreamExecutor(probers, s.tokenStats)})
+	s.registerRoutes(cfg)
+	return s
+}
+
+// newBase allocates a Server with dispatcher and mux but no routing or pipeline yet.
+func newBase(cfg *config.Config, cfgPath string) *Server {
+	s := &Server{
+		startTime:    time.Now(),
+		tokenStats:   &stats.Registry{},
+		mux:          http.NewServeMux(),
+		cfgPath:      cfgPath,
+		dispatcher:   rpc.NewHTTPDispatcher(&http.Client{}),
+		stopProxyCh:  make(chan struct{}, 1),
+		startProxyCh: make(chan struct{}, 1),
+	}
+	s.cfg.Store(cfg)
+	return s
+}
+
+// defaultAdapters returns the built-in downstream protocol adapters.
+// Adding a new client protocol = add one entry here (and write the adapter file).
+func defaultAdapters() []coredown.DownstreamAdapter {
+	return []coredown.DownstreamAdapter{
+		&intdown.AnthropicAdapter{},
+		&intdown.OpenAIAdapter{},     // POST /v1/chat/completions
+		&intdown.ResponsesAdapter{},  // POST /v1/responses — Codex CLI (wire_api=responses)
+	}
+}
+
+// registerRoutes wires HTTP endpoints.  Each DownstreamAdapter registers its
+// own path; adding a new client protocol requires no changes here.
+func (s *Server) registerRoutes(cfg *config.Config) {
+	authMW := auth.NewValidator(cfg.Auth.AllowedKeys).Middleware
+
+	for _, a := range defaultAdapters() {
+		a := a // capture
+		s.mux.Handle("POST "+a.Path(), authMW(http.HandlerFunc(s.makeHandler(a))))
+	}
+
+	s.mux.Handle("GET /v1/models", authMW(http.HandlerFunc(s.handleModels)))
+	s.mux.HandleFunc("GET /health", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	if cfg.Metrics.Enabled {
+		path := cfg.Metrics.Path
+		if path == "" {
+			path = "/metrics"
+		}
+		s.mux.HandleFunc("GET "+path, func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "text/plain")
+			fmt.Fprintln(w, "# metrics stub — Prometheus integration coming in metrics phase")
+		})
+	}
+}
+
+// makeHandler returns an http.HandlerFunc that drives the full request cycle
+// for one DownstreamAdapter: decode → model lookup → pipeline → encode.
+// This single generic handler replaces the former handleMessages and
+// handleChatCompletions methods.
+func (s *Server) makeHandler(a coredown.DownstreamAdapter) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		req, err := a.Decode(r)
+		if err != nil {
+			slog.Debug("request decode/validate failed", "proto", a.Protocol(), "error", err)
+			a.WriteError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
+			return
+		}
+		slog.Debug("request decoded", "proto", a.Protocol(),
+			"model", req.Model, "stream", req.Stream, "messages", len(req.Messages))
+		// Dump raw_request (what the client sent, before pipeline processing).
+		if b, err2 := dumpRequest(req); err2 == nil {
+			dump.WriteIfEnabled(r.Context(), dump.Record{
+				Dir:      dump.DirRawRequest,
+				Protocol: a.Protocol(),
+				Model:    req.Model,
+				Body:     b,
+			})
+		}
+
+		cfg := s.cfg.Load()
+		entry, ok := cfg.LookupModel(req.Model)
+		if !ok {
+			slog.Debug("model not found", "model", req.Model)
+			a.WriteError(w, http.StatusBadRequest, "invalid_request_error",
+				fmt.Sprintf("unknown model %q — see GET /v1/models for available models", req.Model))
+			return
+		}
+		if entry.ModelName != req.Model {
+			slog.Debug("model routed to default", "requested", req.Model, "routed", entry.ModelName)
+		}
+
+		rt := s.routing.Load()
+		sel := rt.selectors[entry.ModelName]
+		providerModel := entry.ProviderModel
+
+		// Passthrough: entry came from LookupModel step 4 (inferred provider).
+		// No pre-built selector exists; use the passthrough selector for the provider.
+		// Forward the original model name to the upstream as-is.
+		if sel == nil && entry.Provider != "" {
+			sel = rt.passthroughSelectors[entry.Provider]
+			if providerModel == "" {
+				providerModel = req.Model
+			}
+		}
+
+		c := pipeline.NewContext(r.Context(), req, router.RouteTarget{
+			Invisible: entry.Invisible,
+			Model: router.ModelInfo{
+				Name:          entry.ModelName,
+				ProviderModel: providerModel,
+				Provider:      entry.Provider,
+			},
+			Selector:   sel,
+			Timeout:    rt.timeouts[entry.ModelName],
+			Dispatcher: s.dispatcher,
+		})
+
+		if err := s.pipe.Run(c); err != nil {
+			var pe *pipeline.PipelineError
+			if errors.As(err, &pe) {
+				slog.Debug("pipeline error", "proto", a.Protocol(),
+					"status", pe.Status, "type", pe.ErrType, "msg", pe.Msg)
+				if pe.RawBody != nil && entry.Invisible {
+					ct := pe.ContentType
+					if ct == "" {
+						ct = "application/json"
+					}
+					w.Header().Set("Content-Type", ct)
+					w.WriteHeader(pe.Status)
+					_, _ = w.Write(pe.RawBody)
+				} else {
+					a.WriteError(w, pe.Status, pe.ErrType, pe.Msg)
+				}
+			} else {
+				slog.Debug("pipeline unexpected error", "error", err)
+				a.WriteError(w, http.StatusInternalServerError, "api_error", err.Error())
+			}
+			return
+		}
+
+		if c.StreamSrc() != nil {
+			if err := a.WriteStream(r.Context(), w, req, c.StreamSrc()); err != nil {
+				slog.Debug("stream delivery error", "proto", a.Protocol(), "error", err)
+			}
+			c.ReleaseUpstream(nil)
+			return
+		}
+		// Pipeline short-circuited with a sync response (e.g. CommandPlugin) but
+		// the client requested streaming — delegate format to the adapter.
+		if req.Stream {
+			a.WriteResponseAsStream(r.Context(), w, c.Response)
+			return
+		}
+		a.WriteResponse(w, c.Response)
+	}
+}
+
+// ReloadResult summarises what changed after a config reload.
+type ReloadResult struct {
+	AddedModels   []string
+	RemovedModels []string
+	ChangedPools  []string
+}
+
+func (r *ReloadResult) String() string {
+	if len(r.AddedModels) == 0 && len(r.RemovedModels) == 0 && len(r.ChangedPools) == 0 {
+		return "no routing changes"
+	}
+	parts := []string{}
+	if len(r.AddedModels) > 0 {
+		parts = append(parts, fmt.Sprintf("+models:%v", r.AddedModels))
+	}
+	if len(r.RemovedModels) > 0 {
+		parts = append(parts, fmt.Sprintf("-models:%v", r.RemovedModels))
+	}
+	if len(r.ChangedPools) > 0 {
+		parts = append(parts, fmt.Sprintf("~pools:%v", r.ChangedPools))
+	}
+	return strings.Join(parts, " ")
+}
+
+// Reload re-reads the config file and atomically swaps routing state.
+// Changes to server.port or admin.addr are rejected — those require a restart.
+// In-flight requests complete against the old config; new requests use the new one.
+func (s *Server) Reload() (*ReloadResult, error) {
+	if s.cfgPath == "" {
+		return nil, fmt.Errorf("reload not available: no config file path recorded")
+	}
+	newCfg, err := config.NewYAMLStore(s.cfgPath).Load()
+	if err != nil {
+		return nil, fmt.Errorf("reload: parse config: %w", err)
+	}
+
+	oldCfg := s.cfg.Load()
+
+	// Reject changes that require a full restart.
+	if effectivePort(newCfg) != effectivePort(oldCfg) {
+		return nil, fmt.Errorf("reload rejected: server.port changed %d→%d (requires restart)",
+			effectivePort(oldCfg), effectivePort(newCfg))
+	}
+	if effectiveAdminAddr(newCfg) != effectiveAdminAddr(oldCfg) {
+		return nil, fmt.Errorf("reload rejected: admin.addr changed %s→%s (requires restart)",
+			effectiveAdminAddr(oldCfg), effectiveAdminAddr(newCfg))
+	}
+
+	newState := buildRoutingState(newCfg)
+	oldState := s.routing.Load()
+	result := diffRouting(oldState, newState)
+
+	// Atomic swap — in-flight requests hold references to old selectors and
+	// complete normally; GC reclaims old pools once all references drop.
+	s.routing.Store(newState)
+	s.cfg.Store(newCfg)
+
+	slog.Info("config reloaded", "changes", result.String(),
+		"models", len(newCfg.ModelRoutes), "pools", len(newCfg.KeyPools))
+	return result, nil
+}
+
+// InFlightCount returns the number of requests currently being processed.
+func (s *Server) InFlightCount() int64 { return s.inFlight.Load() }
+
+func effectivePort(cfg *config.Config) int {
+	if cfg.Server.Port == 0 {
+		return 8080
+	}
+	return cfg.Server.Port
+}
+
+func effectiveAdminAddr(cfg *config.Config) string {
+	if cfg.Admin.Addr == "" {
+		return "127.0.0.1:8090"
+	}
+	return cfg.Admin.Addr
+}
+
+// AdminEnabled returns true when the admin server should start.
+// Defaults to true when admin.enabled is not set in config.
+func AdminEnabled(cfg *config.Config) bool {
+	if cfg.Admin.Enabled == nil {
+		return true
+	}
+	return *cfg.Admin.Enabled
+}
+
+
+func diffRouting(old, new *routingState) *ReloadResult {
+	r := &ReloadResult{}
+	for name := range new.selectors {
+		if _, exists := old.selectors[name]; !exists {
+			r.AddedModels = append(r.AddedModels, name)
+		}
+	}
+	for name := range old.selectors {
+		if _, exists := new.selectors[name]; !exists {
+			r.RemovedModels = append(r.RemovedModels, name)
+		}
+	}
+	for name, nt := range new.timeouts {
+		if ot, exists := old.timeouts[name]; exists && ot != nt {
+			r.ChangedPools = append(r.ChangedPools, name)
+		}
+	}
+	return r
+}
+
+// modelTimeout returns the request timeout for a model_routes entry.
+// For routing entries, uses the maximum timeout across all targets.
+func modelTimeout(m config.ModelEntry) time.Duration {
+	if m.Routing != nil {
+		var max int
+		for _, t := range m.Routing.Targets {
+			if t.TimeoutSeconds > max {
+				max = t.TimeoutSeconds
+			}
+		}
+		if max > 0 {
+			return time.Duration(max) * time.Second
+		}
+		return 30 * time.Second
+	}
+	t := time.Duration(m.TimeoutSeconds) * time.Second
+	if t <= 0 {
+		t = 30 * time.Second
+	}
+	return t
+}
+
+// Handler returns the http.Handler for use with net/http or httptest.
+func (s *Server) Handler() http.Handler { return s.requestLogger(s.mux) }
+
+type responseRecorder struct {
+	http.ResponseWriter
+	status int
+}
+
+func (r *responseRecorder) WriteHeader(code int) {
+	r.status = code
+	r.ResponseWriter.WriteHeader(code)
+}
+
+func (r *responseRecorder) Flush() {
+	if f, ok := r.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+func (s *Server) requestLogger(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		s.inFlight.Add(1)
+		defer s.inFlight.Add(-1)
+
+		start := time.Now()
+
+		// Inject trace_id into context when dump is enabled.
+		ctx := r.Context()
+		if s.dumpStore != nil {
+			traceID := idgen.NewMsgID()[:8]
+			ctx = dump.WithTrace(ctx, traceID, s.dumpStore)
+			r = r.WithContext(ctx)
+		}
+
+		slog.Debug("request in", "method", r.Method, "path", r.URL.Path,
+			"remote", r.RemoteAddr, "in_flight", s.inFlight.Load())
+		rec := &responseRecorder{ResponseWriter: w, status: http.StatusOK}
+		next.ServeHTTP(rec, r)
+		slog.Info("request handled",
+			"method", r.Method, "path", r.URL.Path,
+			"status", rec.status, "duration_ms", time.Since(start).Milliseconds())
+	})
+}
+
+
+// isClaudeCodeClient reports whether the request comes from Claude Code.
+// Claude Code identifies itself via User-Agent: claude-code/<version>.
+func isClaudeCodeClient(r *http.Request) bool {
+	return strings.HasPrefix(r.Header.Get("User-Agent"), "claude-code/")
+}
+
+// handleModels returns the configured model list.
+// The response satisfies both Anthropic and OpenAI wire formats so clients
+// using CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY can discover models.
+func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
+	cfg := s.cfg.Load()
+	claudeCode := isClaudeCodeClient(r)
+	data := make([]types.Model, 0, len(cfg.ModelRoutes))
+	for _, m := range cfg.ModelRoutes {
+		displayName := m.DisplayName
+		if displayName == "" {
+			displayName = m.ModelName
+		}
+		// For Claude Code: auto-prefix model IDs with "claude-" so they appear
+		// in the /model picker (Claude Code only shows claude-* models).
+		// Other clients receive the original model_name unchanged.
+		id := m.ModelName
+		if claudeCode && !strings.HasPrefix(id, "claude-") {
+			id = "claude-" + id
+		}
+		data = append(data, types.Model{
+			// Anthropic fields
+			Type:        "model",
+			ID:          id,
+			DisplayName: displayName,
+			CreatedAt:   "2025-01-01T00:00:00Z",
+			// OpenAI compatibility fields (gateway model discovery)
+			Object:  "model",
+			Created: 1735689600, // 2025-01-01 00:00:00 UTC
+			OwnedBy: "miroxy",
+		})
+	}
+	resp := types.ModelsResponse{
+		Object:  "list",
+		Data:    data,
+		HasMore: false,
+	}
+	if len(data) > 0 {
+		resp.FirstID = data[0].ID
+		resp.LastID = data[len(data)-1].ID
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+
+// ReloadText is the ServerRef implementation of Reload — returns a plain string.
+func (s *Server) ReloadText() (string, error) {
+	r, err := s.Reload()
+	if err != nil {
+		return "", err
+	}
+	return r.String(), nil
+}
+// dumpRequest serialises a MessageRequest to JSON for dump capture.
+func dumpRequest(req *types.MessageRequest) ([]byte, error) {
+	return json.Marshal(req)
+}

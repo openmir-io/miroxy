@@ -1,0 +1,161 @@
+server:
+  port: 8080
+  # When a client sends an unknown model name, route to this model_name.
+  # Set ANTHROPIC_MODEL=miroxy in your shell to always use this default route.
+  default_model: miroxy
+
+# ── Admin server ──────────────────────────────────────────────────────────────
+# Separate listener for management APIs (stats, reload, key management).
+# Intentionally NOT the same port as the proxy — different security boundary:
+#   proxy port (8080) → public-facing, receives LLM traffic from agents/clients
+#   admin port (8090) → internal only, never expose to the public internet
+#
+# CLI commands that talk to this port:
+#   miroxy health        health check (exit 0 = ok)
+#   miroxy stat          per-pool key health + routing table
+#   miroxy reload        re-read config file, hot-swap routing
+#   miroxy key add/rm    dynamic key management (no config file write)
+#
+# Admin API proto: proto/miroxy/v1/admin.proto (in miroxy-rpc repo)
+# ─────────────────────────────────────────────────────────────────────────────
+admin:
+  enabled: true              # omit or set false to disable the admin server entirely
+  addr: "127.0.0.1:8090"    # localhost only; use 0.0.0.0:8090 inside containers/k8s
+
+log:
+  level: debug                          # debug | info | warn | error | fatal
+  file: /var/log/miroxy.log            # optional; logs also go to stderr
+
+auth:
+  allowed_keys:
+    - ${MIROXY_CLIENT_KEY_1}
+    # - ${MIROXY_CLIENT_KEY_2}
+
+# ── Protocol / auth_style reference ──────────────────────────────────────────
+#
+#  protocol   | default base_url                               | auth_style
+#  -----------|-----------------------------------------------|------------
+#  gemini     | https://generativelanguage.googleapis.com      | query_key
+#  openai     | https://api.openai.com/v1                      | bearer
+#  anthropic  | https://api.anthropic.com                      | api_key
+#  deepseek   | https://api.deepseek.com/v1                    | bearer
+#  glm        | https://api.z.ai/api/paas/v4                   | bearer
+#  grok       | https://api.x.ai/v1                            | bearer
+#
+# Built-in providers do not need to appear in the providers block unless you
+# want to override their defaults (e.g. point gemini at a relay URL).
+#
+# miroxy validates base_url against protocol at startup and refuses to start
+# on a known mismatch (e.g. generativelanguage.googleapis.com + protocol: openai).
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── Provider definitions ──────────────────────────────────────────────────────
+# Define once, reference by name in model_list and keypools.
+# Only needed for custom / relay providers, or to override built-in defaults.
+#
+# Relay / intermediate proxy pattern:
+#   Your client → miroxy → relay proxy → actual LLM provider
+#   The relay may expose any URL and any protocol. Configure it here exactly
+#   as it presents itself — miroxy does not care what sits behind the relay.
+#   miroxy adds key management, rotation, and fallback on top of the relay.
+# ─────────────────────────────────────────────────────────────────────────────
+providers:
+  # DeepSeek via OpenAI-compatible endpoint
+  deepseek-openai:
+    base_url: https://api.deepseek.com/v1
+    protocol: openai
+    auth_style: bearer
+
+  # DeepSeek via Anthropic-compatible endpoint
+  deepseek-anthropic:
+    base_url: https://api.deepseek.com/anthropic
+    protocol: anthropic
+    auth_style: bearer
+
+  # Local Ollama (no auth)
+  ollama:
+    base_url: http://localhost:11434/v1
+    protocol: openai
+    auth_style: none
+
+  # ── Relay / intermediate proxy examples ──────────────────────────────────
+  #
+  # Case 1: Company-internal LLM gateway (speaks OpenAI, custom subdomain)
+  # Employees route through a corporate proxy that enforces policy / logging.
+  # my-corp-gateway:
+  #   base_url: https://llm-gateway.corp.internal/v1
+  #   protocol: openai
+  #   auth_style: bearer          # gateway issues its own tokens
+
+  # Case 2: Third-party aggregator relay (e.g. OpenRouter, PortKey, LiteLLM)
+  # These relays expose an OpenAI-compatible API but proxy multiple providers.
+  # The model name in provider_model controls which upstream the relay picks.
+  # openrouter:
+  #   base_url: https://openrouter.ai/api/v1
+  #   protocol: openai
+  #   auth_style: bearer          # OpenRouter API key
+
+  # Case 3: Self-hosted LiteLLM proxy in front of Gemini / Bedrock
+  # LiteLLM translates OpenAI calls to native provider formats internally.
+  # miroxy only sees the LiteLLM OpenAI endpoint; LiteLLM handles the rest.
+  # litellm-internal:
+  #   base_url: http://litellm.infra.internal:4000
+  #   protocol: openai
+  #   auth_style: bearer
+
+  # Case 4: Relay that speaks Anthropic protocol (e.g. a caching proxy)
+  # Client sends Anthropic format → miroxy → Anthropic-speaking relay → Claude
+  # Because client_protocol == protocol == anthropic, miroxy auto-passthroughs.
+  # anthropic-relay:
+  #   base_url: https://anthropic-cache.internal
+  #   protocol: anthropic
+  #   auth_style: bearer
+
+  # Case 5: Completely custom URL + custom auth header (proprietary LLM service)
+  # The service speaks OpenAI format but uses a non-standard auth header.
+  # my-custom-llm:
+  #   base_url: https://api.my-llm-service.com/inference/v2
+  #   protocol: openai
+  #   auth_style: api_key         # sends X-API-Key: <value>
+
+# ── KeyPool definitions ───────────────────────────────────────────────────────
+# Define key pools once; reference with keypool_ref in model_list.
+# Multiple model_list entries sharing a keypool_ref share ONE pool instance —
+# in-flight counts and 429 cooldowns are accurate across all models using it.
+#
+# strategy options:
+#   least_requests  — pick the key with fewest active in-flight requests
+#   round_robin     — rotate keys in order regardless of load
+#
+# rate_soft_limit:
+#   miroxy switches to the next key at this RPM threshold, before the provider
+#   returns a 429. Defaults to rate_limit_rpm - 2 if omitted.
+#   Set to 0 to disable proactive rotation.
+# ─────────────────────────────────────────────────────────────────────────────
+keypools:
+  gemini-flash:
+    strategy: least_requests
+    circuit_break_threshold: 5
+    cooldown_seconds: 60
+    rate_limit_rpm: 20                # Gemini free tier flash limit
+    rate_soft_limit: 18
+    keys:
+      - ${GEMINI_KEY_1}
+      - ${GEMINI_KEY_2}
+      - ${GEMINI_KEY_3}
+
+  
+model_list:
+  - model_name: miroxy
+    description: "Default — balanced cost and quality"
+    routing:
+      strategy: fallback
+      targets:
+        - provider: gemini
+          provider_model: gemini-2.5-flash
+          keypool_ref: gemini-flash
+          timeout_seconds: 30
+
+metrics:
+  enabled: false
+  path: /metrics
