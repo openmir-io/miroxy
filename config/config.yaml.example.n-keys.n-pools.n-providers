@@ -1,5 +1,5 @@
 # config.yaml.example.n-keys.n-pools.n-providers
-# Multiple keypools, multiple API keys, multiple providers, one route model.
+# Multiple credpools, multiple API keys, multiple providers, one route model.
 # Use case: route to Gemini by default; fall back to DeepSeek if Gemini is down.
 # Each provider has its own isolated key pool — failures in one never affect another.
 
@@ -15,7 +15,7 @@ providers:
 
   deepseek: {}              # uses built-in default (api.deepseek.com/v1, deepseek protocol)
 
-keypools:
+credpools:
   gemini-flash:
     strategy: least_requests
     rate_limit_rpm: 20
@@ -37,9 +37,9 @@ model_routes:
       targets:
         - provider: gemini
           provider_model: gemini-2.5-flash
-          keypool_ref: gemini-flash
+          credpool_ref: gemini-flash
           timeout_seconds: 30
         - provider: deepseek
           provider_model: deepseek-chat
-          keypool_ref: deepseek-pool
+          credpool_ref: deepseek-pool
           timeout_seconds: 30

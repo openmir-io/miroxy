@@ -58,10 +58,10 @@ components:
           example: gemini
         auth_style:
           type: string
-          enum: [bearer, api_key, none, query_key]
+          enum: [bearer, api_key, none, query_key, sigv4]
           example: query_key
 
-    KeyEntry:
+    CredEntry:
       type: object
       properties:
         name:
@@ -69,16 +69,38 @@ components:
           example: "key_alice"
         key:
           type: string
-          description: Masked — only last 4 characters are visible.
+          description: Masked — only last 4 characters are visible. Used for all auth_styles except sigv4.
           example: "****5678"
+        access_key_id:
+          type: string
+          description: sigv4 only. Masked — only last 4 characters are visible.
+          example: "****WXYZ"
+        secret_access_key:
+          type: string
+          description: sigv4 only. Masked — only last 4 characters are visible.
+          example: "****5678"
+        session_token:
+          type: string
+          description: sigv4 only, optional (empty for long-term IAM credentials). Masked.
+          example: "****abcd"
 
-    KeyPool:
+    CredPool:
       type: object
       properties:
         provider:
           type: string
           description: Provider tag for auto-discovery (anthropic | openai).
           example: "gemini"
+        auth_style:
+          type: string
+          enum: [bearer, api_key, none, query_key, sigv4]
+          description: Declared on the pool itself for sigv4 (required so validation runs before any model_routes reference is resolved).
+        region:
+          type: string
+          description: sigv4 only — shared AWS region for every key in this pool.
+        service:
+          type: string
+          description: sigv4 only — shared AWS service, e.g. "bedrock-runtime".
         strategy:
           type: string
           enum: [round_robin, least_requests]
@@ -88,10 +110,12 @@ components:
           type: integer
         rate_limit_rpm:
           type: integer
+        rate_limit_tpm:
+          type: integer
         keys:
           type: array
           items:
-            $ref: "#/components/schemas/KeyEntry"
+            $ref: "#/components/schemas/CredEntry"
 
     RoutingTarget:
       type: object
@@ -100,7 +124,7 @@ components:
           type: string
         provider_model:
           type: string
-        keypool_ref:
+        credpool_ref:
           type: string
         timeout_seconds:
           type: integer
@@ -139,7 +163,7 @@ components:
           description: Resolved base URL after applying provider defaults.
         auth_style:
           type: string
-        keypool_ref:
+        credpool_ref:
           type: string
         routing:
           $ref: "#/components/schemas/RoutingConfig"
@@ -266,10 +290,10 @@ components:
           type: object
           additionalProperties:
             $ref: "#/components/schemas/ProviderDef"
-        keypools:
+        credpools:
           type: object
           additionalProperties:
-            $ref: "#/components/schemas/KeyPool"
+            $ref: "#/components/schemas/CredPool"
         model_routes:
           type: array
           items:
@@ -368,26 +392,26 @@ paths:
         "401":
           $ref: "#/components/responses/Unauthorized"
 
-  /v1/config/keypools:
+  /v1/config/credpools:
     get:
-      operationId: getConfigKeypools
-      summary: Keypool configuration (keys masked)
+      operationId: getConfigCredpools
+      summary: Credpool configuration (keys masked)
       description: |
-        Returns all configured keypools. API key values are masked — only the last
+        Returns all configured credpools. API key values are masked — only the last
         4 characters are visible (e.g. `****5678`). Shows strategy, circuit-break
         settings, and rate limits alongside masked key entries.
       responses:
         "200":
-          description: Keypool configuration.
+          description: Credpool configuration.
           content:
             application/json:
               schema:
                 type: object
                 properties:
-                  keypools:
+                  credpools:
                     type: object
                     additionalProperties:
-                      $ref: "#/components/schemas/KeyPool"
+                      $ref: "#/components/schemas/CredPool"
         "401":
           $ref: "#/components/responses/Unauthorized"
 
@@ -398,7 +422,7 @@ paths:
       description: |
         Returns all model routes with resolved protocol, api_base, and auth_style.
         Includes routes injected at startup by auto-discovery (model_discovery: auto).
-        Passthrough routes (created from provider-tagged keypools) are also listed.
+        Passthrough routes (created from provider-tagged credpools) are also listed.
       responses:
         "200":
           description: Model routes and providers.

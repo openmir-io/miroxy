@@ -80,11 +80,12 @@ type UpstreamConverter interface {
 
 // UpstreamBackend is the pluggable execution seam for the provider (south) side.
 // It has the same shape as UpstreamConverter but is the boundary across which a
-// future backend may cross a serialization boundary:
+// future backend may cross a process boundary:
 //
-//   - BuiltinBackend         — direct Go call (v1, zero overhead)
-//   - WASMBackend     (future) — marshal → wazero guest → unmarshal
-//   - GRPCBackend     (future) — call an external translation service via pluginrt/ext
+//   - BuiltinBackend      — direct Go call (v1, zero overhead)
+//   - SidecarBackend (future) — call an external translation service over
+//     HTTP or gRPC, whichever fits; no shared transport abstraction needed
+//     (see docs/design/architecture-v3.md)
 type UpstreamBackend interface {
 	RequestToProvider(irReq *ir.IRRequest) ([]byte, error)
 	ResponseToIR(body []byte) (*ir.IRResponse, error)

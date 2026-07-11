@@ -12,14 +12,14 @@ import (
 	"miroxy/internal/types"
 )
 
-// tryInjectOpenAIModels finds the first named keypool backed by an OpenAI
+// tryInjectOpenAIModels finds the first named credpool backed by an OpenAI
 // provider, fetches the live model list, and appends chat-capable models not
 // already present in cfg.ModelRoutes. Called once at startup alongside
 // tryInjectAnthropicModels when model_discovery: auto is set.
 func tryInjectOpenAIModels(cfg *config.Config) {
 	poolName, key, baseURL := findOpenAIPoolKey(cfg)
 	if key == "" {
-		slog.Debug("model_discovery: no OpenAI keypool found, skipping")
+		slog.Debug("model_discovery: no OpenAI credpool found, skipping")
 		return
 	}
 
@@ -48,7 +48,7 @@ func tryInjectOpenAIModels(cfg *config.Config) {
 			DisplayName:   display,
 			Provider:      "openai",
 			ProviderModel: m.ID,
-			KeypoolRef:    poolName,
+			CredpoolRef:   poolName,
 		})
 		injected++
 	}
@@ -56,13 +56,13 @@ func tryInjectOpenAIModels(cfg *config.Config) {
 	slog.Info("model_discovery: injected OpenAI models", "count", injected, "pool", poolName)
 }
 
-// findOpenAIPoolKey returns the first keypool configured for OpenAI.
+// findOpenAIPoolKey returns the first credpool configured for OpenAI.
 // Checks in order:
-//  1. Keypools with provider: "openai" tag (explicit, no model_routes needed)
-//  2. Model routes with provider: "openai" referencing a named keypool (legacy)
+//  1. Credpools with provider: "openai" tag (explicit, no model_routes needed)
+//  2. Model routes with provider: "openai" referencing a named credpool (legacy)
 func findOpenAIPoolKey(cfg *config.Config) (poolName, key, baseURL string) {
-	// 1. Explicit keypool tag.
-	for name, pool := range cfg.KeyPools {
+	// 1. Explicit credpool tag.
+	for name, pool := range cfg.CredPools {
 		if pool.Provider == "openai" && len(pool.Keys) > 0 {
 			base := resolveOpenAIBaseFromPool(cfg, name)
 			return name, pool.Keys[0].Key, base
@@ -70,15 +70,15 @@ func findOpenAIPoolKey(cfg *config.Config) (poolName, key, baseURL string) {
 	}
 	// 2. Infer from model_routes (backward compat).
 	for _, m := range cfg.ModelRoutes {
-		if m.Provider != "openai" || m.KeypoolRef == "" {
+		if m.Provider != "openai" || m.CredpoolRef == "" {
 			continue
 		}
-		pool, ok := cfg.KeyPools[m.KeypoolRef]
+		pool, ok := cfg.CredPools[m.CredpoolRef]
 		if !ok || len(pool.Keys) == 0 {
 			continue
 		}
 		base := resolveOpenAIBase(cfg, m)
-		return m.KeypoolRef, pool.Keys[0].Key, base
+		return m.CredpoolRef, pool.Keys[0].Key, base
 	}
 	return "", "", ""
 }

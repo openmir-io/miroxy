@@ -13,17 +13,56 @@ type ConfigStore interface {
 }
 
 type Config struct {
-	Server    ServerConfig             `yaml:"server"`
-	Admin     AdminConfig              `yaml:"admin"`
-	Log       LogConfig                `yaml:"log"`
-	Auth      AuthConfig               `yaml:"auth"`
-	Providers map[string]ProviderDef  `yaml:"providers"`
-	KeyPools  map[string]KeyPoolCfg   `yaml:"keypools"`
-	ModelRoutes []ModelEntry             `yaml:"model_routes"`
-	Metrics   MetricsConfig            `yaml:"metrics"`
-	Compress     CompressConfig     `yaml:"compress"`
-	Dump         DumpConfig         `yaml:"dump"`
-	Transparent  TransparentConfig  `yaml:"transparent"`
+	Server      ServerConfig           `yaml:"server"`
+	Admin       AdminConfig            `yaml:"admin"`
+	Log         LogConfig              `yaml:"log"`
+	Auth        AuthConfig             `yaml:"auth"`
+	Providers   map[string]ProviderDef `yaml:"providers"`
+	CredPools   map[string]CredPoolCfg `yaml:"credpools"`
+	ModelRoutes []ModelEntry           `yaml:"model_routes"`
+	Metrics     MetricsConfig          `yaml:"metrics"`
+	Compress    CompressConfig         `yaml:"compress"`
+	Dump        DumpConfig             `yaml:"dump"`
+	Transparent TransparentConfig      `yaml:"transparent"`
+	Sidecar     SidecarConfig          `yaml:"sidecar"`
+	LocalState  LocalStateConfig       `yaml:"local_state"`
+}
+
+// SidecarConfig groups every optional external-service integration under one
+// namespace. Each sidecar is independently enabled; miroxy runs with zero
+// sidecars configured by default (fully standalone, in-memory only).
+type SidecarConfig struct {
+	CredSource CredSourceConfig `yaml:"credsource"`
+	// Future sidecars (compressor, securitygate, ...) are added here as their
+	// own <Domain>Config field once they have a real implementation — see
+	// docs/design/architecture-v3.md for the pattern to follow.
+}
+
+// CredSourceConfig configures the optional credstone credential source.
+// Disabled by default — miroxy uses local credpools only unless enabled.
+type CredSourceConfig struct {
+	Enabled      bool   `yaml:"enabled"`
+	BaseURL      string `yaml:"base_url"`
+	AuthToken    string `yaml:"auth_token"`
+	SyncInterval int    `yaml:"sync_interval"` // seconds, default 300
+}
+
+// LocalStateConfig configures optional on-disk caching of local runtime state
+// (currently: per-credential health — state/cooldown/failure counters) via a
+// small embedded buntdb store. Disabled by default — miroxy is fully
+// in-memory and resets on restart unless this is turned on.
+//
+// Meaningless (and ignored, with a startup warning) when
+// sidecar.credsource.enabled is true: credstone is already the
+// authoritative, cross-restart source of credential health in that mode, so
+// a local disk cache would just be a second, potentially-stale copy with no
+// correctness benefit. This is a standalone-mode-only optimization.
+type LocalStateConfig struct {
+	Enabled bool `yaml:"enabled"`
+	// Path is the buntdb file path. Defaults to "./miroxy-local-state.db" when
+	// enabled and left blank. The file is a pure cache: if it's missing or
+	// corrupt, miroxy deletes and recreates it rather than failing to start.
+	Path string `yaml:"path"`
 }
 
 type LogConfig struct {
@@ -32,13 +71,13 @@ type LogConfig struct {
 }
 
 type ServerConfig struct {
-	Port           int         `yaml:"port"`
-	DefaultModel   string      `yaml:"default_model"`
-	Commands       CommandsCfg `yaml:"commands"`
+	Port         int         `yaml:"port"`
+	DefaultModel string      `yaml:"default_model"`
+	Commands     CommandsCfg `yaml:"commands"`
 	// ModelDiscovery controls whether miroxy auto-discovers models from upstream
 	// providers at startup and injects them into the in-memory model list.
 	// "strict" (default): only models explicitly listed in model_routes are exposed.
-	// "auto": additionally fetches models from any configured Anthropic keypool
+	// "auto": additionally fetches models from any configured Anthropic credpool
 	//         and injects those not already present in model_routes.
 	ModelDiscovery string `yaml:"model_discovery"`
 }
@@ -79,7 +118,7 @@ type ProviderDef struct {
 //
 // Simple (single provider):
 //
-//	model_name + provider + provider_model + keypool_ref (or inline keypool)
+//	model_name + provider + provider_model + credpool_ref (or inline credpool)
 //
 // Routing (multiple providers):
 //
@@ -95,8 +134,8 @@ type ModelEntry struct {
 	ClientProtocol string         `yaml:"client_protocol"`
 	Protocol       string         `yaml:"protocol"`
 	ProviderModel  string         `yaml:"provider_model"`
-	KeyPool        KeyPoolCfg     `yaml:"keypool"`
-	KeypoolRef     string         `yaml:"keypool_ref"`
+	CredPool       CredPoolCfg    `yaml:"credpool"`
+	CredpoolRef    string         `yaml:"credpool_ref"`
 	Routing        *RoutingConfig `yaml:"routing"`
 	Description    string         `yaml:"description"`
 	TimeoutSeconds int            `yaml:"timeout_seconds"`
@@ -118,7 +157,7 @@ type RoutingConfig struct {
 type RoutingTarget struct {
 	Provider       string `yaml:"provider"`
 	ProviderModel  string `yaml:"provider_model"`
-	KeypoolRef     string `yaml:"keypool_ref"`
+	CredpoolRef    string `yaml:"credpool_ref"`
 	TimeoutSeconds int    `yaml:"timeout_seconds"`
 	// Resolved by resolveProviders — not user-facing YAML fields.
 	Protocol  string `yaml:"-"`
@@ -126,13 +165,22 @@ type RoutingTarget struct {
 	AuthStyle string `yaml:"-"`
 }
 
-// KeyEntry is a single upstream API key with an optional display name.
-type KeyEntry struct {
+// CredEntry is a single upstream credential with an optional display name.
+//
+// Key holds the material for single-value kinds (API key, bearer token, or —
+// for oauth_refresh pools — the refresh_token). AccessKeyID/SecretAccessKey/
+// SessionToken hold SigV4 material instead, populated only when the owning
+// pool's auth_style is "sigv4"; Key is left empty in that case.
+type CredEntry struct {
 	Name string
 	Key  string
+
+	AccessKeyID     string
+	SecretAccessKey string
+	SessionToken    string // optional — empty for long-term IAM credentials
 }
 
-func (e *KeyEntry) UnmarshalYAML(value *yaml.Node) error {
+func (e *CredEntry) UnmarshalYAML(value *yaml.Node) error {
 	switch value.Kind {
 	case yaml.ScalarNode:
 		// Plain string: - ${ENV_VAR}  (anonymous key, gets key_N name in logs)
@@ -140,58 +188,94 @@ func (e *KeyEntry) UnmarshalYAML(value *yaml.Node) error {
 		return nil
 	case yaml.MappingNode:
 		// Shorthand: - my_label: ${ENV_VAR}
-		// One key-value pair where the YAML key is the display name.
+		// One key-value pair where the YAML key is the display name and the
+		// value is a plain string.
 		if len(value.Content) == 2 {
 			keyName := value.Content[0].Value
+			valueNode := value.Content[1]
 			if keyName != "name" && keyName != "key" {
-				e.Name = keyName
-				e.Key = value.Content[1].Value
-				return nil
+				if valueNode.Kind == yaml.ScalarNode {
+					e.Name = keyName
+					e.Key = valueNode.Value
+					return nil
+				}
+				if valueNode.Kind == yaml.MappingNode {
+					// Structured shorthand (sigv4): - my_label: {access_key_id: ..., ...}
+					var fields sigv4Fields
+					if err := valueNode.Decode(&fields); err != nil {
+						return err
+					}
+					e.Name = keyName
+					e.AccessKeyID = fields.AccessKeyID
+					e.SecretAccessKey = fields.SecretAccessKey
+					e.SessionToken = fields.SessionToken
+					return nil
+				}
 			}
 		}
 		// Verbose: - name: my_label\n  key: ${ENV_VAR}
-		type plain struct {
-			Name string `yaml:"name"`
-			Key  string `yaml:"key"`
+		// or (sigv4) - name: my_label\n  access_key_id: ...\n  secret_access_key: ...
+		var p struct {
+			Name        string `yaml:"name"`
+			Key         string `yaml:"key"`
+			sigv4Fields `yaml:",inline"`
 		}
-		var p plain
 		if err := value.Decode(&p); err != nil {
 			return err
 		}
 		e.Name = p.Name
 		e.Key = p.Key
+		e.AccessKeyID = p.AccessKeyID
+		e.SecretAccessKey = p.SecretAccessKey
+		e.SessionToken = p.SessionToken
 		return nil
 	default:
 		return fmt.Errorf("keys entry must be a string or a mapping (e.g. \"my_label: ${ENV_VAR}\")")
 	}
 }
 
-type KeyPoolCfg struct {
-	// Provider optionally tags this keypool for auto-discovery.
+// sigv4Fields is the structured material for an "auth_style: sigv4" entry.
+type sigv4Fields struct {
+	AccessKeyID     string `yaml:"access_key_id"`
+	SecretAccessKey string `yaml:"secret_access_key"`
+	SessionToken    string `yaml:"session_token"`
+}
+
+type CredPoolCfg struct {
+	// Provider optionally tags this credpool for auto-discovery.
 	// Accepted values: "anthropic", "openai".
 	// When model_discovery: auto is set, miroxy calls the provider's
 	// /v1/models endpoint at startup and injects discovered models.
 	Provider string `yaml:"provider,omitempty"`
 
+	// AuthStyle declares this pool's credential kind up front: "bearer",
+	// "api_key", "query_key", "sigv4", or "none". Optional for header/query
+	// pools (inferred from whatever model_routes entry references the pool,
+	// via namedPoolAuthStyle) but required for "sigv4" pools, since sigv4
+	// validation happens at pool-definition time, before any reference is
+	// resolved.
+	AuthStyle string `yaml:"auth_style,omitempty"`
+
 	Type         string `yaml:"type"`
 	ClientID     string `yaml:"client_id"`
 	ClientSecret string `yaml:"client_secret"`
 
-	Strategy              string `yaml:"strategy"`
-	CircuitBreakThreshold int    `yaml:"circuit_break_threshold"`
-	CooldownSeconds       int    `yaml:"cooldown_seconds"`
-	Keys                  []KeyEntry `yaml:"keys"`
-	RateLimitRPM          int    `yaml:"rate_limit_rpm"`
-	RateSoftLimit         int    `yaml:"rate_soft_limit"`
-	CredBroker            *CredBrokerConfig `yaml:"cred_broker"`
-}
+	// Region/Service are shared SigV4 signing parameters for every key in a
+	// sigv4 pool (e.g. AWS Bedrock's region + "bedrock-runtime"). Ignored for
+	// any other auth_style.
+	Region  string `yaml:"region,omitempty"`
+	Service string `yaml:"service,omitempty"`
 
-// CredBrokerConfig wires one external CredBroker pool into a miroxy keypool.
-type CredBrokerConfig struct {
-	URL            string `yaml:"url"`
-	Token          string `yaml:"token"`
-	Pool           string `yaml:"pool"`
-	RefreshSeconds int    `yaml:"refresh_seconds"`
+	Strategy              string      `yaml:"strategy"`
+	CircuitBreakThreshold int         `yaml:"circuit_break_threshold"`
+	CooldownSeconds       int         `yaml:"cooldown_seconds"`
+	Keys                  []CredEntry `yaml:"keys"`
+	RateLimitRPM          int         `yaml:"rate_limit_rpm"`
+	RateSoftLimit         int         `yaml:"rate_soft_limit"`
+	// RateLimitTPM caps total (input+output) tokens per credential per
+	// minute; 0 = disabled (the default — most credentials have no
+	// provider-side token quota worth tracking locally).
+	RateLimitTPM int `yaml:"rate_limit_tpm"`
 }
 
 type MetricsConfig struct {
@@ -285,16 +369,16 @@ func (c *Config) LookupModel(name string) (ModelEntry, bool) {
 	}
 
 	// 4. Provider passthrough: infer provider from model name pattern, find a
-	//    keypool tagged with that provider. Returns a synthetic ModelEntry so
+	//    credpool tagged with that provider. Returns a synthetic ModelEntry so
 	//    the executor can use the passthroughSelectors built at startup.
 	if provider := inferModelProvider(name); provider != "" {
-		for poolName, pool := range c.KeyPools {
+		for poolName, pool := range c.CredPools {
 			if pool.Provider == provider && len(pool.Keys) > 0 {
 				return ModelEntry{
 					ModelName:     name,
 					Provider:      provider,
 					ProviderModel: name, // forward the original model name to the upstream
-					KeypoolRef:    poolName,
+					CredpoolRef:   poolName,
 				}, true
 			}
 		}
@@ -364,7 +448,7 @@ type TransparentConfig struct {
 // CommandsCfg controls miroxy in-band commands (:miroxy ...).
 type CommandsCfg struct {
 	// Disabled turns off all :miroxy commands. Default false (commands enabled).
-	Disabled  bool `yaml:"disabled"`
+	Disabled bool `yaml:"disabled"`
 	// AllowDump permits :miroxy dump on|off. Default false.
 	AllowDump bool `yaml:"allow_dump"`
 }

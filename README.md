@@ -65,7 +65,7 @@ providers:
   gemini: {}                 # declare every provider used in model_routes
                              # fields left blank use built-in defaults
 
-keypools:
+credpools:
   my-pool:
     keys:
       - my_key: ${GEMINI_KEY}
@@ -74,7 +74,7 @@ model_routes:
   - model_name: miroxy
     provider: gemini
     provider_model: gemini-2.5-flash
-    keypool_ref: my-pool
+    credpool_ref: my-pool
 ```
 
 See [`config/config.yaml.example.min`](config/config.yaml.example.min) for the
@@ -124,7 +124,7 @@ Authentication: `Authorization: Bearer <token>` where token is any value from
 | `GET`  | `/stat` | Runtime stats: uptime, token usage, compress perf |
 | `GET`  | `/v1/config` | Full effective config (defaults resolved, keys masked) |
 | `GET`  | `/v1/config/providers` | Resolved provider definitions |
-| `GET`  | `/v1/config/keypools` | Keypools with masked keys |
+| `GET`  | `/v1/config/credpools` | Credpools with masked keys |
 | `GET`  | `/v1/config/routes` | Model routes (including auto-discovered) |
 | `POST` | `/admin/reload` | Hot-reload config file |
 | `POST` | `/admin/proxy/stop` | Stop proxy listener |
@@ -141,7 +141,7 @@ miroxy serve                    Start the proxy server
 miroxy config                   Show full effective config of running instance
 miroxy config providers         Show resolved provider definitions
 miroxy config routes            Show model routes (including auto-discovered)
-miroxy config keypools          Show keypools (keys masked)
+miroxy config credpools          Show credpools (keys masked)
 miroxy health                   Liveness check against running instance
 miroxy stat                     Runtime stats
 miroxy reload                   Hot-reload config file
@@ -171,7 +171,7 @@ export MIROXY_AUTH_TOKEN=sk-my-client-key
 miroxy config                             # full effective config
 miroxy config providers                   # providers section
 miroxy config routes                      # model routes
-miroxy config keypools                    # keypools (keys masked)
+miroxy config credpools                    # credpools (keys masked)
 miroxy config --admin-addr 10.0.0.5:9001 routes   # remote instance
 ```
 
@@ -217,7 +217,7 @@ providers:
 ### Key pools
 
 ```yaml
-keypools:
+credpools:
   gemini-flash:
     strategy: least_requests        # or round_robin
     circuit_break_threshold: 5      # consecutive failures before marking key unhealthy
@@ -232,10 +232,10 @@ keypools:
 
 Key name (e.g. `key_alice`) appears in `key_id` log fields on 429 and circuit-break events — makes it easy to identify which key is causing problems.
 
-**Passthrough auto-routing**: tag a keypool with `provider: anthropic` or `provider: openai` to enable zero-config passthrough routing for `claude-*` or `gpt-*` models respectively:
+**Passthrough auto-routing**: tag a credpool with `provider: anthropic` or `provider: openai` to enable zero-config passthrough routing for `claude-*` or `gpt-*` models respectively:
 
 ```yaml
-keypools:
+credpools:
   anthropic-pool:
     provider: anthropic        # enables passthrough for any claude-* model
     keys:
@@ -257,7 +257,7 @@ model_routes:
   - model_name: miroxy
     provider: gemini
     provider_model: gemini-2.5-flash
-    keypool_ref: gemini-flash
+    credpool_ref: gemini-flash
     timeout_seconds: 30
 
   # Routing: fallback across multiple providers
@@ -267,11 +267,11 @@ model_routes:
       targets:
         - provider: anthropic
           provider_model: claude-sonnet-4-6
-          keypool_ref: anthropic-pool
+          credpool_ref: anthropic-pool
           timeout_seconds: 60
         - provider: gemini
           provider_model: gemini-2.5-pro
-          keypool_ref: gemini-pro
+          credpool_ref: gemini-pro
           timeout_seconds: 60
 ```
 
@@ -282,7 +282,7 @@ When a request arrives with `model: "claude-opus-4-8"`, miroxy finds the route i
 1. **Exact match** — `model_name: "claude-opus-4-8"` in config
 2. **Strip prefix** — strip `claude-`, look up `opus-4-8`
 3. **Longest prefix** — `opus` matches `opus-4-8` (next char must be `-` or end); `gpt-5.4` matches `gpt-5.4-mini` and `gpt-5.4-turbo`
-4. **Provider passthrough** — `claude-*` → anthropic keypool; `gpt-*/o1*/o3*` → openai keypool
+4. **Provider passthrough** — `claude-*` → anthropic credpool; `gpt-*/o1*/o3*` → openai credpool
 5. **Default model** — `server.default_model`
 
 ### Routing strategies
@@ -322,11 +322,11 @@ Generate a Codex-compatible model catalog from your miroxy config:
 
 ### Auto-discovery of upstream models
 
-With `model_discovery: auto` (default) and a provider-tagged keypool, miroxy
+With `model_discovery: auto` (default) and a provider-tagged credpool, miroxy
 calls the provider's `/v1/models` at startup and injects discovered models:
 
 ```yaml
-keypools:
+credpools:
   anthropic-pool:
     provider: anthropic    # triggers GET api.anthropic.com/v1/models on startup
     keys:
@@ -345,7 +345,7 @@ Works in Claude Code, Codex, and any other client.
 
 ```
 :miroxy ?              List all commands
-:miroxy stats          Uptime, token usage, keypool health, compression stats
+:miroxy stats          Uptime, token usage, credpool health, compression stats
 :miroxy health         Quick health check
 :miroxy dump on|off    Toggle traffic capture to dump.jsonl
 ```
@@ -353,7 +353,7 @@ Works in Claude Code, Codex, and any other client.
 **Inject into context:**
 
 ```
-:miroxy stats is keypool utilization high?
+:miroxy stats is credpool utilization high?
 # → injects stats output, then asks the LLM the question
 ```
 
@@ -440,7 +440,7 @@ miroxy reload -c config/config.yaml
 ```
 
 What can be changed without restart:
-- Model routes, providers, keypools
+- Model routes, providers, credpools
 - Rate limits, circuit-break settings
 - `default_model`, `auth.allowed_keys`
 

@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"miroxy/core/selector"
+	intcred "miroxy/internal/cred"
 	"miroxy/internal/idgen"
 	"miroxy/internal/irc"
 	"miroxy/internal/pipeline"
@@ -60,10 +61,14 @@ const maxRetries = 10
 type UpstreamExecutor struct {
 	probers map[string]*keyProber
 	stats   *stats.Registry
+	// usageAcc holds one entry per credstone-backed named pool, keyed by
+	// plan.SelectionID (see routingState.usageAcc). nil/empty when credsource
+	// is disabled — every lookup below is a no-op map read in that case.
+	usageAcc map[string]*intcred.UsageAccumulator
 }
 
-func newUpstreamExecutor(probers map[string]*keyProber, reg *stats.Registry) *UpstreamExecutor {
-	return &UpstreamExecutor{probers: probers, stats: reg}
+func newUpstreamExecutor(probers map[string]*keyProber, reg *stats.Registry, usageAcc map[string]*intcred.UsageAccumulator) *UpstreamExecutor {
+	return &UpstreamExecutor{probers: probers, stats: reg, usageAcc: usageAcc}
 }
 
 func (e *UpstreamExecutor) Name() string  { return "upstream" }
@@ -176,11 +181,26 @@ func (e *UpstreamExecutor) executeNonStream(c *pipeline.LLMContext) error {
 				int64(anthropicResp.Usage.InputTokens),
 				int64(anthropicResp.Usage.OutputTokens))
 		}
+		if ua := e.usageAcc[plan.SelectionID]; ua != nil {
+			ua.AddTokens(int64(anthropicResp.Usage.InputTokens), int64(anthropicResp.Usage.OutputTokens))
+		}
+		if tr, ok := sel.(tokenRecorder); ok {
+			tr.RecordTokens(plan.SelectionID, int64(anthropicResp.Usage.InputTokens)+int64(anthropicResp.Usage.OutputTokens))
+		}
 		c.Response = anthropicResp
 		return nil
 	}
 
 	return allKeysFailed(model.Name, model.ProviderModel, attempts, invisible)
+}
+
+// tokenRecorder is satisfied by CredPool (type assertion, not part of the
+// Selector interface — mirrors probeCapable/outcomeReporter). Token counts
+// are only known after the upstream response, well after Select/Release have
+// already run, so this is fed from the executor rather than threaded through
+// the retry loop's existing calls.
+type tokenRecorder interface {
+	RecordTokens(selectionID string, tokens int64)
 }
 
 // --- Streaming retry loop ---
@@ -279,7 +299,11 @@ func (e *UpstreamExecutor) executeStream(c *pipeline.LLMContext) error {
 	slog.Debug("stream starting", "model", req.Model, "key_id", plan.SelectionID, "msg_id", msgID)
 	events, _ := plan.Upstream.StreamFromUpstream(ctx, resp, msgID, req.Model)
 	if e.stats != nil {
-		events = trackUsageStream(events, e.stats, req.Model, plan.SelectionID)
+		var tr tokenRecorder
+		if r, ok := sel.(tokenRecorder); ok {
+			tr = r
+		}
+		events = trackUsageStream(events, e.stats, req.Model, plan.SelectionID, e.usageAcc[plan.SelectionID], tr)
 	}
 
 	c.SetStream(events, func(streamErr error) {
@@ -291,8 +315,8 @@ func (e *UpstreamExecutor) executeStream(c *pipeline.LLMContext) error {
 
 // trackUsageStream wraps a SSE event channel, accumulates token usage from
 // message_start (input) and message_delta (output) events, and records the
-// totals to reg when the channel closes.
-func trackUsageStream(src <-chan types.SSEEvent, reg *stats.Registry, model, keyID string) <-chan types.SSEEvent {
+// totals to reg (and, when non-nil, ua/tr) when the channel closes.
+func trackUsageStream(src <-chan types.SSEEvent, reg *stats.Registry, model, keyID string, ua *intcred.UsageAccumulator, tr tokenRecorder) <-chan types.SSEEvent {
 	out := make(chan types.SSEEvent, 64)
 	go func() {
 		defer close(out)
@@ -312,6 +336,12 @@ func trackUsageStream(src <-chan types.SSEEvent, reg *stats.Registry, model, key
 		}
 		if totalIn > 0 || totalOut > 0 {
 			reg.Record(model, keyID, totalIn, totalOut)
+			if ua != nil {
+				ua.AddTokens(totalIn, totalOut)
+			}
+			if tr != nil {
+				tr.RecordTokens(keyID, totalIn+totalOut)
+			}
 		}
 	}()
 	return out

@@ -10,9 +10,11 @@ import (
 	"sync/atomic"
 	"time"
 
+	"encoding/json"
+	ccomp "miroxy/core/compress"
 	"miroxy/core/cred"
-	coredown "miroxy/core/downstream"
 	"miroxy/core/dispatch"
+	coredown "miroxy/core/downstream"
 	"miroxy/core/router"
 	"miroxy/core/rpc"
 	"miroxy/core/selector"
@@ -22,12 +24,11 @@ import (
 	"miroxy/internal/config"
 	intcred "miroxy/internal/cred"
 	intdown "miroxy/internal/downstream"
-	ccomp "miroxy/core/compress"
 	"miroxy/internal/dump"
-	"miroxy/internal/stats"
-	"encoding/json"
 	"miroxy/internal/idgen"
+	"miroxy/internal/localstate"
 	"miroxy/internal/pipeline"
+	"miroxy/internal/stats"
 	"miroxy/internal/types"
 	intup "miroxy/internal/upstream"
 )
@@ -35,32 +36,48 @@ import (
 // routingState is swapped atomically on hot reload.
 // All maps are read together so they stay consistent.
 type routingState struct {
-	selectors            map[string]selector.Selector
-	timeouts             map[string]time.Duration
+	selectors map[string]selector.Selector
+	timeouts  map[string]time.Duration
 	// passthroughSelectors handles models not in model_routes.
 	// Keyed by provider name ("anthropic", "openai").
-	// Built from keypools that carry a provider: tag.
+	// Built from credpools that carry a provider: tag.
 	passthroughSelectors map[string]selector.Selector
+	// usageAcc holds one entry per credstone-backed named pool, keyed by the
+	// same "credsource:"+poolName SelectionID the pool uses internally, so
+	// UpstreamExecutor can look up plan.SelectionID directly. Empty when
+	// credsource is disabled.
+	usageAcc map[string]*intcred.UsageAccumulator
 }
 
 // Server is the miroxy HTTP server.
 type Server struct {
-	mux        *http.ServeMux
-	cfgPath    string                        // config file path for reload
-	cfg        atomic.Pointer[config.Config] // swapped atomically on reload
-	routing    atomic.Pointer[routingState]  // selectors + timeouts, swapped atomically
-	pipe       *pipeline.Pipeline
-	dispatcher dispatch.Dispatcher
-	inFlight   atomic.Int64 // count of active requests, used for graceful shutdown logging
-	dumpStore     dump.Store        // nil when dump is disabled
-	tokenStats    *stats.Registry  // in-process token usage counters; never nil
-	compressStats *ccomp.Stats     // nil when compress is disabled
+	mux           *http.ServeMux
+	cfgPath       string                        // config file path for reload
+	cfg           atomic.Pointer[config.Config] // swapped atomically on reload
+	routing       atomic.Pointer[routingState]  // selectors + timeouts, swapped atomically
+	pipe          *pipeline.Pipeline
+	dispatcher    dispatch.Dispatcher
+	inFlight      atomic.Int64    // count of active requests, used for graceful shutdown logging
+	dumpStore     dump.Store      // nil when dump is disabled
+	tokenStats    *stats.Registry // in-process token usage counters; never nil
+	compressStats *ccomp.Stats    // nil when compress is disabled
 	startTime     time.Time
 
 	// Proxy lifecycle — used by the serve loop and admin stop/start endpoints.
 	proxyRunning atomic.Bool
 	stopProxyCh  chan struct{} // buffered(1); admin writes, serve loop reads
 	startProxyCh chan struct{} // buffered(1); admin writes, serve loop reads
+
+	// credSourceCancel stops the current generation's CredSource background
+	// pollers (see buildRoutingState). Not read on the request path — only
+	// touched by New, Reload, and Close, which are never concurrent with
+	// each other — so it needs no atomic/mutex guard.
+	credSourceCancel context.CancelFunc
+
+	// localStateStore is opened once at New() time (nil when local_state is
+	// disabled or sidecar.credsource is enabled) and reused across Reload —
+	// changing local_state config requires a restart, same as server.port.
+	localStateStore *localstate.Store
 }
 
 // credentialFromConfig wraps a raw key into the appropriate typed Credential.
@@ -77,44 +94,79 @@ func credentialFromConfig(keyValue, authStyle string) cred.Credential {
 	}
 }
 
-// buildCredSpecsFromPool builds CredSpec slice from a KeyPoolCfg using a given authStyle.
-func buildCredSpecsFromPool(kp config.KeyPoolCfg, authStyle string) []selector.CredSpec {
-	specs := make([]selector.CredSpec, 0, len(kp.Keys)+1)
+// buildCredSpecsFromPool builds CredSpec slice from a CredPoolCfg using a given authStyle.
+// poolName is used only for the oauth_refresh multi-replica warning below.
+func buildCredSpecsFromPool(kp config.CredPoolCfg, authStyle, poolName string) []selector.CredSpec {
+	if kp.Type == "oauth_refresh" && len(kp.Keys) > 0 {
+		intcred.WarnIfMultiReplicaUnsafe(poolName)
+	}
+	specs := make([]selector.CredSpec, 0, len(kp.Keys))
 	for _, k := range kp.Keys {
 		var src selector.CredentialSource
-		if kp.Type == "oauth_refresh" {
+		switch {
+		case kp.Type == "oauth_refresh":
 			src = intcred.NewOAuthSource(kp.ClientID, kp.ClientSecret, k.Key)
-		} else {
+		case authStyle == "sigv4":
+			// Static: SigV4Credential.Apply is intentionally unimplemented
+			// pending an SDKDispatcher (see core/cred/credential.go) — this
+			// wires the config → object model, not request dispatch itself.
+			src = selector.NewStaticSource(&cred.SigV4Credential{
+				AccessKeyID:     k.AccessKeyID,
+				SecretAccessKey: k.SecretAccessKey,
+				SessionToken:    k.SessionToken,
+				Region:          kp.Region,
+				Service:         kp.Service,
+			})
+		default:
 			src = selector.NewStaticSource(credentialFromConfig(k.Key, authStyle))
 		}
 		specs = append(specs, selector.CredSpec{Name: k.Name, Source: src})
 	}
-	if kp.CredBroker != nil {
-		cb := kp.CredBroker
-		refreshSecs := cb.RefreshSeconds
-		if refreshSecs <= 0 {
-			refreshSecs = 30
-		}
-		broker := intcred.NewConnectBrokerClient(cb.URL, cb.Token)
-		src := intcred.NewBrokerSource(broker, cb.Pool)
-		poller := intcred.NewBrokerPoller(src, broker, cb.Pool, time.Duration(refreshSecs)*time.Second)
-		poller.Start(context.Background())
-		specs = append(specs, selector.CredSpec{Name: "cred_broker:" + cb.Pool, Source: src})
-	}
 	return specs
 }
 
-// newCredPool builds a CredPool from a KeyPoolCfg and authStyle.
-func newCredPool(kp config.KeyPoolCfg, authStyle string) *selector.CredPool {
-	specs := buildCredSpecsFromPool(kp, authStyle)
-	return selector.NewCredPool(selector.CredPoolConfig{
-		Keys:      specs,
-		Strategy:  kp.Strategy,
-		Threshold: kp.CircuitBreakThreshold,
-		Cooldown:  time.Duration(kp.CooldownSeconds) * time.Second,
+// newCredPool builds a CredPool from a CredPoolCfg and authStyle.
+//
+// When credClient is non-nil (credsource.enabled), one additional CredSpec
+// sourcing from credstone (poolID = poolName) is appended alongside the
+// pool's local keys, and its background health poller is started against
+// pollerCtx. A pool not registered in credstone (or temporarily exhausted
+// there) simply parks that one entry — the pool's local keys keep serving,
+// giving the fallback behavior for free via CredPool's existing per-entry
+// circuit-break.
+//
+// The returned *intcred.UsageAccumulator is nil unless credClient is non-nil;
+// callers key it by the same "credsource:"+poolName SelectionID the pool
+// uses internally, so UpstreamExecutor can look it up by plan.SelectionID
+// with no extra bookkeeping.
+func newCredPool(
+	kp config.CredPoolCfg,
+	authStyle string,
+	poolName string,
+	credClient *intcred.CredstoneClient,
+	syncInterval time.Duration,
+	pollerCtx context.Context,
+) (*selector.CredPool, *intcred.UsageAccumulator) {
+	specs := buildCredSpecsFromPool(kp, authStyle, poolName)
+	var usage *intcred.UsageAccumulator
+	if credClient != nil {
+		cs := intcred.NewCredSource(credClient, poolName)
+		cs.StartPoller(pollerCtx, syncInterval)
+		usage = intcred.NewUsageAccumulator(credClient, poolName)
+		usage.StartFlusher(pollerCtx, syncInterval)
+		cs.SetUsageAccumulator(usage)
+		specs = append(specs, selector.CredSpec{Name: "credsource:" + poolName, Source: cs})
+	}
+	pool := selector.NewCredPool(selector.CredPoolConfig{
+		Keys:          specs,
+		Strategy:      kp.Strategy,
+		Threshold:     kp.CircuitBreakThreshold,
+		Cooldown:      time.Duration(kp.CooldownSeconds) * time.Second,
 		RateLimitRPM:  kp.RateLimitRPM,
 		RateSoftLimit: kp.RateSoftLimit,
+		RateLimitTPM:  kp.RateLimitTPM,
 	})
+	return pool, usage
 }
 
 // buildTranslator creates the appropriate Translator for the given protocol and model.
@@ -152,16 +204,19 @@ func resolveProto(m config.ModelEntry) (proto, clientProto string) {
 // namedPoolAuthStyle infers the auth_style for a named pool by scanning model
 // entries and routing targets that reference it. Returns "bearer" as default.
 func namedPoolAuthStyle(poolName string, cfg *config.Config) string {
+	if kp, ok := cfg.CredPools[poolName]; ok && kp.AuthStyle != "" {
+		return kp.AuthStyle
+	}
 	for _, m := range cfg.ModelRoutes {
 		if m.Routing != nil {
 			for _, t := range m.Routing.Targets {
-				if t.KeypoolRef == poolName && t.AuthStyle != "" {
+				if t.CredpoolRef == poolName && t.AuthStyle != "" {
 					return t.AuthStyle
 				}
 			}
 			continue
 		}
-		if m.KeypoolRef == poolName && m.AuthStyle != "" {
+		if m.CredpoolRef == poolName && m.AuthStyle != "" {
 			return m.AuthStyle
 		}
 	}
@@ -169,11 +224,34 @@ func namedPoolAuthStyle(poolName string, cfg *config.Config) string {
 }
 
 // buildRoutingState builds selectors and timeouts from a config.
-func buildRoutingState(cfg *config.Config) *routingState {
-	namedPools := make(map[string]*selector.CredPool, len(cfg.KeyPools))
-	for name, kp := range cfg.KeyPools {
+//
+// The returned context.CancelFunc stops every CredSource poller started
+// during this build; it is a no-op when credsource is disabled. Callers
+// must invoke it once this routingState is replaced (on Reload) or the
+// server shuts down, so pollers from superseded generations don't leak.
+func buildRoutingState(cfg *config.Config, localStore *localstate.Store) (*routingState, context.CancelFunc) {
+	pollerCtx, cancelPollers := context.WithCancel(context.Background())
+
+	var credClient *intcred.CredstoneClient
+	if cfg.Sidecar.CredSource.Enabled {
+		credClient = intcred.NewCredstoneClient(cfg.Sidecar.CredSource.BaseURL, cfg.Sidecar.CredSource.AuthToken)
+		slog.Info("credsource enabled — credentials also served by credstone", "base_url", cfg.Sidecar.CredSource.BaseURL)
+	}
+	syncInterval := time.Duration(cfg.Sidecar.CredSource.SyncInterval) * time.Second
+
+	namedPools := make(map[string]*selector.CredPool, len(cfg.CredPools))
+	usageAcc := make(map[string]*intcred.UsageAccumulator)
+	for name, kp := range cfg.CredPools {
 		authStyle := namedPoolAuthStyle(name, cfg)
-		namedPools[name] = newCredPool(kp, authStyle)
+		pool, usage := newCredPool(kp, authStyle, name, credClient, syncInterval, pollerCtx)
+		namedPools[name] = pool
+		if usage != nil {
+			usageAcc["credsource:"+name] = usage
+		}
+		if localStore != nil {
+			pool.RestoreHealth(loadHealthSnapshot(localStore, name))
+			startHealthSnapshotLoop(pollerCtx, pool, localStore, name)
+		}
 	}
 	sels := make(map[string]selector.Selector, len(cfg.ModelRoutes))
 	timeouts := make(map[string]time.Duration, len(cfg.ModelRoutes))
@@ -182,11 +260,11 @@ func buildRoutingState(cfg *config.Config) *routingState {
 		timeouts[m.ModelName] = modelTimeout(m)
 	}
 
-	// Build passthrough selectors from keypools tagged with provider: "anthropic"|"openai".
+	// Build passthrough selectors from credpools tagged with provider: "anthropic"|"openai".
 	// These handle models that are not in model_routes: the client's model name is forwarded
 	// as-is to the upstream provider (e.g. claude-opus-4-8 → Anthropic, gpt-5.4 → OpenAI).
 	passthrough := make(map[string]selector.Selector)
-	for poolName, kp := range cfg.KeyPools {
+	for poolName, kp := range cfg.CredPools {
 		if kp.Provider == "" {
 			continue
 		}
@@ -205,7 +283,7 @@ func buildRoutingState(cfg *config.Config) *routingState {
 		slog.Info("passthrough selector built", "provider", kp.Provider, "pool", poolName)
 	}
 
-	return &routingState{selectors: sels, timeouts: timeouts, passthroughSelectors: passthrough}
+	return &routingState{selectors: sels, timeouts: timeouts, passthroughSelectors: passthrough, usageAcc: usageAcc}, cancelPollers
 }
 
 // New creates a production Server.
@@ -228,15 +306,18 @@ func New(cfg *config.Config, cfgPath string) *Server {
 		}
 	}
 
-	rt := buildRoutingState(cfg)
+	s.localStateStore = openLocalStateStore(cfg)
+
+	rt, cancelPollers := buildRoutingState(cfg, s.localStateStore)
 	s.routing.Store(rt)
+	s.credSourceCancel = cancelPollers
 
 	probers := make(map[string]*keyProber, len(cfg.ModelRoutes))
 	for _, m := range cfg.ModelRoutes {
 		probers[m.ModelName] = newKeyProber(m.ModelName, rt.selectors[m.ModelName], s.dispatcher)
 	}
 
-	plugins := []pipeline.Plugin{newUpstreamExecutor(probers, s.tokenStats)}
+	plugins := []pipeline.Plugin{newUpstreamExecutor(probers, s.tokenStats, rt.usageAcc)}
 	if cfg.Compress.Enabled {
 		cp, cs := buildCompressPlugin(&cfg.Compress)
 		s.compressStats = cs
@@ -248,6 +329,91 @@ func New(cfg *config.Config, cfgPath string) *Server {
 	s.pipe = pipeline.New(plugins)
 	s.registerRoutes(cfg)
 	return s
+}
+
+// openLocalStateStore opens the standalone-mode health cache per
+// LocalStateConfig, or returns nil when it doesn't apply. sidecar.credsource
+// always wins: credstone is already the authoritative, cross-restart source
+// of credential health, so a local disk cache would add nothing but a second
+// copy that can disagree with it — local_state is ignored (with a warning)
+// rather than silently doing something in that mode.
+func openLocalStateStore(cfg *config.Config) *localstate.Store {
+	if cfg.Sidecar.CredSource.Enabled {
+		if cfg.LocalState.Enabled {
+			slog.Warn("local_state.enabled is ignored while sidecar.credsource.enabled is true — " +
+				"credstone is already the authoritative source of credential health")
+		}
+		return nil
+	}
+	if !cfg.LocalState.Enabled {
+		return nil
+	}
+	path := cfg.LocalState.Path
+	if path == "" {
+		path = "./miroxy-local-state.db"
+	}
+	slog.Info("local_state enabled — credential health will be cached to disk", "path", path)
+	return localstate.Open(path)
+}
+
+// healthSnapshotInterval is how often each credpool's health state is
+// mirrored to the local_state store. Not currently configurable — a fixed
+// default keeps the config surface small; revisit if someone needs to tune it.
+const healthSnapshotInterval = 30 * time.Second
+
+// startHealthSnapshotLoop periodically mirrors pool's per-credential health
+// to store under poolName, so a standalone-mode restart doesn't immediately
+// re-hammer a credential that was still cooling down. Runs until ctx is
+// cancelled — same per-generation lifecycle as CredSource's poller and
+// UsageAccumulator's flusher — and does one best-effort final flush on exit,
+// which is how both Reload (superseding this generation) and Close
+// (shutdown) get a last snapshot without any extra call site.
+func startHealthSnapshotLoop(ctx context.Context, pool *selector.CredPool, store *localstate.Store, poolName string) {
+	go func() {
+		t := time.NewTicker(healthSnapshotInterval)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				flushHealthSnapshot(pool, store, poolName)
+				return
+			case <-t.C:
+				flushHealthSnapshot(pool, store, poolName)
+			}
+		}
+	}()
+}
+
+func flushHealthSnapshot(pool *selector.CredPool, store *localstate.Store, poolName string) {
+	snap := pool.HealthSnapshot()
+	converted := make(map[string]localstate.CredHealth, len(snap))
+	for id, h := range snap {
+		converted[id] = localstate.CredHealth{
+			State:             h.State,
+			CoolEndUnixNano:   h.CoolEnd.UnixNano(),
+			RateLimitFailures: h.RateLimitFailures,
+			Failures:          h.Failures,
+		}
+	}
+	if err := store.SaveAllCredHealth(poolName, converted); err != nil {
+		slog.Warn("local_state: health snapshot flush failed", "pool", poolName, "error", err)
+	}
+}
+
+// loadHealthSnapshot reads poolName's persisted health snapshot and converts
+// it to the selector package's snapshot type, ready for CredPool.RestoreHealth.
+func loadHealthSnapshot(store *localstate.Store, poolName string) map[string]selector.CredHealthSnapshot {
+	raw := store.LoadAllCredHealth(poolName)
+	out := make(map[string]selector.CredHealthSnapshot, len(raw))
+	for id, h := range raw {
+		out[id] = selector.CredHealthSnapshot{
+			State:             h.State,
+			CoolEnd:           time.Unix(0, h.CoolEndUnixNano),
+			RateLimitFailures: h.RateLimitFailures,
+			Failures:          h.Failures,
+		}
+	}
+	return out
 }
 
 // buildCompressPlugin constructs a CompressPlugin from the config block.
@@ -277,20 +443,21 @@ func buildSimpleSelector(m config.ModelEntry, namedPools map[string]*selector.Cr
 	trans := buildUpstreamAdapter(proto, clientProto, m.Mode, m.ProviderModel, m.APIBase)
 
 	var pool *selector.CredPool
-	if m.KeypoolRef != "" {
-		pool = namedPools[m.KeypoolRef]
+	if m.CredpoolRef != "" {
+		pool = namedPools[m.CredpoolRef]
 	} else {
-		// Inline keypool — backward-compatible path.
-		specs := buildCredSpecsFromPool(m.KeyPool, m.AuthStyle)
+		// Inline credpool — backward-compatible path.
+		specs := buildCredSpecsFromPool(m.CredPool, m.AuthStyle, m.ModelName)
 		pool = selector.NewCredPool(selector.CredPoolConfig{
 			Keys:          specs,
-			Upstream:      trans,    // kept for inline pools (prober compat)
+			Upstream:      trans, // kept for inline pools (prober compat)
 			ProviderModel: m.ProviderModel,
-			Strategy:      m.KeyPool.Strategy,
-			Threshold:     m.KeyPool.CircuitBreakThreshold,
-			Cooldown:      time.Duration(m.KeyPool.CooldownSeconds) * time.Second,
-			RateLimitRPM:  m.KeyPool.RateLimitRPM,
-			RateSoftLimit: m.KeyPool.RateSoftLimit,
+			Strategy:      m.CredPool.Strategy,
+			Threshold:     m.CredPool.CircuitBreakThreshold,
+			Cooldown:      time.Duration(m.CredPool.CooldownSeconds) * time.Second,
+			RateLimitRPM:  m.CredPool.RateLimitRPM,
+			RateSoftLimit: m.CredPool.RateSoftLimit,
+			RateLimitTPM:  m.CredPool.RateLimitTPM,
 		})
 		// Inline pool: translator is embedded in the pool, no TargetSelector needed.
 		return pool
@@ -303,10 +470,10 @@ func buildSimpleSelector(m config.ModelEntry, namedPools map[string]*selector.Cr
 func buildRoutingSelector(m config.ModelEntry, namedPools map[string]*selector.CredPool) selector.Selector {
 	inner := make([]selector.Selector, 0, len(m.Routing.Targets))
 	for _, t := range m.Routing.Targets {
-		pool, ok := namedPools[t.KeypoolRef]
+		pool, ok := namedPools[t.CredpoolRef]
 		if !ok {
-			slog.Error("routing target references unknown keypool, skipping",
-				"model", m.ModelName, "keypool_ref", t.KeypoolRef)
+			slog.Error("routing target references unknown credpool, skipping",
+				"model", m.ModelName, "credpool_ref", t.CredpoolRef)
 			continue
 		}
 		clientProto := m.ClientProtocol
@@ -325,16 +492,17 @@ func NewWithTranslators(cfg *config.Config, translators map[string]coreup.Upstre
 	timeouts := make(map[string]time.Duration, len(cfg.ModelRoutes))
 	for _, m := range cfg.ModelRoutes {
 		trans := translators[m.ModelName]
-		specs := buildCredSpecsFromPool(m.KeyPool, m.AuthStyle)
+		specs := buildCredSpecsFromPool(m.CredPool, m.AuthStyle, m.ModelName)
 		pool := selector.NewCredPool(selector.CredPoolConfig{
 			Keys:          specs,
 			Upstream:      trans,
 			ProviderModel: m.ProviderModel,
-			Strategy:      m.KeyPool.Strategy,
-			Threshold:     m.KeyPool.CircuitBreakThreshold,
-			Cooldown:      time.Duration(m.KeyPool.CooldownSeconds) * time.Second,
-			RateLimitRPM:  m.KeyPool.RateLimitRPM,
-			RateSoftLimit: m.KeyPool.RateSoftLimit,
+			Strategy:      m.CredPool.Strategy,
+			Threshold:     m.CredPool.CircuitBreakThreshold,
+			Cooldown:      time.Duration(m.CredPool.CooldownSeconds) * time.Second,
+			RateLimitRPM:  m.CredPool.RateLimitRPM,
+			RateSoftLimit: m.CredPool.RateSoftLimit,
+			RateLimitTPM:  m.CredPool.RateLimitTPM,
 		})
 		sels[m.ModelName] = pool
 		timeouts[m.ModelName] = modelTimeout(m)
@@ -346,7 +514,7 @@ func NewWithTranslators(cfg *config.Config, translators map[string]coreup.Upstre
 	for _, m := range cfg.ModelRoutes {
 		probers[m.ModelName] = newKeyProber(m.ModelName, sels[m.ModelName], s.dispatcher)
 	}
-	s.pipe = pipeline.New([]pipeline.Plugin{newUpstreamExecutor(probers, s.tokenStats)})
+	s.pipe = pipeline.New([]pipeline.Plugin{newUpstreamExecutor(probers, s.tokenStats, nil)})
 	s.registerRoutes(cfg)
 	return s
 }
@@ -371,8 +539,8 @@ func newBase(cfg *config.Config, cfgPath string) *Server {
 func defaultAdapters() []coredown.DownstreamAdapter {
 	return []coredown.DownstreamAdapter{
 		&intdown.AnthropicAdapter{},
-		&intdown.OpenAIAdapter{},     // POST /v1/chat/completions
-		&intdown.ResponsesAdapter{},  // POST /v1/responses — Codex CLI (wire_api=responses)
+		&intdown.OpenAIAdapter{},    // POST /v1/chat/completions
+		&intdown.ResponsesAdapter{}, // POST /v1/responses — Codex CLI (wire_api=responses)
 	}
 }
 
@@ -551,23 +719,51 @@ func (s *Server) Reload() (*ReloadResult, error) {
 		return nil, fmt.Errorf("reload rejected: admin.addr changed %s→%s (requires restart)",
 			effectiveAdminAddr(oldCfg), effectiveAdminAddr(newCfg))
 	}
+	if newCfg.LocalState != oldCfg.LocalState || newCfg.Sidecar.CredSource.Enabled != oldCfg.Sidecar.CredSource.Enabled {
+		return nil, fmt.Errorf("reload rejected: local_state or sidecar.credsource.enabled changed (requires restart) — " +
+			"the local state store is opened once at startup and not rebuilt on reload")
+	}
 
-	newState := buildRoutingState(newCfg)
+	newState, newCancelPollers := buildRoutingState(newCfg, s.localStateStore)
 	oldState := s.routing.Load()
 	result := diffRouting(oldState, newState)
 
 	// Atomic swap — in-flight requests hold references to old selectors and
 	// complete normally; GC reclaims old pools once all references drop.
+	oldCancelPollers := s.credSourceCancel
 	s.routing.Store(newState)
 	s.cfg.Store(newCfg)
+	s.credSourceCancel = newCancelPollers
+
+	// Cancel the previous generation's CredSource pollers only after the new
+	// state is live, so there's no gap in health-check freshness.
+	if oldCancelPollers != nil {
+		oldCancelPollers()
+	}
 
 	slog.Info("config reloaded", "changes", result.String(),
-		"models", len(newCfg.ModelRoutes), "pools", len(newCfg.KeyPools))
+		"models", len(newCfg.ModelRoutes), "pools", len(newCfg.CredPools))
 	return result, nil
 }
 
 // InFlightCount returns the number of requests currently being processed.
 func (s *Server) InFlightCount() int64 { return s.inFlight.Load() }
+
+// Close stops background goroutines owned by the Server — currently just
+// the current generation's CredSource pollers. Call during graceful
+// shutdown, alongside the HTTP server's own Shutdown.
+func (s *Server) Close() {
+	if s.credSourceCancel != nil {
+		s.credSourceCancel()
+	}
+	// The health-snapshot loop's final flush (triggered by the cancel above)
+	// runs in its own goroutine and may not finish before this Close call —
+	// acceptable: it's a best-effort cache, same tolerance as every other
+	// local_state write.
+	if s.localStateStore != nil {
+		_ = s.localStateStore.Close()
+	}
+}
 
 func effectivePort(cfg *config.Config) int {
 	if cfg.Server.Port == 0 {
@@ -591,7 +787,6 @@ func AdminEnabled(cfg *config.Config) bool {
 	}
 	return *cfg.Admin.Enabled
 }
-
 
 func diffRouting(old, new *routingState) *ReloadResult {
 	r := &ReloadResult{}
@@ -679,7 +874,6 @@ func (s *Server) requestLogger(next http.Handler) http.Handler {
 	})
 }
 
-
 // isClaudeCodeClient reports whether the request comes from Claude Code.
 // Claude Code identifies itself via User-Agent: claude-code/<version>.
 func isClaudeCodeClient(r *http.Request) bool {
@@ -729,7 +923,6 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, resp)
 }
 
-
 // ReloadText is the ServerRef implementation of Reload — returns a plain string.
 func (s *Server) ReloadText() (string, error) {
 	r, err := s.Reload()
@@ -738,6 +931,7 @@ func (s *Server) ReloadText() (string, error) {
 	}
 	return r.String(), nil
 }
+
 // dumpRequest serialises a MessageRequest to JSON for dump capture.
 func dumpRequest(req *types.MessageRequest) ([]byte, error) {
 	return json.Marshal(req)

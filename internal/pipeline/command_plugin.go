@@ -30,6 +30,7 @@ const priorityCommand = PriorityAuth + 5 // = 5
 // ServerRef is the subset of Server capabilities the CommandPlugin needs.
 type ServerRef interface {
 	StatsText() string
+	ModelInfoText() string
 	SetDump(enabled bool)
 }
 
@@ -116,6 +117,9 @@ func (p *CommandPlugin) dispatch(c *LLMContext, next Handler, cmd, extra string)
 	case "stats":
 		return p.respond(c, next, p.srv.StatsText(), extra)
 
+	case "model":
+		return p.respond(c, next, p.srv.ModelInfoText(), extra)
+
 	case "health":
 		return p.respond(c, next, "status: healthy\nin_flight: (see :miroxy stats)", extra)
 
@@ -184,7 +188,8 @@ func (p *CommandPlugin) topHelp() string {
 	}
 	return fmt.Sprintf(`miroxy built-in commands (zero LLM tokens)
 ============================================================
-  :miroxy stats              Uptime, model routing, keypool health
+  :miroxy stats              Uptime, model routing, credpool health
+  :miroxy model              Current model, routes, providers, credpools + key names (read-only)
   Use /model in Claude Code or Codex to switch models via the native picker
   :miroxy dump on|off        %s
   :miroxy health             Quick health check
@@ -194,7 +199,7 @@ func (p *CommandPlugin) topHelp() string {
   :miroxy <cmd> ?|help       Show help for a specific command
 
 Tip: append a question after any command to inject the result into the LLM.
-  Example:  :miroxy stats is keypool utilization high?`, dumpNote)
+  Example:  :miroxy stats is credpool utilization high?`, dumpNote)
 }
 
 func (p *CommandPlugin) cmdHelp(cmd string) string {
@@ -202,12 +207,17 @@ func (p *CommandPlugin) cmdHelp(cmd string) string {
 		"stats": `  :miroxy stats
   :miroxy stats <question>   — get stats then ask the LLM <question>
 
-Shows: uptime, in-flight count, model routing table, keypool health.`,
+Shows: uptime, in-flight count, model routing table, credpool health.`,
 
-		"model": `  Model switching is available via /model in Claude Code and Codex.
-  miroxy routes requests based on the model name sent by the client.
+		"model": `  :miroxy model
+  :miroxy model <question>   — get model info then ask the LLM <question>
 
-Model names come from model_routes in config. Use "show" to discover them.`,
+Read-only. Shows: current default model, model_routes (client model name →
+provider / provider_model), configured providers, and each credpool's key
+names (never key values).
+
+To switch models, use /model in Claude Code or Codex — the native picker,
+not this command.`,
 
 		"dump": `  :miroxy dump on    — capture all requests/responses to dump.jsonl
   :miroxy dump off   — stop capturing

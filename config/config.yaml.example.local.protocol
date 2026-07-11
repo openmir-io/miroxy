@@ -49,7 +49,7 @@ providers:
     protocol: openai
     auth_style: none
 
-keypools:
+credpools:
   ollama-local:
     keys:
       - local: "ollama"    # placeholder — ollama ignores the key value
@@ -71,23 +71,23 @@ model_routes:
   - model_name: local
     provider: ollama
     provider_model: llama3.2        # `ollama list` to see available models
-    keypool_ref: ollama-local
+    credpool_ref: ollama-local
     timeout_seconds: 120            # local models can be slow on first token
 
   - model_name: local-fast
     provider: ollama
     provider_model: phi3            # smaller, faster model
-    keypool_ref: ollama-local
+    credpool_ref: ollama-local
     timeout_seconds: 60
 
   - model_name: local-lmstudio
     provider: lmstudio
     provider_model: local-model     # matches the model loaded in LM Studio
-    keypool_ref: lmstudio-local
+    credpool_ref: lmstudio-local
     timeout_seconds: 120
 
   - model_name: local-vllm
     provider: vllm
     provider_model: meta-llama/Meta-Llama-3-8B-Instruct
-    keypool_ref: vllm-local
+    credpool_ref: vllm-local
     timeout_seconds: 60

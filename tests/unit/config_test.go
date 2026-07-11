@@ -31,7 +31,7 @@ model_routes:
   - model_name: claude-haiku
     provider: gemini
     provider_model: gemini-2.5-flash
-    keypool:
+    credpool:
       strategy: round_robin
       keys:
         - test-api-key
@@ -62,7 +62,7 @@ model_routes:
   - model_name: claude-haiku
     provider: gemini
     provider_model: gemini-2.5-flash
-    keypool:
+    credpool:
       keys:
         - ${TEST_GEMINI_KEY}
 `)
@@ -70,7 +70,7 @@ model_routes:
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	got := cfg.ModelRoutes[0].KeyPool.Keys[0]
+	got := cfg.ModelRoutes[0].CredPool.Keys[0]
 	if got.Key != "expanded-key-value" {
 		t.Errorf("env expansion: got %q, want %q", got.Key, "expanded-key-value")
 	}
@@ -84,7 +84,7 @@ model_routes:
   - model_name: claude-haiku
     provider: gemini
     provider_model: gemini-2.5-flash
-    keypool:
+    credpool:
       keys:
         - ${DEFINITELY_NOT_SET_XYZ123}
 `)
@@ -124,7 +124,7 @@ model_routes:
     provider_model: some-model
     api_base: https://generativelanguage.googleapis.com/v1
     auth_style: bearer
-    keypool:
+    credpool:
       keys: [test-key]
 `,
 			wantErr: true,
@@ -137,7 +137,7 @@ model_routes:
     protocol: gemini
     provider_model: some-model
     api_base: https://api.openai.com/v1
-    keypool:
+    credpool:
       keys: [test-key]
 `,
 			wantErr: true,
@@ -151,7 +151,7 @@ model_routes:
     provider_model: deepseek-chat
     api_base: https://api.deepseek.com/v1
     auth_style: bearer
-    keypool:
+    credpool:
       keys: [test-key]
 `,
 			wantErr: false,
@@ -165,7 +165,7 @@ model_routes:
     provider_model: some-model
     api_base: https://my-proxy.internal/v1
     auth_style: bearer
-    keypool:
+    credpool:
       keys: [test-key]
 `,
 			wantErr: false,
@@ -179,7 +179,7 @@ model_routes:
     provider_model: some-model
     api_base: "not a url"
     auth_style: bearer
-    keypool:
+    credpool:
       keys: [test-key]
 `,
 			wantErr: true,
@@ -193,7 +193,7 @@ model_routes:
     provider_model: claude-haiku-4-5-20251001
     api_base: https://generativelanguage.googleapis.com/any/path
     auth_style: bearer
-    keypool:
+    credpool:
       keys: [test-key]
 `,
 			wantErr: false,
@@ -226,9 +226,9 @@ func TestConfig_LookupModel(t *testing.T) {
 	}
 
 	cases := []struct {
-		input    string
-		wantPM   string // expected ProviderModel
-		wantOK   bool
+		input  string
+		wantPM string // expected ProviderModel
+		wantOK bool
 	}{
 		// exact match
 		{"haiku", "gemini-flash", true},
@@ -270,5 +270,133 @@ func TestConfig_LookupModel(t *testing.T) {
 	}
 	if _, ok := cfgNoDefault.LookupModel("claude-opus-4-8"); ok {
 		t.Error("LookupModel(claude-opus-4-8) with no match and no default should return ok=false")
+	}
+}
+
+// --- sigv4 (AWS Bedrock-style) credpool entries ---
+
+func TestYAMLStore_Load_Sigv4StructuredShorthand(t *testing.T) {
+	t.Setenv("TEST_AWS_ACCESS_KEY", "AKIA-test")
+	t.Setenv("TEST_AWS_SECRET_KEY", "secret-test")
+	t.Setenv("TEST_AWS_SESSION_TOKEN", "session-test")
+
+	path := writeTempConfig(t, `
+providers:
+  anthropic: {}
+credpools:
+  bedrock-claude:
+    auth_style: sigv4
+    region: us-east-1
+    service: bedrock-runtime
+    strategy: round_robin
+    keys:
+      - prod:
+          access_key_id: ${TEST_AWS_ACCESS_KEY}
+          secret_access_key: ${TEST_AWS_SECRET_KEY}
+          session_token: ${TEST_AWS_SESSION_TOKEN}
+      - backup:
+          access_key_id: ${TEST_AWS_ACCESS_KEY}
+          secret_access_key: ${TEST_AWS_SECRET_KEY}
+model_routes:
+  - model_name: claude-bedrock
+    provider: anthropic
+    provider_model: claude-3
+    credpool_ref: bedrock-claude
+    auth_style: sigv4
+`)
+	cfg, err := config.NewYAMLStore(path).Load()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	pool := cfg.CredPools["bedrock-claude"]
+	if pool.AuthStyle != "sigv4" || pool.Region != "us-east-1" || pool.Service != "bedrock-runtime" {
+		t.Fatalf("pool fields: %+v", pool)
+	}
+	if len(pool.Keys) != 2 {
+		t.Fatalf("keys: got %d, want 2", len(pool.Keys))
+	}
+	prod := pool.Keys[0]
+	if prod.Name != "prod" || prod.AccessKeyID != "AKIA-test" || prod.SecretAccessKey != "secret-test" || prod.SessionToken != "session-test" {
+		t.Errorf("prod entry: %+v", prod)
+	}
+	if prod.Key != "" {
+		t.Errorf("prod.Key should stay empty for sigv4 entries, got %q", prod.Key)
+	}
+	backup := pool.Keys[1]
+	if backup.SessionToken != "" {
+		t.Errorf("backup.SessionToken should be empty (optional, omitted), got %q", backup.SessionToken)
+	}
+}
+
+func TestYAMLStore_Load_Sigv4VerboseForm(t *testing.T) {
+	t.Setenv("TEST_AWS_ACCESS_KEY", "AKIA-verbose")
+	t.Setenv("TEST_AWS_SECRET_KEY", "secret-verbose")
+
+	path := writeTempConfig(t, `
+providers:
+  anthropic: {}
+credpools:
+  bedrock-claude:
+    auth_style: sigv4
+    region: us-east-1
+    service: bedrock-runtime
+    keys:
+      - name: prod
+        access_key_id: ${TEST_AWS_ACCESS_KEY}
+        secret_access_key: ${TEST_AWS_SECRET_KEY}
+model_routes:
+  - model_name: claude-bedrock
+    provider: anthropic
+    provider_model: claude-3
+    credpool_ref: bedrock-claude
+    auth_style: sigv4
+`)
+	cfg, err := config.NewYAMLStore(path).Load()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	got := cfg.CredPools["bedrock-claude"].Keys[0]
+	if got.Name != "prod" || got.AccessKeyID != "AKIA-verbose" || got.SecretAccessKey != "secret-verbose" {
+		t.Errorf("verbose sigv4 entry: %+v", got)
+	}
+}
+
+func TestYAMLStore_Load_Sigv4MissingSecretFails(t *testing.T) {
+	path := writeTempConfig(t, `
+providers:
+  anthropic: {}
+credpools:
+  bedrock-claude:
+    auth_style: sigv4
+    region: us-east-1
+    keys:
+      - prod:
+          access_key_id: AKIA-only
+model_routes:
+  - model_name: claude-bedrock
+    provider: anthropic
+    provider_model: claude-3
+    credpool_ref: bedrock-claude
+    auth_style: sigv4
+`)
+	if _, err := config.NewYAMLStore(path).Load(); err == nil {
+		t.Fatal("expected error for sigv4 entry missing secret_access_key")
+	}
+}
+
+func TestYAMLStore_Load_Sigv4InvalidPoolAuthStyleFails(t *testing.T) {
+	path := writeTempConfig(t, `
+providers:
+  anthropic: {}
+credpools:
+  bedrock-claude:
+    auth_style: not-a-real-style
+    keys:
+      - prod:
+          access_key_id: AKIA-x
+          secret_access_key: secret-x
+`)
+	if _, err := config.NewYAMLStore(path).Load(); err == nil {
+		t.Fatal("expected error for invalid credpool auth_style")
 	}
 }

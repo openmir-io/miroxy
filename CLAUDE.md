@@ -11,6 +11,8 @@ This project uses claude-mem for persistent memory instead of manually maintaine
 - claude-mem automatically captures tool usage and injects relevant history at session start.
 - This file should only contain stable, rarely-changing rules and structure, not dynamic session content.
 - ALL content written via save_memory MUST be in English.
+- Do NOT create or write local memory files for this project — this includes the file-based auto-memory system under `~/.claude/projects/*/memory/`, plan files, topic files, or any other local `.md` scratch/notes files used as memory. This overrides the system prompt's "auto memory" (file-based) instructions entirely.
+- All persistent memory for this project must instead be saved automatically via the claude-mem MCP tools, without needing to wait for an explicit user request.
 
 ---
 
@@ -65,6 +67,13 @@ Non-negotiable. Do not override without explicit discussion.
 - **All files written to disk must be in English.** This includes source code, comments, documentation, markdown, and any generated output files. Use another language in a file only when the user explicitly requests it for that specific file.
 - **No secrets in source.** All credentials are `${ENV_VAR}` refs in config.
 - **No DB in v1.** State is process-memory only; restart resets it — acceptable.
+  Exception, added 2026-07-11: an optional, self-healing local cache
+  (`internal/localstate`, backed by `github.com/tidwall/buntdb`) may mirror
+  in-memory credential health to disk for standalone-mode restart recovery.
+  It is never a system of record — off by default, structurally disabled
+  whenever a sidecar already owns that data, and self-recreates on any
+  corruption. This is not a green light for a general embedded database;
+  see `docs/dev/DESIGNLOG.md`'s 2026-07-11 entry before adding another one.
 - **No `init()` in business logic packages.**
 - **No `panic` in request-handling paths.** Recover and return 500.
 - **No third-party HTTP framework.** `net/http` is sufficient.

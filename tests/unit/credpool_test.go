@@ -415,3 +415,212 @@ func TestRateLimit_ErrRateLimitIsRateLimitError(t *testing.T) {
 		t.Error("errors.Is(ErrRateLimit, ErrRateLimit) should be true")
 	}
 }
+
+// --- TPM (tokens-per-minute) sliding window tests ---
+//
+// TPM mirrors RPM's sliding window, but the sample can only be recorded via
+// RecordTokens after a response — there is no soft-limit reservation at
+// Select time, since token counts aren't known yet then.
+
+func newTPMPool(tpmLimit int, window time.Duration, keys ...string) *selector.CredPool {
+	return selector.NewCredPool(selector.CredPoolConfig{
+		Keys:         toSpecs(keys...),
+		Strategy:     "round_robin",
+		Threshold:    5,
+		Cooldown:     5 * time.Second,
+		RateLimitTPM: tpmLimit,
+		RateWindow:   window,
+	})
+}
+
+// TestTPM_DisabledByDefault verifies RecordTokens is a harmless no-op and
+// Select never filters on tokens when RateLimitTPM is unset (0).
+func TestTPM_DisabledByDefault(t *testing.T) {
+	ctx := context.Background()
+	pool := newTPMPool(0, time.Minute, "only-key")
+
+	plan, err := pool.Select(ctx, nil)
+	if err != nil {
+		t.Fatalf("Select: %v", err)
+	}
+	pool.RecordTokens(plan.SelectionID, 1_000_000) // would blow any real budget
+	pool.Release(plan, nil)
+
+	if _, err := pool.Select(ctx, nil); err != nil {
+		t.Fatalf("expected key available with TPM disabled, got %v", err)
+	}
+}
+
+// TestTPM_SkipsCredentialOverBudget verifies that once RecordTokens pushes a
+// credential's window total at or above the cap, Select rotates to the next
+// credential instead.
+func TestTPM_SkipsCredentialOverBudget(t *testing.T) {
+	ctx := context.Background()
+	pool := selector.NewCredPool(selector.CredPoolConfig{
+		Keys:         toSpecs("key-a", "key-b"),
+		Strategy:     "least_requests",
+		Threshold:    5,
+		Cooldown:     5 * time.Second,
+		RateLimitTPM: 100,
+		RateWindow:   5 * time.Second,
+	})
+
+	// key_0 wins the first (tied, inFlight=0) selection under least_requests.
+	plan, err := pool.Select(ctx, nil)
+	if err != nil {
+		t.Fatalf("Select: %v", err)
+	}
+	if plan.SelectionID != "key_0" {
+		t.Fatalf("expected key_0 first, got %s", plan.SelectionID)
+	}
+	pool.RecordTokens(plan.SelectionID, 120) // over the 100 TPM cap
+	pool.Release(plan, nil)
+
+	// key_0 is now over budget — Select must rotate to key_1.
+	plan2, err := pool.Select(ctx, nil)
+	if err != nil {
+		t.Fatalf("Select after over-budget: %v", err)
+	}
+	if plan2.SelectionID != "key_1" {
+		t.Errorf("expected rotation to key_1, got %s", plan2.SelectionID)
+	}
+	pool.Release(plan2, nil)
+}
+
+// TestTPM_FallbackWhenAllOverBudget verifies that when every credential is
+// over its TPM budget, Select still returns one rather than ErrNoSelection —
+// same reactive-backstop behavior as the existing RPM soft-limit fallback.
+func TestTPM_FallbackWhenAllOverBudget(t *testing.T) {
+	ctx := context.Background()
+	pool := newTPMPool(50, 5*time.Second, "only-key")
+
+	plan, err := pool.Select(ctx, nil)
+	if err != nil {
+		t.Fatalf("Select: %v", err)
+	}
+	pool.RecordTokens(plan.SelectionID, 999)
+	pool.Release(plan, nil)
+
+	plan2, err := pool.Select(ctx, nil)
+	if err != nil {
+		t.Fatalf("expected key despite TPM overflow, got: %v", err)
+	}
+	pool.Release(plan2, nil)
+}
+
+// TestTPM_WindowExpiry verifies that recorded token samples age out after
+// RateWindow elapses, making a previously over-budget credential eligible
+// again — mirrors TestRateLimit_WindowExpiry for RPM.
+func TestTPM_WindowExpiry(t *testing.T) {
+	ctx := context.Background()
+	pool := newTPMPool(50, 100*time.Millisecond, "key-a", "key-b")
+
+	plan, err := pool.Select(ctx, nil)
+	if err != nil {
+		t.Fatalf("Select: %v", err)
+	}
+	pool.RecordTokens(plan.SelectionID, 200) // well over the 50 TPM cap
+	pool.Release(plan, nil)
+
+	time.Sleep(110 * time.Millisecond)
+
+	// Window has cleared — Select must succeed without ErrNoSelection.
+	plan2, err := pool.Select(ctx, nil)
+	if err != nil {
+		t.Fatalf("select after TPM window expiry: %v", err)
+	}
+	pool.Release(plan2, nil)
+}
+
+// TestTPM_RecordTokens_IgnoresNonPositiveAndUnknownID verifies RecordTokens is
+// a safe no-op for zero/negative token counts and unknown selection IDs.
+func TestTPM_RecordTokens_IgnoresNonPositiveAndUnknownID(t *testing.T) {
+	pool := newTPMPool(10, time.Minute, "only-key")
+	pool.RecordTokens("does-not-exist", 5)
+	pool.RecordTokens("key_0", 0)
+	pool.RecordTokens("key_0", -5)
+
+	// None of the above should have registered — key should still be usable.
+	plan, err := pool.Select(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("Select: %v", err)
+	}
+	pool.Release(plan, nil)
+}
+
+// --- HealthSnapshot / RestoreHealth (internal/localstate support) ---
+
+// TestHealthSnapshot_RestoreHealth_RoundTrip verifies that a cooldown applied
+// to one pool carries over to a fresh pool instance via
+// HealthSnapshot/RestoreHealth — the standalone-mode restart-recovery path.
+func TestHealthSnapshot_RestoreHealth_RoundTrip(t *testing.T) {
+	ctx := context.Background()
+	original := newPool("least_requests", "key-a", "key-b")
+
+	// Rate-limit key_0 (wins the tie under least_requests).
+	plan, err := original.Select(ctx, nil)
+	if err != nil {
+		t.Fatalf("Select: %v", err)
+	}
+	if plan.SelectionID != "key_0" {
+		t.Fatalf("expected key_0 first, got %s", plan.SelectionID)
+	}
+	original.Release(plan, &selector.RateLimitError{RetryAfter: time.Hour}) // long cooldown, won't expire mid-test
+
+	snap := original.HealthSnapshot()
+	if len(snap) != 2 {
+		t.Fatalf("snapshot has %d entries, want 2", len(snap))
+	}
+	if snap["key_0"].State != "rate_limited" {
+		t.Errorf("key_0 snapshot state = %q, want rate_limited", snap["key_0"].State)
+	}
+
+	// Fresh pool, same keys, never saw the 429 — restore the snapshot into it.
+	restored := newPool("least_requests", "key-a", "key-b")
+	restored.RestoreHealth(snap)
+
+	plan2, err := restored.Select(ctx, nil)
+	if err != nil {
+		t.Fatalf("Select on restored pool: %v", err)
+	}
+	if plan2.SelectionID != "key_1" {
+		t.Errorf("expected restored pool to skip still-cooling key_0, got %s", plan2.SelectionID)
+	}
+	restored.Release(plan2, nil)
+}
+
+// TestRestoreHealth_PastCoolEnd_ImmediatelyAvailable verifies that a restored
+// snapshot whose CoolEnd has already elapsed does not block Select — no
+// special-casing needed, available(now) already treats a past CoolEnd as
+// healthy.
+func TestRestoreHealth_PastCoolEnd_ImmediatelyAvailable(t *testing.T) {
+	pool := newPool("round_robin", "only-key")
+	pool.RestoreHealth(map[string]selector.CredHealthSnapshot{
+		"key_0": {State: "rate_limited", CoolEnd: time.Now().Add(-time.Hour)},
+	})
+
+	plan, err := pool.Select(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("Select after restoring an expired cooldown: %v", err)
+	}
+	pool.Release(plan, nil)
+}
+
+// TestRestoreHealth_UnknownIDAndEmpty_NoOp verifies RestoreHealth safely
+// ignores snapshot entries for credentials the pool doesn't have, and is a
+// harmless no-op on an empty/nil snapshot.
+func TestRestoreHealth_UnknownIDAndEmpty_NoOp(t *testing.T) {
+	pool := newPool("round_robin", "only-key")
+
+	pool.RestoreHealth(nil)
+	pool.RestoreHealth(map[string]selector.CredHealthSnapshot{})
+	pool.RestoreHealth(map[string]selector.CredHealthSnapshot{
+		"does-not-exist": {State: "rate_limited", CoolEnd: time.Now().Add(time.Hour)},
+	})
+
+	plan, err := pool.Select(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("Select: %v", err)
+	}
+	pool.Release(plan, nil)
+}

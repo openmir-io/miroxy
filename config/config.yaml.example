@@ -26,13 +26,13 @@ server:
   # model_discovery controls what GET /v1/models returns to clients (e.g. Claude Code model picker).
   #
   #   auto   (default) — miroxy also fetches the live model list from any configured Anthropic
-  #                       keypool at startup and injects discovered models into the routing table
+  #                       credpool at startup and injects discovered models into the routing table
   #                       in memory (config file is never modified). Models already present in
   #                       model_routes are skipped, preserving all explicit mappings. Discovered
   #                       models are shown with their exact Anthropic IDs (e.g.
   #                       claude-sonnet-4-6-20250219) so you can copy them directly into
   #                       model_routes when you want to override their routing.
-  #                       If no Anthropic keypool is configured, auto silently behaves as strict.
+  #                       If no Anthropic credpool is configured, auto silently behaves as strict.
   #
   #   strict — /v1/models returns exactly the models listed in model_routes below, nothing more.
   #            Use this when you want full control and no outbound calls at startup.
@@ -88,7 +88,7 @@ auth:
 # ─────────────────────────────────────────────────────────────────────────────
 
 # ── Provider definitions ──────────────────────────────────────────────────────
-# Define once, reference by name in model_routes and keypools.
+# Define once, reference by name in model_routes and credpools.
 # Only needed for custom / relay providers, or to override built-in defaults.
 #
 # Relay / intermediate proxy pattern:
@@ -179,9 +179,9 @@ providers:
   #   protocol: openai
   #   auth_style: api_key         # sends X-API-Key: <value>
 
-# ── KeyPool definitions ───────────────────────────────────────────────────────
-# Define key pools once; reference with keypool_ref in model_routes.
-# Multiple model_routes entries sharing a keypool_ref share ONE pool instance —
+# ── CredPool definitions ───────────────────────────────────────────────────────
+# Define key pools once; reference with credpool_ref in model_routes.
+# Multiple model_routes entries sharing a credpool_ref share ONE pool instance —
 # in-flight counts and 429 cooldowns are accurate across all models using it.
 #
 # strategy options:
@@ -193,6 +193,14 @@ providers:
 #   returns a 429. Defaults to rate_limit_rpm - 2 if omitted.
 #   Set to 0 to disable proactive rotation.
 #
+# rate_limit_tpm:
+#   Optional per-credential tokens-per-minute cap (input+output combined).
+#   0/omitted = disabled (the default — most credentials have no token quota
+#   worth tracking locally). Unlike rate_limit_rpm there is no soft-limit
+#   rotation: token counts are only known after the response, so a key already
+#   over its TPM budget is simply skipped on the next Select() until its
+#   window ages out.
+#
 # Key name formats (names appear in 429/circuit-break log lines as key_id):
 #   - label: ${ENV_VAR}          ← recommended: named shorthand, easy to grep in logs
 #   - ${ENV_VAR}                 ← anonymous: auto-named key_0, key_1, ... in logs
@@ -201,7 +209,7 @@ providers:
 #
 # Names must be unique within a pool. Duplicate names are a startup error.
 # ─────────────────────────────────────────────────────────────────────────────
-keypools:
+credpools:
   gemini-flash:
     strategy: least_requests
     circuit_break_threshold: 5
@@ -247,21 +255,79 @@ keypools:
     keys:
       - main_key: ${OPENAI_KEY_1}
 
-  # Remote credential broker (optional, supplements local keys above).
-  # The broker must implement the CredBrokerService ConnectRPC contract.
-  # A background poller calls PoolStatus every refresh_seconds.
-  #
-  # gemini-flash-brokered:
-  #   strategy: least_requests
-  #   rate_limit_rpm: 20
-  #   rate_soft_limit: 18
-  #   keys:
-  #     - ${GEMINI_KEY_1}             # local keys first
-  #   cred_broker:
-  #     url: "http://cred-broker:50051"
-  #     token: ${CRED_BROKER_TOKEN}
-  #     pool: "gemini-flash"
-  #     refresh_seconds: 30
+# ── Sidecars ─────────────────────────────────────────────────────────────────
+#
+# Every optional external-service integration lives under sidecar:, one block
+# per service, each independently on/off. miroxy runs with zero sidecars
+# configured by default — fully standalone, in-memory only. There is no
+# generic "sidecar" plugin framework: each sidecar is a normal Go interface
+# (e.g. cred.CredentialSource) with a builtin implementation and a
+# sidecar-backed one that happens to call out over whatever transport fits
+# (HTTP for credstone below; a future high-throughput compressor or security
+# scanner sidecar would likely use gRPC instead) — see
+# docs/design/architecture-v3.md for the pattern.
+#
+# credsource (credstone): when enabled, miroxy fetches API keys from a
+# credstone service instead of (or alongside) the credpools defined below.
+# credstone manages credential pools, lease lifecycle, and rate-limit state.
+# miroxy calls three credstone endpoints:
+#   Acquire:    borrow one key from a pool before each upstream request
+#   Release:    return the key with outcome flags after the request completes
+#   PoolStatus: poll pool health every sync_interval seconds
+#
+# Pool IDs: credpool names above (credpool_ref values) are used as pool IDs
+# when calling credstone. Ensure credstone has matching pool IDs.
+#
+# When disabled (default), miroxy uses credpools defined in this file only.
+# Both modes can coexist: for each named credpool above, credstone is tried
+# as one additional credential source alongside its local keys. A pool not
+# found in credstone (or temporarily exhausted there) falls back to that
+# credpool's local keys automatically — no extra config needed.
+#
+# Setup:
+#   1. Deploy credstone: docker run credstone/credstone:latest
+#   2. Create a pool in credstone: POST /v1/pools {"id": "gemini-flash"}
+#   3. Add credentials:  POST /v1/keys {"poolId":"gemini-flash",...}
+#   4. Set CREDSTONE_AUTH_TOKEN to match credstone's CREDSTONE_API_TOKEN
+#   5. Set enabled: true below
+# ───────────────────────────────────────────────────────────────────────────
+sidecar:
+  credsource:
+    enabled: false                        # set true to activate
+
+    base_url: "http://credstone:8000"     # credstone service URL
+                                           # no trailing slash
+                                           # supports http and https
+
+    auth_token: ${CREDSTONE_AUTH_TOKEN}   # bearer token for credstone auth
+                                           # must match credstone's
+                                           # CREDSTONE_API_TOKEN env var
+                                           # leave empty if credstone has no auth
+
+    sync_interval: 300                    # seconds between PoolStatus polls
+                                           # lower = faster health detection
+                                           # higher = less overhead
+                                           # default: 300 (5 minutes)
+
+# ── Local state cache (standalone mode only) ────────────────────────────────
+#
+# Optional on-disk cache of per-credential health (state/cooldown/failure
+# counters), backed by a small embedded buntdb store. Off by default — miroxy
+# is fully in-memory and forgets everything on restart unless this is on.
+#
+# Meaningless when sidecar.credsource.enabled is true above: credstone is
+# already the authoritative, cross-restart source of credential health in
+# that mode, so this is ignored (with a startup warning) rather than risking
+# two disagreeing sources of truth. Turn this on only in standalone mode, to
+# avoid immediately re-hammering a credential that was still cooling down
+# from a 429 right before a restart/redeploy.
+#
+# The file is a pure cache: if it's missing or corrupted, miroxy deletes and
+# recreates it rather than failing to start.
+# ───────────────────────────────────────────────────────────────────────────
+local_state:
+  enabled: false                          # set true to activate (standalone mode only)
+  path: ./miroxy-local-state.db           # buntdb file path; blank = this default
 
 # ── Model routing table ───────────────────────────────────────────────────────
 #
@@ -298,14 +364,14 @@ keypools:
 # routing.strategy (Style 1 and multi-target Style 3):
 #   fallback       try targets in order; advance only when all keys in a
 #                  target are exhausted or circuit-broken.
-#                  Single-key 429 is handled inside the keypool and does
+#                  Single-key 429 is handled inside the credpool and does
 #                  NOT trigger cross-provider fallback.
 #   round_robin    distribute requests evenly across all targets
 #   least_requests send to the target with fewest active in-flight requests
 #
-# Inline keypool (no keypool_ref):
+# Inline credpool (no credpool_ref):
 #   When a model needs its own isolated pool (e.g. Ollama with no keys).
-#   Same fields as keypools entries, written under keypool:.
+#   Same fields as credpools entries, written under credpool:.
 # ─────────────────────────────────────────────────────────────────────────────
 # ── Model routes ─────────────────────────────────────────────────────────────
 # model_name is both the routing key and the model ID returned by GET /v1/models.
@@ -347,11 +413,11 @@ model_routes:
       targets:
         - provider: gemini
           provider_model: gemini-2.5-flash
-          keypool_ref: gemini-flash
+          credpool_ref: gemini-flash
           timeout_seconds: 30
         - provider: deepseek-openai
           provider_model: deepseek-chat
-          keypool_ref: deepseek
+          credpool_ref: deepseek
           timeout_seconds: 30
 
   # Reasoning / thinking: DeepSeek R1 first, Gemini Pro + Anthropic fallback
@@ -363,15 +429,15 @@ model_routes:
       targets:
         - provider: deepseek-openai
           provider_model: deepseek-reasoner
-          keypool_ref: deepseek
+          credpool_ref: deepseek
           timeout_seconds: 120
         - provider: anthropic
           provider_model: claude-sonnet-4-6
-          keypool_ref: anthropic
+          credpool_ref: anthropic
           timeout_seconds: 60
         - provider: gemini
           provider_model: gemini-2.5-pro
-          keypool_ref: gemini-pro
+          credpool_ref: gemini-pro
           timeout_seconds: 60
 
   # Coding / agentic: Claude Sonnet first (best tool_use stability)
@@ -383,15 +449,15 @@ model_routes:
       targets:
         - provider: anthropic
           provider_model: claude-sonnet-4-6
-          keypool_ref: anthropic
+          credpool_ref: anthropic
           timeout_seconds: 60
         - provider: gemini
           provider_model: gemini-2.5-pro
-          keypool_ref: gemini-pro
+          credpool_ref: gemini-pro
           timeout_seconds: 60
         - provider: deepseek-openai
           provider_model: deepseek-chat
-          keypool_ref: deepseek
+          credpool_ref: deepseek
           timeout_seconds: 30
 
   # Documents: long-context, cheap, round-robin
@@ -403,11 +469,11 @@ model_routes:
       targets:
         - provider: gemini
           provider_model: gemini-2.5-flash
-          keypool_ref: gemini-flash
+          credpool_ref: gemini-flash
           timeout_seconds: 60
         - provider: deepseek-openai
           provider_model: deepseek-chat
-          keypool_ref: deepseek
+          credpool_ref: deepseek
           timeout_seconds: 60
 
   # Fast / background: cheapest, highest throughput
@@ -419,11 +485,11 @@ model_routes:
       targets:
         - provider: gemini
           provider_model: gemini-2.5-flash
-          keypool_ref: gemini-flash
+          credpool_ref: gemini-flash
           timeout_seconds: 20
         - provider: deepseek-openai
           provider_model: deepseek-chat
-          keypool_ref: deepseek
+          credpool_ref: deepseek
           timeout_seconds: 20
 
   # Maximum quality: best models regardless of cost
@@ -435,11 +501,11 @@ model_routes:
       targets:
         - provider: anthropic
           provider_model: claude-opus-4-8
-          keypool_ref: anthropic
+          credpool_ref: anthropic
           timeout_seconds: 120
         - provider: gemini
           provider_model: gemini-2.5-pro
-          keypool_ref: gemini-pro
+          credpool_ref: gemini-pro
           timeout_seconds: 120
 
   # ════════════════════════════════════════════════════════════════════════
@@ -457,20 +523,20 @@ model_routes:
   #   display_name: "Claude Haiku 4.5 → Gemini Flash"  # optional; shown in client model picker
   #   provider: gemini                               # routed to Gemini behind the scenes
   #   provider_model: gemini-2.5-flash
-  #   keypool_ref: gemini-flash                      # shared pool — in-flight counts stay accurate
+  #   credpool_ref: gemini-flash                      # shared pool — in-flight counts stay accurate
   #   timeout_seconds: 30
 
   # - model_name: claude-sonnet-4-6-20250219        # exact versioned ID overrides auto-discovery
   #   display_name: "Claude Sonnet 4.6 → Gemini Pro"
   #   provider: gemini
   #   provider_model: gemini-2.5-pro
-  #   keypool_ref: gemini-pro
+  #   credpool_ref: gemini-pro
   #   timeout_seconds: 30
 
   # - model_name: claude-opus-4-8
   #   provider: gemini
   #   provider_model: gemini-2.5-pro
-  #   keypool_ref: gemini-pro
+  #   credpool_ref: gemini-pro
   #   timeout_seconds: 60
 
   # ════════════════════════════════════════════════════════════════════════
@@ -485,19 +551,19 @@ model_routes:
   # - model_name: gemini-2.5-flash
   #   provider: gemini
   #   provider_model: gemini-2.5-flash
-  #   keypool_ref: gemini-flash
+  #   credpool_ref: gemini-flash
   #   timeout_seconds: 30
 
   # - model_name: deepseek-chat
   #   provider: deepseek-openai
   #   provider_model: deepseek-chat
-  #   keypool_ref: deepseek
+  #   credpool_ref: deepseek
   #   timeout_seconds: 30
 
   # - model_name: deepseek-reasoner
   #   provider: deepseek-openai
   #   provider_model: deepseek-reasoner
-  #   keypool_ref: deepseek
+  #   credpool_ref: deepseek
   #   timeout_seconds: 120
 
   # Multi-provider fallback behind a native model name:
@@ -508,18 +574,18 @@ model_routes:
   #     targets:
   #       - provider: gemini
   #         provider_model: gemini-2.5-pro
-  #         keypool_ref: gemini-pro
+  #         credpool_ref: gemini-pro
   #         timeout_seconds: 60
   #       - provider: deepseek-openai
   #         provider_model: deepseek-chat
-  #         keypool_ref: deepseek
+  #         credpool_ref: deepseek
   #         timeout_seconds: 30
 
-  # Local Ollama — no API key needed, inline keypool:
+  # Local Ollama — no API key needed, inline credpool:
   # - model_name: llama3:8b
   #   provider: ollama
   #   provider_model: llama3:8b
-  #   keypool:
+  #   credpool:
   #     keys: []
   #   timeout_seconds: 120
 
@@ -527,7 +593,7 @@ model_routes:
   # - model_name: glm-4-flash
   #   provider: glm
   #   provider_model: glm-4-flash
-  #   keypool:
+  #   credpool:
   #     strategy: least_requests
   #     keys:
   #       - ${GLM_KEY_1}

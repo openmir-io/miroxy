@@ -36,7 +36,7 @@ type DirectServer struct {
 }
 
 type directRoute struct {
-	upstreamBase string         // e.g. "https://api.anthropic.com"
+	upstreamBase string          // e.g. "https://api.anthropic.com"
 	credential   cred.Credential // typed auth — Apply() attaches it to the upstream request
 }
 
@@ -64,8 +64,8 @@ func NewDirect(cfg *config.Config, dumpPath string) (*DirectServer, error) {
 			continue
 		}
 		var credential cred.Credential
-		if len(m.KeyPool.Keys) > 0 {
-			credential = credentialFromConfig(m.KeyPool.Keys[0].Key, m.AuthStyle)
+		if len(m.CredPool.Keys) > 0 {
+			credential = credentialFromConfig(m.CredPool.Keys[0].Key, m.AuthStyle)
 		}
 		routes[m.ModelName] = directRoute{
 			upstreamBase: strings.TrimRight(m.APIBase, "/"),

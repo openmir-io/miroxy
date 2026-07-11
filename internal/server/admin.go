@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 
@@ -122,7 +123,7 @@ func (s *Server) AdminHandler() http.Handler {
 	pag := s.proxyAuthGuard(guard)
 	mux.Handle("GET /v1/config", pag(http.HandlerFunc(s.configFull)))
 	mux.Handle("GET /v1/config/providers", pag(http.HandlerFunc(s.configProviders)))
-	mux.Handle("GET /v1/config/keypools", pag(http.HandlerFunc(s.configKeypools)))
+	mux.Handle("GET /v1/config/credpools", pag(http.HandlerFunc(s.configCredpools)))
 	mux.Handle("GET /v1/config/routes", pag(http.HandlerFunc(s.configRoutes)))
 
 	return guard.wrap(mux)
@@ -192,8 +193,8 @@ func (s *Server) adminStatus(w http.ResponseWriter, _ *http.Request) {
 		Name string `json:"name"`
 		Keys int    `json:"keys"`
 	}
-	pools := make([]poolRow, 0, len(cfg.KeyPools))
-	for name, kp := range cfg.KeyPools {
+	pools := make([]poolRow, 0, len(cfg.CredPools))
+	for name, kp := range cfg.CredPools {
 		pools = append(pools, poolRow{Name: name, Keys: len(kp.Keys)})
 	}
 
@@ -228,7 +229,7 @@ func (s *Server) adminStatus(w http.ResponseWriter, _ *http.Request) {
 		"uptime":    uptime.String(),
 		"in_flight": s.inFlight.Load(),
 		"models":    models,
-		"keypools":  pools,
+		"credpools": pools,
 		"config":    s.cfgPath,
 		"usage": map[string]any{
 			"total_input_tokens":  totalIn,
@@ -369,7 +370,7 @@ func (s *Server) buildConfigResponse(cfg *config.Config, sections ...string) map
 		resp["metrics"] = cfg.Metrics
 	}
 
-	if all || wants["keypools"] {
+	if all || wants["credpools"] {
 		type keyEntry struct {
 			Name string `json:"name"`
 			Key  string `json:"key"`
@@ -383,7 +384,7 @@ func (s *Server) buildConfigResponse(cfg *config.Config, sections ...string) map
 			Keys                  []keyEntry `json:"keys"`
 		}
 		pools := map[string]poolView{}
-		for name, kp := range cfg.KeyPools {
+		for name, kp := range cfg.CredPools {
 			pv := poolView{
 				Provider:              kp.Provider,
 				Strategy:              kp.Strategy,
@@ -396,7 +397,7 @@ func (s *Server) buildConfigResponse(cfg *config.Config, sections ...string) map
 			}
 			pools[name] = pv
 		}
-		resp["keypools"] = pools
+		resp["credpools"] = pools
 	}
 
 	if all || wants["providers"] {
@@ -405,14 +406,14 @@ func (s *Server) buildConfigResponse(cfg *config.Config, sections ...string) map
 
 	if all || wants["routes"] {
 		type routeView struct {
-			ModelName     string              `json:"model_name"`
-			DisplayName   string              `json:"display_name,omitempty"`
-			Provider      string              `json:"provider,omitempty"`
-			ProviderModel string              `json:"provider_model,omitempty"`
-			Protocol      string              `json:"protocol,omitempty"`
-			APIBase       string              `json:"api_base,omitempty"`
-			AuthStyle     string              `json:"auth_style,omitempty"`
-			KeypoolRef    string              `json:"keypool_ref,omitempty"`
+			ModelName     string                `json:"model_name"`
+			DisplayName   string                `json:"display_name,omitempty"`
+			Provider      string                `json:"provider,omitempty"`
+			ProviderModel string                `json:"provider_model,omitempty"`
+			Protocol      string                `json:"protocol,omitempty"`
+			APIBase       string                `json:"api_base,omitempty"`
+			AuthStyle     string                `json:"auth_style,omitempty"`
+			CredpoolRef   string                `json:"credpool_ref,omitempty"`
 			Routing       *config.RoutingConfig `json:"routing,omitempty"`
 		}
 		routes := make([]routeView, len(cfg.ModelRoutes))
@@ -421,7 +422,7 @@ func (s *Server) buildConfigResponse(cfg *config.Config, sections ...string) map
 				ModelName: m.ModelName, DisplayName: m.DisplayName,
 				Provider: m.Provider, ProviderModel: m.ProviderModel,
 				Protocol: m.Protocol, APIBase: m.APIBase, AuthStyle: m.AuthStyle,
-				KeypoolRef: m.KeypoolRef, Routing: m.Routing,
+				CredpoolRef: m.CredpoolRef, Routing: m.Routing,
 			}
 		}
 		resp["model_routes"] = routes
@@ -471,9 +472,9 @@ func (s *Server) configProviders(w http.ResponseWriter, _ *http.Request) {
 	writeAdminJSON(w, http.StatusOK, s.buildConfigResponse(s.cfg.Load(), "providers"))
 }
 
-// configKeypools returns keypool names, strategies, and masked keys.
-func (s *Server) configKeypools(w http.ResponseWriter, _ *http.Request) {
-	writeAdminJSON(w, http.StatusOK, s.buildConfigResponse(s.cfg.Load(), "keypools"))
+// configCredpools returns credpool names, strategies, and masked keys.
+func (s *Server) configCredpools(w http.ResponseWriter, _ *http.Request) {
+	writeAdminJSON(w, http.StatusOK, s.buildConfigResponse(s.cfg.Load(), "credpools"))
 }
 
 // configRoutes returns providers and model_routes (including auto-discovered entries).
@@ -503,34 +504,98 @@ func tokenBar(part, total int64, width int) string {
 	return strings.Repeat("█", filled) + strings.Repeat("░", width-filled)
 }
 
-// modelInfoText returns a human-readable model routing table (used by StatsText).
-func (s *Server) modelInfoText() string {
+// ModelInfoText returns a human-readable, read-only overview of the current
+// default model, the model routing table, configured providers, and each
+// credpool's key names (never key values). Used by CommandPlugin's
+// ":miroxy model" — model switching itself is done via each client's native
+// /model picker, not through this command.
+func (s *Server) ModelInfoText() string {
 	cfg := s.cfg.Load()
 	var b strings.Builder
 	sep := strings.Repeat("─", 62)
-	fmt.Fprintf(&b, "Configured models\n%s\n", sep)
-	fmt.Fprintf(&b, "%-22s  %-12s  %-18s  %s\n",
-		"Client model name", "Strategy", "Provider", "Provider model")
-	fmt.Fprintf(&b, "%s\n", sep)
+
+	defaultModel := cfg.Server.DefaultModel
+	if defaultModel == "" {
+		defaultModel = "(none set — first model_routes entry is used)"
+	}
+	fmt.Fprintf(&b, "Current model: %s\n%s\n", defaultModel, sep)
+
+	fmt.Fprintf(&b, "\nModel routes\n%s\n", sep)
+	if len(cfg.ModelRoutes) == 0 {
+		fmt.Fprintf(&b, "  (no model_routes configured)\n")
+	}
 	for _, m := range cfg.ModelRoutes {
 		if m.Routing != nil {
-			fmt.Fprintf(&b, "%-22s  [%s]\n", m.ModelName, m.Routing.Strategy)
+			fmt.Fprintf(&b, "  %-20s [%s]\n", m.ModelName, m.Routing.Strategy)
 			for i, t := range m.Routing.Targets {
 				tree := "├─"
 				if i == len(m.Routing.Targets)-1 {
 					tree = "└─"
 				}
-				fmt.Fprintf(&b, "  %s %-20s  %-18s  %s\n", tree, "", t.Provider, t.ProviderModel)
+				fmt.Fprintf(&b, "    %s %-14s %-20s  credpool: %s\n",
+					tree, t.Provider, t.ProviderModel, orDash(t.CredpoolRef))
 			}
 		} else {
-			fmt.Fprintf(&b, "%-22s  %-12s  %-18s  %s\n",
-				m.ModelName, "direct", m.Provider, m.ProviderModel)
+			fmt.Fprintf(&b, "  %-20s %-14s %-20s  credpool: %s\n",
+				m.ModelName, m.Provider, m.ProviderModel, orDash(m.CredpoolRef))
 		}
 	}
-	fmt.Fprintf(&b, "%s\n", sep)
-	fmt.Fprintf(&b, "Use: :miroxy model <client-model-name> <your question>\n")
-	fmt.Fprintf(&b, "     <client-model-name> is the first column above.")
+
+	fmt.Fprintf(&b, "\nProviders\n%s\n", sep)
+	if len(cfg.Providers) == 0 {
+		fmt.Fprintf(&b, "  (no providers configured — built-ins resolved implicitly)\n")
+	}
+	for _, name := range sortedKeys(cfg.Providers) {
+		fmt.Fprintf(&b, "  %-14s %s\n", name, cfg.Providers[name].BaseURL)
+	}
+
+	fmt.Fprintf(&b, "\nCredpools\n%s\n", sep)
+	if len(cfg.CredPools) == 0 {
+		fmt.Fprintf(&b, "  (no named credpools)\n")
+	}
+	for _, name := range sortedKeys(cfg.CredPools) {
+		kp := cfg.CredPools[name]
+		fmt.Fprintf(&b, "  %-14s provider=%-10s strategy=%-14s keys: %s\n",
+			name, orDash(kp.Provider), orDash(kp.Strategy), keyNames(kp.Keys))
+	}
+
 	return b.String()
+}
+
+// orDash returns "-" for an empty string, otherwise s unchanged.
+func orDash(s string) string {
+	if s == "" {
+		return "-"
+	}
+	return s
+}
+
+// keyNames renders a credpool's key names (never values) as a comma-separated
+// list. Anonymous keys (no yaml name) fall back to key_N, matching the
+// convention used by sanitizeConfig().
+func keyNames(keys []config.CredEntry) string {
+	if len(keys) == 0 {
+		return "(none)"
+	}
+	names := make([]string, len(keys))
+	for i, k := range keys {
+		if k.Name != "" {
+			names[i] = k.Name
+		} else {
+			names[i] = fmt.Sprintf("key_%d", i+1)
+		}
+	}
+	return strings.Join(names, ", ")
+}
+
+// sortedKeys returns a map's keys in sorted order for deterministic text output.
+func sortedKeys[V any](m map[string]V) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // sanitizeConfig converts a Config into a UI-safe JSON structure.
@@ -549,7 +614,7 @@ func sanitizeConfig(cfg *config.Config) map[string]any {
 	type targetView struct {
 		Provider      string `json:"provider"`
 		ProviderModel string `json:"provider_model"`
-		KeypoolRef    string `json:"keypool_ref,omitempty"`
+		CredpoolRef   string `json:"credpool_ref,omitempty"`
 	}
 	type routingView struct {
 		Strategy string       `json:"strategy"`
@@ -559,12 +624,12 @@ func sanitizeConfig(cfg *config.Config) map[string]any {
 		ModelName     string       `json:"model_name"`
 		Provider      string       `json:"provider,omitempty"`
 		ProviderModel string       `json:"provider_model,omitempty"`
-		KeypoolRef    string       `json:"keypool_ref,omitempty"`
+		CredpoolRef   string       `json:"credpool_ref,omitempty"`
 		Routing       *routingView `json:"routing,omitempty"`
 	}
 
-	pools := make(map[string]poolView, len(cfg.KeyPools))
-	for name, kp := range cfg.KeyPools {
+	pools := make(map[string]poolView, len(cfg.CredPools))
+	for name, kp := range cfg.CredPools {
 		keys := make([]keyView, len(kp.Keys))
 		for i, k := range kp.Keys {
 			masked := "••••"
@@ -591,7 +656,7 @@ func sanitizeConfig(cfg *config.Config) map[string]any {
 			ModelName:     m.ModelName,
 			Provider:      m.Provider,
 			ProviderModel: m.ProviderModel,
-			KeypoolRef:    m.KeypoolRef,
+			CredpoolRef:   m.CredpoolRef,
 		}
 		if m.Routing != nil {
 			targets := make([]targetView, len(m.Routing.Targets))
@@ -599,7 +664,7 @@ func sanitizeConfig(cfg *config.Config) map[string]any {
 				targets[j] = targetView{
 					Provider:      t.Provider,
 					ProviderModel: t.ProviderModel,
-					KeypoolRef:    t.KeypoolRef,
+					CredpoolRef:   t.CredpoolRef,
 				}
 			}
 			mv.Routing = &routingView{
@@ -619,7 +684,7 @@ func sanitizeConfig(cfg *config.Config) map[string]any {
 				"allow_dump": cfg.Server.Commands.AllowDump,
 			},
 		},
-		"keypools":   pools,
+		"credpools":    pools,
 		"model_routes": models,
 		"compress": map[string]any{
 			"enabled":       cfg.Compress.Enabled,

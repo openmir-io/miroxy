@@ -4,8 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/url"
+	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -117,4 +120,32 @@ func (s *OAuthSource) exchange(ctx context.Context) (string, error) {
 	s.accessToken = result.AccessToken
 	s.expiry = time.Now().Add(time.Duration(result.ExpiresIn) * time.Second)
 	return s.accessToken, nil
+}
+
+// WarnIfMultiReplicaUnsafe logs a warning when an oauth_refresh credpool looks
+// like it's running in a multi-replica deployment. credstone does not yet
+// support OAuth refresh (reserved, not implemented on the credstone side), so
+// every oauth_refresh pool self-refreshes locally via OAuthSource today,
+// regardless of whether credsource is enabled — there is no cross-replica
+// coordination for the refresh_token exchange. Detection is best-effort; when
+// it can't be determined this errs toward warning rather than staying silent.
+func WarnIfMultiReplicaUnsafe(poolName string) {
+	if !likelyMultiReplica() {
+		return
+	}
+	slog.Warn("oauth_refresh credpool has no cross-replica coordination for its refresh_token exchange; "+
+		"concurrent refreshes from multiple replicas can race (credstone does not manage OAuth refresh yet)",
+		"pool", poolName)
+}
+
+func likelyMultiReplica() bool {
+	v := os.Getenv("MIROXY_REPLICA_COUNT")
+	if v == "" {
+		return true // can't tell — err toward warning
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		return true
+	}
+	return n > 1
 }

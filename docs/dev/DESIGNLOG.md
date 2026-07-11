@@ -752,3 +752,311 @@ Then calls `next(c)` — the LLM receives the enriched context and processes
 `!miroxy model <name>` sets `c.Request.Model` for the current request only.
 The routing layer then looks up `<name>` in `model_list` as usual. No session
 state is maintained — the next request reverts to the original model.
+
+---
+
+## [2026-07-11] Credential Status Reporting Architecture Audit
+
+### Context
+
+credstone (a separate repo) is the real, working credential/status service —
+plain HTTP/JSON, not the hypothetical gRPC "Credpool" sidecar miroxy had
+scaffolding for. This session audited miroxy's credential-handling code
+against the decided principles for how local state and credstone should
+relate, then retired the dead gRPC path and implemented the follow-up design
+(delta-based usage reporting, local TPM tracking).
+
+### Principles audited (condensed)
+
+1. Local in-memory state is always written synchronously; credstone is an
+   additive, optional, asynchronous side effect — never a replacement path.
+2. Outcome reporting fans out through one existing optional-interface hook,
+   not a builtin/credstone runtime branch or a second dispatch mechanism.
+3. `CredPool.Select()` checks-and-reserves in one locked step — no two-phase
+   `IsUsable()`/`Reserve()` split (that's only worth it for a networked
+   limiter, which this isn't).
+4. Filters run cheapest-first: health/cooldown state before rate math.
+5. Rate-limit machinery no-ops entirely for credentials with no configured
+   limit — no wasted lookups.
+6. OAuth refresh is meant to be delegated to credstone; miroxy should never
+   call a provider's refresh endpoint itself, and should warn when running
+   unsafely (multi-replica, no cross-instance coordination).
+7. Request-failure handling stays fully local in the hot path; credstone
+   never gets a synchronous "what do I do" call — only async outcome pushes.
+8. A local, non-persisted, short-lived cooldown marker is allowed as an
+   optimization but must never be confused with credstone's authority.
+9. `/metrics` and `/stat` are pull-only and reflect local state — zero
+   dependency on credstone reachability.
+
+### Findings
+
+| # | Principle | Verdict | Notes |
+|---|-----------|---------|-------|
+| 1 | Local state always written, credstone additive | OK | `newCredPool` always builds local `CredSpec`s first; a credstone entry is appended, never substituted (`internal/server/server.go`). |
+| 2 | Fan-out via existing hook, no new mechanism | OK | The only reporting path is the existing `outcomeReporter` type-assertion hook (`core/selector/credpool.go`), implemented by `CredSource.ReportOutcome`. No `AfterUpstreamCall`/`UsageObserver` exists or was needed. |
+| 3 | Single check-and-reserve step | OK | `CredPool.Select()` checks and reserves inside one critical section. No `WouldAllow`/`IsUsable` abstraction exists anywhere in the repo. |
+| 4 | Cheapest-first filter ordering | OK | `available(now)` (state/time compare) short-circuits before the RPM length compare, which short-circuits before the new TPM sum-over-window. |
+| 5 | Rate machinery no-ops when unlimited | OK for RPM; **MISSING** for TPM/rpd/tpd (now built) | RPM pruning/append is gated on `rateLimit > 0`. TPM, rpd, tpd didn't exist before this session. |
+| 6 | OAuth refresh delegated; warn if unsafe | **VIOLATION** (accepted, unavoidable) + **MISSING** (fixed) | `OAuthSource` self-refreshes via the provider's token endpoint — but credstone has no OAuth/refresh support yet (reserved, not implemented on its side), so this is the only way OAuth credentials work today; kept as-is. The missing multi-replica warning was added (`internal/cred/oauth.go: WarnIfMultiReplicaUnsafe`). |
+| 7 | No synchronous credstone call in the hot path | **VIOLATION** (fixed) | `CredSource.ReportOutcome` called `client.Release` inline on the executor's retry-loop goroutine — a slow/down credstone added latency before the next `Select()`. Now fired in a goroutine. |
+| 8 | Optional local cooldown marker | NOT-YET-APPLICABLE / already satisfied | The existing per-entry `coolEnd` cooldown and `CredSource.lastHealthy` poll cache already serve this purpose; no new marker needed. |
+| 9 | `/metrics`/`/stat` independent of credstone | OK | Both read only in-memory config/state (`stats.Registry`, `cfg`); confirmed with a new test pointing credsource at an unreachable address. |
+
+### Dead code retired
+
+- Deleted `internal/cred/credpool.go`, `internal/cred/credpool.proto`, and
+  `core/rpc/grpc.go` — the never-built gRPC "Credpool" sidecar path.
+  Reconfirmed zero real callers of `NewCredpoolSource`/`CredpoolSource`/
+  `CredpoolClient` (the one remaining hit was a comment example in
+  `core/rpc/grpc.go`, itself dead TODO scaffolding for the same abandoned
+  design). credstone (plain HTTP/JSON via `CredstoneClient`) is now the sole
+  third-party credential integration.
+
+### Implemented this session
+
+- **Async outcome reporting** (`internal/cred/credsource.go`): `ReportOutcome`
+  now fires its credstone `Release` call in a goroutine instead of blocking
+  the retry loop.
+- **Multi-replica OAuth warning** (`internal/cred/oauth.go`,
+  `internal/server/server.go`): `buildCredSpecsFromPool` now warns once per
+  `oauth_refresh` pool when running in what looks like (or can't be ruled
+  out as) a multi-replica deployment.
+- **Delta-based usage reporting** (`internal/cred/usage_accumulator.go`,
+  `internal/cred/credstone_client.go`): new `UsageAccumulator` holds
+  per-pool `delta_requests`/`delta_input_tokens`/`delta_output_tokens` since
+  the last confirmed-successful send. `delta_requests` is wired through the
+  existing `outcomeReporter` hook (`CredSource.SetUsageAccumulator`);
+  `delta_input_tokens`/`delta_output_tokens` are fed from
+  `UpstreamExecutor` at the same point token counts already flow to
+  `stats.Registry` (both non-stream and streaming paths) — no change to the
+  `Selector` interface. A periodic flusher reuses the `sync_interval`/
+  `StartPoller` pattern rather than inventing a second ticker. Failed sends
+  leave deltas accumulated (subtract-what-was-sent, not reset-to-zero) so
+  concurrent increments during a flush aren't lost. New
+  `CredstoneClient.ReportUsage` defines the wire shape credstone will
+  receive — **credstone has no matching endpoint yet** (its `/Release` only
+  accepts `rateLimited`/`serverOverload`/`callError`/`retryAfterSeconds`);
+  this is a companion gap on the credstone side, tracked separately, not
+  blocking this change.
+- **Local TPM tracking** (`core/selector/credpool.go`): a token-weighted
+  sliding window (`credEntry.recentTokens`) mirrors the existing RPM window
+  structure. Checked in `Select()`'s first pass (cheapest-first, after the
+  RPM check); the existing "all over the soft limit → best available"
+  fallback now also triggers when everyone is over the TPM cap, matching
+  RPM's reactive-backstop behavior. Fed via `CredPool.RecordTokens`, an
+  optional method callers type-assert for (same pattern as `probeCapable`/
+  `outcomeReporter`), since token counts are only known after the response —
+  well after `Select`/`Release` already ran. New `KeyPoolCfg.RateLimitTPM`
+  config field (0 = disabled, the default).
+
+### Deferred
+
+- Credstone-side `ReportUsage` endpoint and `rpd_limit`/`tpd_limit`
+  enforcement — explicitly out of scope for miroxy; do not consider rpd/tpd
+  delegation "done" until both sides exist.
+- `OAuthSource` remaining a local self-refresh path is accepted debt, not
+  fixed — removing it would drop OAuth support entirely until credstone
+  ships refresh_token handling.
+
+---
+
+## [2026-07-11] keypools → credpools rename + SigV4 (AWS Bedrock) schema support
+
+### Context
+
+The pool config (`keypools:`, `KeyPoolCfg`/`KeyEntry`) was designed around a
+single credential shape: one string per key. That's fine for header/query
+auth, but AWS Bedrock's SigV4 credentials need multiple fields per key
+(`access_key_id`, `secret_access_key`, `session_token`) plus pool-wide
+signing parameters (`region`, `service`) — and "key" no longer described what
+a pool actually holds once OAuth refresh tokens and SigV4 material are in
+scope too. This renames the config-facing layer to match the runtime layer,
+which was already correctly named `core/selector.CredPool` from the start,
+and extends the schema to be shape-agnostic.
+
+### Rename
+
+`keypools` → `credpools` across the config YAML, Go types (`KeyPoolCfg` →
+`CredPoolCfg`, `KeyEntry` → `CredEntry`, `KeypoolRef` → `CredpoolRef`), the
+admin REST API (`/v1/config/keypools` → `/v1/config/credpools`, JSON fields
+`keypools`/`keypool_ref` → `credpools`/`credpool_ref`), the OpenAPI doc, CLI
+help text, and all example configs + README. `CredPoolCfg` deliberately keeps
+the `Cfg` suffix rather than `CredPoolConfig` — `core/selector` already has a
+`CredPoolConfig` (the runtime constructor input), and giving the config-layer
+type the identical name in a different package would be a real readability
+trap in grep results and logs even though Go allows it.
+
+### SigV4 (AWS Bedrock) schema
+
+`kind` (attach shape) and lifecycle (refresh strategy) stay orthogonal, same
+principle credstone's own credential-material design already established:
+- `CredPoolCfg` gains `AuthStyle` (settable directly on the pool — needed
+  because sigv4 validation happens at pool-definition time, before any
+  `model_routes` reference is resolved; `namedPoolAuthStyle` prefers it over
+  the existing model-route-scanning inference, unchanged for pools that
+  don't set it), plus `Region`/`Service` (shared AWS signing parameters for
+  every key in the pool).
+- `CredEntry` gains `AccessKeyID`/`SecretAccessKey`/`SessionToken`.
+  `CredEntry.UnmarshalYAML` (`internal/config/config.go`) grew a branch: the
+  existing shorthand (`- label: ${VALUE}`) now also accepts a nested mapping
+  as the value (`- label: {access_key_id: ..., ...}`) instead of only a
+  scalar; the verbose form grew the same three fields as siblings of
+  `name`/`key`. All existing forms (anonymous, shorthand, verbose) are
+  unchanged.
+- `buildCredSpecsFromPool` (`internal/server/server.go`) gets a third branch
+  alongside `oauth_refresh`/default: `authStyle == "sigv4"` builds a
+  `*cred.SigV4Credential` from the entry + pool fields, wrapped in the same
+  `selector.NewStaticSource` used for plain API keys (no local refresh —
+  matches credstone's own note that STS temporary credentials would use a
+  `refresh_strategy` mechanism reserved for later, not implemented now).
+- `validateKeys` (`internal/config/yaml.go`) takes the resolved `authStyle`
+  and requires `access_key_id`+`secret_access_key` for sigv4 entries instead
+  of the plain `key` field (`session_token` stays optional).
+
+**Scope note**: this is config-schema + object-model compatibility only.
+`cred.SigV4Credential.Apply()` (`core/cred/credential.go`) is still
+intentionally unimplemented pending an SDKDispatcher — a bedrock credpool
+validates and builds the right typed credential, but actually dispatching a
+signed request to Bedrock is a separate, larger epic, unchanged by this
+session.
+
+### Verification
+
+`go build ./...`, `go vet ./...`, `go test ./...` all pass. All 8
+`config/config.yaml.example*` files load successfully under the renamed
+schema (checked with a throwaway `LoadFromBytesWithEnv` run, not shipped). A
+`bedrock-claude`-style credpool (structured shorthand and verbose forms, both
+with and without `session_token`) parses and validates correctly, and
+`buildCredSpecsFromPool` produces `*cred.SigV4Credential` entries with the
+right per-key and pool-level fields — covered by new tests in
+`tests/unit/config_test.go` and `internal/server/server_test.go`.
+
+---
+
+## [2026-07-11] Two-layer extension model (builtin/sidecar); sidecar config namespace; buntdb local_state cache
+
+### Context
+
+The 2026-07-01 design (`## 2026-07-01 Plugin directory structure`, above)
+planned a three-tier execution model — native/builtin, WASM (wazero-embedded
+guests), and sidecar (external process, gRPC/HTTP) — with shared cross-process
+machinery in `internal/pluginrt/`. This session audited what actually got
+built against that plan, prompted by a question about whether the sidecar
+layer should support both HTTP and gRPC transports.
+
+### What the audit found
+
+- `internal/pluginrt/sidecar` was itself renamed to `internal/pluginrt/ext`
+  on 2026-07-03. Neither name mattered: `ext.Register`/`ext.NewClient` had
+  **zero callers** anywhere in the codebase.
+- `internal/pluginrt/wasm` (wazero runtime stub, host-function allow-list) —
+  also **zero callers**, 0% implemented, `wazero` never added to go.mod.
+- `pipeline.PluginSpec`/`PluginLoader`/`BuiltinLoader` (`internal/pipeline/loader.go`)
+  — the config-driven `ExecModel: "builtin"|"wasm"|"grpc"` dispatch mechanism
+  meant to let a plugin's execution model be chosen at runtime — **zero
+  callers**. Every real plugin (`CompressPlugin`, `CommandPlugin`,
+  `UpstreamExecutor`) is wired via direct Go constructor calls in
+  `internal/server/server.go`, not through this mechanism.
+- credstone — meant to be "the first real sidecar consumer" (Decision 7,
+  2026-06-30 entry) — never actually went through `pluginrt/ext` either.
+  `internal/cred/credstone_client.go` is a self-contained HTTP/JSON client
+  with its own `post()` helper; it doesn't call `ext.Register`/`NewClient` or
+  implement `ext.Transport`.
+
+This is the same pattern as the `CredpoolSource`/`credpool.proto` deletion
+earlier in this session (also zero callers, also a gRPC abstraction built
+ahead of a real consumer) — now observed **four times** in one codebase:
+every generic extension-point abstraction built before a second real need
+existed went unused, while the actual implementation (credstone) took the
+simpler, direct route and worked fine without it.
+
+### Decision: two layers, no shared transport abstraction
+
+Collapsed the model to **builtin** and **sidecar**, dropping WASM from the
+roadmap entirely (not deferred — actively decided against, given zero
+progress and no concrete plugin driving it). Dropped `pluginrt` as a
+concept: there is no generic `Sidecar`/`Transport` interface, and none is
+planned.
+
+The reasoning: HTTP and gRPC don't need to be unified at a transport-interface
+level, because the parts that are actually hard to share (retry policy,
+timeout semantics, error-code mapping) are protocol-specific regardless — see
+`pluginrt/ext`'s own doc comment, which already conceded "the actual RPC
+surface is defined per domain." What's left to share (dial, health-check) is
+already well served by `net/http.Client`/`grpc.ClientConn` directly. The
+pattern to follow instead — already proven by
+`core/cred.CredentialSource` — is: define the extension point as a Go
+interface expressing the **capability** (e.g. "give me a Credential"), never
+mentioning transport; give it a builtin implementation; give it a
+sidecar-backed implementation that picks HTTP or gRPC internally, entirely
+hidden from callers. `core/compress.Compressor` (builtin today) or a future
+`SecurityScanner` would follow the same shape when a real sidecar for either
+exists — no shared plumbing needed ahead of that.
+
+### Removed
+
+- `internal/pluginrt/` (all of it — `ext/` and `wasm/`).
+- `internal/pipeline/loader.go` (`PluginSpec`, `PluginLoader`, `BuiltinLoader`).
+- Stale comment references (`internal/irc/irc.go`'s `UpstreamBackend` doc
+  comment no longer mentions WASM or `pluginrt/ext`).
+
+### Sidecar config namespace
+
+Every optional external-service integration now lives under one `sidecar:`
+YAML block, one field per service: `Config.CredSource` → `Config.Sidecar.CredSource`
+(`sidecar.credsource.*`), via a new `SidecarConfig` struct
+(`internal/config/config.go`). Zero sidecars configured by default. Future
+sidecars (compressor, securitygate, ...) get their own field on
+`SidecarConfig` when they have a real implementation — not before.
+
+### buntdb-backed local_state cache (standalone mode only)
+
+New optional on-disk cache of per-credential health (state/cooldown/failure
+counters), gated by `local_state.enabled` (`internal/config/config.go`'s
+`LocalStateConfig`), backed by `github.com/tidwall/buntdb` (pure Go, no CGO).
+
+Scope, deliberately narrow:
+- **Health state only** — `state`/`coolEnd`/`rateLimitFailures`/`failures`
+  per credential. The RPM/TPM sliding windows are NOT persisted — they're
+  1-minute windows; restart-reset is correct behavior, not a gap.
+- **Standalone mode only.** `openLocalStateStore` (`internal/server/server.go`)
+  refuses to open the store when `sidecar.credsource.enabled` is true, logging
+  a warning if `local_state.enabled` was also set. Rationale: credstone is
+  already the authoritative, cross-restart (and cross-replica) source of
+  credential health in that mode; a local disk cache would just be a second,
+  potentially-stale copy with no correctness benefit — same principle as
+  keeping `/metrics`/`/stat` independent of credstone, applied in the other
+  direction (don't let a local optimization pretend to be authoritative when
+  a real authority already exists).
+- **Pure cache, self-healing.** `internal/localstate.Open` treats any error
+  (missing file, corruption) by deleting and recreating the file; if that
+  still fails, it falls back to an in-memory-only buntdb instance so a
+  disk problem never blocks startup.
+- **Deliberately deferred, not built**: the broader idea discussed this
+  session — multi-dimensional usage stats (per model/provider/pool/key,
+  session-scoped and all-time, historical session browsing, more stat types
+  later) — is NOT implemented. That's a genuinely relational shape
+  (aggregation, historical queries) that doesn't fit a KV store well; if it
+  becomes a real need, it should be evaluated on its own against something
+  like `modernc.org/sqlite` (pure Go, no CGO — but meaningfully heavier in
+  binary size and build time than buntdb), not folded into this cache.
+
+`core/selector/credpool.go` stays IO-free per the repo's core/internal split:
+it exposes `CredHealthSnapshot`, `CredPool.HealthSnapshot()`, and
+`CredPool.RestoreHealth()` as plain serializable data; all actual disk I/O
+lives in `internal/localstate` + `internal/server`. Restore happens once at
+pool construction; a periodic flush (30s, not currently configurable) mirrors
+current state to disk, tied to the same per-generation `pollerCtx` already
+used for `CredSource` polling and `UsageAccumulator` flushing — so it starts
+and stops correctly across `Reload`/`Close` for free. `Reload` rejects a
+config change to `local_state.*` or `sidecar.credsource.enabled` (requires a
+restart), consistent with how `server.port`/`admin.addr` already behave.
+
+### Note on CLAUDE.md's "No DB in v1"
+
+This stays within the spirit of that constraint — buntdb here is an
+optional, self-healing local **cache**, never a system of record, off by
+default, and structurally disabled whenever a sidecar already owns the data
+it would cache. It's a materially smaller commitment than a real embedded
+SQL database. Flagging this explicitly rather than letting it drift in
+silently; see the added clarifying note under that constraint in `CLAUDE.md`.

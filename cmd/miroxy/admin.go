@@ -13,7 +13,7 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-var flagAdminAddr string // --admin-addr flag shared by health/stat/reload
+var flagAdminAddr string   // --admin-addr flag shared by health/stat/reload
 var flagAdminConfig string // -c flag for admin commands to read config
 
 // resolveAdminAddr returns the admin base URL.
@@ -113,10 +113,10 @@ func formatStat(raw []byte) string {
 			ProviderModel string `json:"provider_model"`
 			Strategy      string `json:"strategy"`
 		} `json:"models"`
-		KeyPools []struct {
+		CredPools []struct {
 			Name string `json:"name"`
 			Keys int    `json:"keys"`
-		} `json:"keypools"`
+		} `json:"credpools"`
 	}
 	if err := json.Unmarshal(raw, &s); err != nil {
 		return prettyJSON(raw) + "\n"
@@ -147,10 +147,10 @@ func formatStat(raw []byte) string {
 	}
 
 	fmt.Fprintf(&b, "\nKey Pools\n%s\n", sub)
-	if len(s.KeyPools) == 0 {
-		fmt.Fprintf(&b, "  (no named keypools)\n")
+	if len(s.CredPools) == 0 {
+		fmt.Fprintf(&b, "  (no named credpools)\n")
 	}
-	for _, p := range s.KeyPools {
+	for _, p := range s.CredPools {
 		fmt.Fprintf(&b, "  %-20s  %d key(s)\n", p.Name+":", p.Keys)
 	}
 
@@ -199,8 +199,8 @@ Address resolution order:
 
 var statCmd = &cobra.Command{
 	Use:   "stat",
-	Short: "Show keypool and routing stats of running instance",
-	Long: `Show keypool and routing stats of running miroxy instance.
+	Short: "Show credpool and routing stats of running instance",
+	Long: `Show credpool and routing stats of running miroxy instance.
 
 Displays per-pool key health (healthy / rate-limited / circuit-open)
 and the current model routing table.
@@ -266,7 +266,7 @@ func configGetCmd(use, short, path string) *cobra.Command {
 }
 
 var configCmd = &cobra.Command{
-	Use:   "config [providers|routes|keypools]",
+	Use:   "config [providers|routes|credpools]",
 	Short: "Show effective runtime configuration (keys masked)",
 	Long: `Show miroxy's effective runtime configuration — all defaults filled in,
 API keys masked to last 4 characters.
@@ -276,7 +276,7 @@ Requires MIROXY_AUTH_TOKEN env var (any value from auth.allowed_keys).
 Sub-commands:
   providers   Show resolved provider definitions
   routes      Show model routes (including auto-discovered)
-  keypools    Show keypools with masked keys
+  credpools    Show credpools with masked keys
 
 Without a sub-command, returns the full config.`,
 	RunE: func(cmd *cobra.Command, _ []string) error {
@@ -303,7 +303,7 @@ func init() {
 	configCmd.AddCommand(
 		configGetCmd("providers", "Show resolved provider definitions", "/v1/config/providers"),
 		configGetCmd("routes", "Show model routes (including auto-discovered)", "/v1/config/routes"),
-		configGetCmd("keypools", "Show keypools with masked keys", "/v1/config/keypools"),
+		configGetCmd("credpools", "Show credpools with masked keys", "/v1/config/credpools"),
 	)
 	rootCmd.AddCommand(configCmd)
 }

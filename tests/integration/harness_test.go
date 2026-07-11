@@ -10,11 +10,11 @@ import (
 	"strings"
 	"testing"
 
+	coreup "miroxy/core/upstream"
 	"miroxy/internal/config"
 	"miroxy/internal/server"
-	coreup "miroxy/core/upstream"
-	intup "miroxy/internal/upstream"
 	"miroxy/internal/types"
+	intup "miroxy/internal/upstream"
 )
 
 const testClientKey = "test-client-key"
@@ -145,9 +145,9 @@ func newTestServer(t *testing.T, cfg miroxyConfig) *httptest.Server {
 		cfg.threshold = 1
 	}
 
-	keyEntries := make([]config.KeyEntry, len(cfg.keys))
+	keyEntries := make([]config.CredEntry, len(cfg.keys))
 	for i, k := range cfg.keys {
-		keyEntries[i] = config.KeyEntry{Key: k}
+		keyEntries[i] = config.CredEntry{Key: k}
 	}
 
 	appCfg := &config.Config{
@@ -156,7 +156,7 @@ func newTestServer(t *testing.T, cfg miroxyConfig) *httptest.Server {
 			ModelName:     "claude-haiku",
 			Provider:      "gemini",
 			ProviderModel: "gemini-2.5-flash",
-			KeyPool: config.KeyPoolCfg{
+			CredPool: config.CredPoolCfg{
 				Strategy:              "round_robin",
 				CircuitBreakThreshold: cfg.threshold,
 				CooldownSeconds:       1,

@@ -27,7 +27,7 @@ Examples:
     miroxy serve -c /etc/miroxy.yaml      Start with explicit config
     miroxy serve --port 9090              Override listen port
     miroxy health                         Check running instance health
-    miroxy stat                           Show keypool and routing stats
+    miroxy stat                           Show credpool and routing stats
     miroxy reload                         Hot-reload config file`,
 	SilenceUsage:  true,
 	SilenceErrors: true,

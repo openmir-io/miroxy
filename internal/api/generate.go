@@ -17,7 +17,7 @@
 //	GET  /stat                      runtime stats + token usage
 //	GET  /v1/config                 full effective config (keys masked)
 //	GET  /v1/config/providers       resolved provider definitions
-//	GET  /v1/config/keypools        keypools with masked keys
+//	GET  /v1/config/credpools       credpools with masked keys
 //	GET  /v1/config/routes          model routes + providers
 //	POST /admin/reload              hot-reload config file
 //	POST /admin/proxy/stop          stop proxy listener

@@ -1,5 +1,5 @@
 # config.yaml.example.n-keys.n-pools.1-provider
-# Multiple keypools with multiple API keys, one provider (Gemini), one route model.
+# Multiple credpools with multiple API keys, one provider (Gemini), one route model.
 # Use case: different model tiers share the same provider but need isolated key sets.
 # The Flash pool has high-throughput free keys; the Pro pool has paid keys for
 # heavier workloads. Pools are isolated — a 429 in flash-pool never affects pro-pool.
@@ -14,7 +14,7 @@ auth:
 providers:
   gemini: {}
 
-keypools:
+credpools:
   gemini-flash:
     strategy: least_requests
     rate_limit_rpm: 20
@@ -34,11 +34,11 @@ model_routes:
   - model_name: miroxy           # default fast route
     provider: gemini
     provider_model: gemini-2.5-flash
-    keypool_ref: gemini-flash
+    credpool_ref: gemini-flash
     timeout_seconds: 30
 
   - model_name: miroxy-pro       # heavier, smarter route
     provider: gemini
     provider_model: gemini-2.5-pro
-    keypool_ref: gemini-pro
+    credpool_ref: gemini-pro
     timeout_seconds: 60

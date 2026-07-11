@@ -2,10 +2,10 @@ package config
 
 import (
 	"fmt"
+	"log/slog"
 	"net/url"
 	"os"
 	"regexp"
-	"log/slog"
 	"sort"
 	"strings"
 
@@ -139,7 +139,7 @@ func resolveProviders(cfg *Config) error {
 			continue
 		}
 
-		// Simple or inline-keypool entry.
+		// Simple or inline-credpool entry.
 		if m.Provider == "" {
 			continue
 		}
@@ -175,6 +175,11 @@ func validateConfig(cfg *Config) error {
 	if !validLogLevels[cfg.Log.Level] {
 		return fmt.Errorf("log.level %q is invalid — must be one of: debug, info, warn, error, fatal", cfg.Log.Level)
 	}
+	if cfg.Sidecar.CredSource.Enabled {
+		if err := validateCredSource(cfg.Sidecar.CredSource); err != nil {
+			return err
+		}
+	}
 	for i, k := range cfg.Auth.AllowedKeys {
 		if envVarRe.MatchString(k) {
 			return fmt.Errorf("auth.allowed_keys[%d] has unexpanded placeholder %q (env var not set)", i, k)
@@ -208,10 +213,10 @@ func validateConfig(cfg *Config) error {
 		return fmt.Errorf("server.default_model %q does not match any model_name in model_routes", cfg.Server.DefaultModel)
 	}
 
-	// Build set of named keypool names.
-	keypoolNames := make(map[string]bool, len(cfg.KeyPools))
-	for name := range cfg.KeyPools {
-		keypoolNames[name] = true
+	// Build set of named credpool names.
+	credpoolNames := make(map[string]bool, len(cfg.CredPools))
+	for name := range cfg.CredPools {
+		credpoolNames[name] = true
 	}
 
 	for i := range cfg.ModelRoutes {
@@ -221,7 +226,7 @@ func validateConfig(cfg *Config) error {
 		}
 
 		if m.Routing != nil {
-			if err := validateRoutingEntry(i, m, keypoolNames); err != nil {
+			if err := validateRoutingEntry(i, m, credpoolNames); err != nil {
 				return err
 			}
 			continue
@@ -232,17 +237,17 @@ func validateConfig(cfg *Config) error {
 			return fmt.Errorf("model_routes[%d] %q: provider_model is required", i, m.ModelName)
 		}
 
-		if m.KeypoolRef != "" {
+		if m.CredpoolRef != "" {
 			// References a named pool — skip inline key validation.
-			if !keypoolNames[m.KeypoolRef] {
-				return fmt.Errorf("model_routes[%d] %q: keypool_ref %q not found in keypools block", i, m.ModelName, m.KeypoolRef)
+			if !credpoolNames[m.CredpoolRef] {
+				return fmt.Errorf("model_routes[%d] %q: credpool_ref %q not found in credpools block", i, m.ModelName, m.CredpoolRef)
 			}
 		} else {
-			// Inline keypool — validate keys.
-			if len(m.KeyPool.Keys) == 0 {
-				return fmt.Errorf("model_routes[%d] %q: keypool.keys must have at least one entry (or use keypool_ref)", i, m.ModelName)
+			// Inline credpool — validate keys.
+			if len(m.CredPool.Keys) == 0 {
+				return fmt.Errorf("model_routes[%d] %q: credpool.keys must have at least one entry (or use credpool_ref)", i, m.ModelName)
 			}
-			if err := validateKeys(i, m.ModelName, m.KeyPool.Keys); err != nil {
+			if err := validateKeys(i, m.ModelName, m.CredPool.Keys, m.AuthStyle); err != nil {
 				return err
 			}
 		}
@@ -250,24 +255,23 @@ func validateConfig(cfg *Config) error {
 		if err := validateAPIBase(i, m); err != nil {
 			return err
 		}
-		if err := validateCredBroker(i, m.ModelName, m.KeyPool.CredBroker); err != nil {
-			return err
-		}
 	}
 
-	// Validate named keypools.
-	for name, kp := range cfg.KeyPools {
-		if len(kp.Keys) == 0 && kp.CredBroker == nil {
-			return fmt.Errorf("keypools.%s: must have at least one key or a cred_broker", name)
+	// Validate named credpools. A credpool may have zero local keys only when
+	// the global credsource fallback is enabled to supply credentials for it.
+	for name, kp := range cfg.CredPools {
+		if kp.AuthStyle != "" && !validAuthStyles[kp.AuthStyle] {
+			return fmt.Errorf("credpools.%s: auth_style %q is invalid — accepted: %s",
+				name, kp.AuthStyle, joinKeys(validAuthStyles))
 		}
-		if err := validateKeys(-1, "keypools."+name, kp.Keys); err != nil {
-			return err
+		if len(kp.Keys) == 0 && !cfg.Sidecar.CredSource.Enabled {
+			return fmt.Errorf("credpools.%s: must have at least one key (or enable credsource)", name)
 		}
-		if err := validateCredBroker(-1, "keypools."+name, kp.CredBroker); err != nil {
+		if err := validateKeys(-1, "credpools."+name, kp.Keys, kp.AuthStyle); err != nil {
 			return err
 		}
 		if kp.Provider != "" && !validProviderTags[kp.Provider] {
-			return fmt.Errorf("keypools.%s: provider %q is invalid — accepted values: %s",
+			return fmt.Errorf("credpools.%s: provider %q is invalid — accepted values: %s",
 				name, kp.Provider, joinKeys(validProviderTags))
 		}
 	}
@@ -327,6 +331,9 @@ func applyConfigDefaults(cfg *Config) {
 	if cfg.Dump.Path == "" {
 		cfg.Dump.Path = DefaultDumpPath
 	}
+	if cfg.Sidecar.CredSource.SyncInterval == 0 {
+		cfg.Sidecar.CredSource.SyncInterval = 300
+	}
 }
 
 var (
@@ -335,7 +342,7 @@ var (
 		"deepseek": true, "glm": true, "grok": true,
 	}
 	validAuthStyles = map[string]bool{
-		"bearer": true, "api_key": true, "none": true, "query_key": true,
+		"bearer": true, "api_key": true, "none": true, "query_key": true, "sigv4": true,
 	}
 	validProviderTags = map[string]bool{
 		"anthropic": true, "openai": true,
@@ -359,7 +366,7 @@ func joinKeys(m map[string]bool) string {
 	return out
 }
 
-func validateRoutingEntry(idx int, m *ModelEntry, keypoolNames map[string]bool) error {
+func validateRoutingEntry(idx int, m *ModelEntry, credpoolNames map[string]bool) error {
 	r := m.Routing
 	if len(r.Targets) == 0 {
 		return fmt.Errorf("model_routes[%d] %q: routing.targets must have at least one entry", idx, m.ModelName)
@@ -375,17 +382,20 @@ func validateRoutingEntry(idx int, m *ModelEntry, keypoolNames map[string]bool) 
 		if t.ProviderModel == "" {
 			return fmt.Errorf("model_routes[%d] %q: routing.targets[%d].provider_model is required", idx, m.ModelName, j)
 		}
-		if t.KeypoolRef == "" {
-			return fmt.Errorf("model_routes[%d] %q: routing.targets[%d].keypool_ref is required", idx, m.ModelName, j)
+		if t.CredpoolRef == "" {
+			return fmt.Errorf("model_routes[%d] %q: routing.targets[%d].credpool_ref is required", idx, m.ModelName, j)
 		}
-		if !keypoolNames[t.KeypoolRef] {
-			return fmt.Errorf("model_routes[%d] %q: routing.targets[%d].keypool_ref %q not found in keypools block", idx, m.ModelName, j, t.KeypoolRef)
+		if !credpoolNames[t.CredpoolRef] {
+			return fmt.Errorf("model_routes[%d] %q: routing.targets[%d].credpool_ref %q not found in credpools block", idx, m.ModelName, j, t.CredpoolRef)
 		}
 	}
 	return nil
 }
 
-func validateKeys(idx int, label string, keys []KeyEntry) error {
+// validateKeys checks a credpool's key entries. authStyle selects which
+// fields are required: "sigv4" needs AccessKeyID+SecretAccessKey per entry
+// (SessionToken optional); everything else needs the plain Key string.
+func validateKeys(idx int, label string, keys []CredEntry, authStyle string) error {
 	seen := make(map[string]bool, len(keys))
 	for j := range keys {
 		k := &keys[j]
@@ -396,6 +406,19 @@ func validateKeys(idx int, label string, keys []KeyEntry) error {
 			return fmt.Errorf("%s: duplicate key name %q — names must be unique within a pool", label, k.Name)
 		}
 		seen[k.Name] = true
+
+		if authStyle == "sigv4" {
+			if k.AccessKeyID == "" || k.SecretAccessKey == "" {
+				return fmt.Errorf("%s: keys[%d] %q: sigv4 entries require access_key_id and secret_access_key", label, j, k.Name)
+			}
+			for _, v := range []string{k.AccessKeyID, k.SecretAccessKey, k.SessionToken} {
+				if envVarRe.MatchString(v) {
+					return fmt.Errorf("%s: keys[%d] %q: unexpanded placeholder %q (env var not set)", label, j, k.Name, v)
+				}
+			}
+			continue
+		}
+
 		if k.Key == "" {
 			return fmt.Errorf("%s: keys[%d] %q: key is empty (check env var is set)", label, j, k.Name)
 		}
@@ -406,18 +429,24 @@ func validateKeys(idx int, label string, keys []KeyEntry) error {
 	return nil
 }
 
-func validateCredBroker(idx int, label string, cb *CredBrokerConfig) error {
-	if cb == nil {
-		return nil
+// validateCredSource checks the global credsource block. Only called when
+// enabled — an absent or disabled block is always valid (default off).
+func validateCredSource(cs CredSourceConfig) error {
+	if cs.BaseURL == "" {
+		return fmt.Errorf("credsource.base_url is required when credsource.enabled is true")
 	}
-	if cb.URL == "" {
-		return fmt.Errorf("%s: cred_broker.url is required", label)
+	u, err := url.Parse(cs.BaseURL)
+	if err != nil {
+		return fmt.Errorf("credsource.base_url %q is not a valid URL: %w", cs.BaseURL, err)
 	}
-	if cb.Pool == "" {
-		return fmt.Errorf("%s: cred_broker.pool is required", label)
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return fmt.Errorf("credsource.base_url %q must use http or https", cs.BaseURL)
 	}
-	if envVarRe.MatchString(cb.Token) {
-		return fmt.Errorf("%s: cred_broker.token has unexpanded placeholder %q (env var not set)", label, cb.Token)
+	if envVarRe.MatchString(cs.AuthToken) {
+		return fmt.Errorf("credsource.auth_token has unexpanded placeholder %q (env var not set)", cs.AuthToken)
+	}
+	if cs.AuthToken == "" {
+		slog.Warn("credsource.auth_token is empty — credstone requests will be unauthenticated")
 	}
 	return nil
 }

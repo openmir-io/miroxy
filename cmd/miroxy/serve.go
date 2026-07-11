@@ -253,6 +253,7 @@ func gracefulShutdown(httpSrv *http.Server, srv *server.Server) {
 		slog.Info("shutdown: all requests drained cleanly",
 			"in_flight", srv.InFlightCount())
 	}
+	srv.Close()
 	close(done)
 	slog.Info("shutdown complete")
 }

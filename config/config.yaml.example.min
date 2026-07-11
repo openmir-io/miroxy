@@ -1,5 +1,5 @@
 # config.yaml.example.min
-# Minimal miroxy configuration — one API key, one keypool, one provider, one route.
+# Minimal miroxy configuration — one API key, one credpool, one provider, one route.
 # Copy this file to config.yaml and fill in the blanks to get started.
 #
 # Proxy:  http://localhost:9000
@@ -15,7 +15,7 @@ auth:
 providers:
   gemini: {}                # uses built-in defaults (generativelanguage.googleapis.com)
 
-keypools:
+credpools:
   my-pool:
     keys:
       - my_key: ${GEMINI_KEY}
@@ -24,4 +24,4 @@ model_routes:
   - model_name: default
     provider: gemini
     provider_model: gemini-2.5-flash
-    keypool_ref: my-pool
+    credpool_ref: my-pool

@@ -11,7 +11,7 @@ import (
 	"miroxy/internal/types"
 )
 
-// tryInjectAnthropicModels finds the first named keypool backed by an Anthropic
+// tryInjectAnthropicModels finds the first named credpool backed by an Anthropic
 // provider, fetches the live model list from api.anthropic.com, and appends any
 // model not already present in cfg.ModelRoutes. Modifies cfg in memory only —
 // the config file on disk is never touched. Called once at startup when
@@ -19,7 +19,7 @@ import (
 func tryInjectAnthropicModels(cfg *config.Config) {
 	poolName, key := findAnthropicPoolKey(cfg)
 	if key == "" {
-		slog.Debug("model_discovery: auto enabled but no Anthropic keypool found, skipping")
+		slog.Debug("model_discovery: auto enabled but no Anthropic credpool found, skipping")
 		return
 	}
 
@@ -44,7 +44,7 @@ func tryInjectAnthropicModels(cfg *config.Config) {
 			DisplayName:   m.DisplayName,
 			Provider:      "anthropic",
 			ProviderModel: m.ID,
-			KeypoolRef:    poolName,
+			CredpoolRef:   poolName,
 		})
 		injected++
 	}
@@ -52,27 +52,27 @@ func tryInjectAnthropicModels(cfg *config.Config) {
 	slog.Info("model_discovery: injected Anthropic models", "count", injected, "pool", poolName)
 }
 
-// findAnthropicPoolKey returns the first keypool configured for Anthropic.
+// findAnthropicPoolKey returns the first credpool configured for Anthropic.
 // Checks in order:
-//  1. Keypools with provider: "anthropic" tag (explicit)
-//  2. Model routes with provider: "anthropic" referencing a named keypool (legacy)
+//  1. Credpools with provider: "anthropic" tag (explicit)
+//  2. Model routes with provider: "anthropic" referencing a named credpool (legacy)
 func findAnthropicPoolKey(cfg *config.Config) (poolName, key string) {
-	// 1. Explicit keypool tag.
-	for name, pool := range cfg.KeyPools {
+	// 1. Explicit credpool tag.
+	for name, pool := range cfg.CredPools {
 		if pool.Provider == "anthropic" && len(pool.Keys) > 0 {
 			return name, pool.Keys[0].Key
 		}
 	}
 	// 2. Infer from model_routes (backward compat).
 	for _, m := range cfg.ModelRoutes {
-		if m.Provider != "anthropic" || m.KeypoolRef == "" {
+		if m.Provider != "anthropic" || m.CredpoolRef == "" {
 			continue
 		}
-		pool, ok := cfg.KeyPools[m.KeypoolRef]
+		pool, ok := cfg.CredPools[m.CredpoolRef]
 		if !ok || len(pool.Keys) == 0 {
 			continue
 		}
-		return m.KeypoolRef, pool.Keys[0].Key
+		return m.CredpoolRef, pool.Keys[0].Key
 	}
 	return "", ""
 }

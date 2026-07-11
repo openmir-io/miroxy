@@ -59,7 +59,7 @@ providers:
   #   protocol: anthropic
   #   auth_style: bearer
 
-keypools:
+credpools:
   deepseek-pool:
     strategy: round_robin
     keys:
@@ -85,21 +85,21 @@ model_routes:
       targets:
         - provider: deepseek
           provider_model: deepseek-chat
-          keypool_ref: deepseek-pool
+          credpool_ref: deepseek-pool
           timeout_seconds: 30
         - provider: grok
           provider_model: grok-3-mini
-          keypool_ref: grok-pool
+          credpool_ref: grok-pool
           timeout_seconds: 30
 
   - model_name: miroxy-reasoning
     provider: deepseek
     provider_model: deepseek-reasoner
-    keypool_ref: deepseek-pool
+    credpool_ref: deepseek-pool
     timeout_seconds: 120
 
   - model_name: miroxy-openrouter
     provider: openrouter
     provider_model: anthropic/claude-sonnet-4-5   # OpenRouter model name
-    keypool_ref: openrouter-pool
+    credpool_ref: openrouter-pool
     timeout_seconds: 60
