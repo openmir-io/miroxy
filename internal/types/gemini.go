@@ -26,6 +26,13 @@ type GeminiPart struct {
 	Thought          bool                    `json:"thought,omitempty"`
 	FunctionCall     *GeminiFunctionCall     `json:"functionCall,omitempty"`
 	FunctionResponse *GeminiFunctionResponse `json:"functionResponse,omitempty"`
+	// ThoughtSignature is an opaque, encrypted blob binding this part to the
+	// model's internal reasoning state. "Thinking" models attach it to
+	// functionCall parts; every functionCall replayed in later turns must
+	// carry it back verbatim or Gemini rejects the request. See
+	// gemini_thoughtsig.go for how miroxy preserves it across the Anthropic
+	// round-trip.
+	ThoughtSignature string `json:"thoughtSignature,omitempty"`
 }
 
 type GenerationConfig struct {

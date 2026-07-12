@@ -8,8 +8,8 @@ import (
 	"io"
 	"strings"
 
-	"miroxy/internal/idgen"
 	"miroxy/core/ir"
+	"miroxy/internal/idgen"
 	"miroxy/internal/types"
 )
 
@@ -80,8 +80,10 @@ func (*GeminiConverter) ResponseToIR(body []byte) (*ir.IRResponse, error) {
 			content = append(content, ir.IRResponseBlock{Text: &ir.IRTextPart{Text: part.Text}})
 		}
 		if part.FunctionCall != nil {
+			toolID := idgen.NewToolID()
+			geminiThoughtSigs.store(toolID, part.ThoughtSignature)
 			content = append(content, ir.IRResponseBlock{ToolUse: &ir.IRToolUsePart{
-				ID:        idgen.NewToolID(),
+				ID:        toolID,
 				Name:      part.FunctionCall.Name,
 				InputJSON: rectifyArgs(part.FunctionCall.Args), // G-10
 			}})
@@ -178,6 +180,7 @@ func (*GeminiConverter) StreamToIR(ctx context.Context, body io.Reader) <-chan i
 						}
 						blockIndex++
 						toolID := idgen.NewToolID()
+						geminiThoughtSigs.store(toolID, part.ThoughtSignature)
 						// G-10: rectify args before marshaling.
 						argsJSON, _ := json.Marshal(rectifyArgs(part.FunctionCall.Args))
 						if !send(ir.StreamEvent{Kind: ir.EvToolCallStart, ToolCallStart: &ir.ToolCallStart{Index: blockIndex, ID: toolID, Name: part.FunctionCall.Name}}) {
@@ -332,6 +335,11 @@ func convertIRParts(parts []ir.IRContentPart, allMsgs []ir.IRMessage) ([]types.G
 					Name: p.ToolUse.Name,
 					Args: args,
 				},
+				// Re-attach the thought signature captured when this tool
+				// call was first parsed out of a Gemini response — see
+				// gemini_thoughtsig.go. Empty if this call predates thinking
+				// mode or the cache entry expired.
+				ThoughtSignature: geminiThoughtSigs.lookup(p.ToolUse.ID),
 			})
 		}
 		if p.ToolResult != nil {
