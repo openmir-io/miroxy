@@ -42,8 +42,10 @@ type routingState struct {
 	selectors map[string]selector.Selector
 	timeouts  map[string]time.Duration
 	// passthroughSelectors handles models not in model_routes.
-	// Keyed by provider name ("anthropic", "openai").
-	// Built from credpools that carry a provider: tag.
+	// Keyed by provider name ("anthropic", "openai", "gemini").
+	// Built from credpools whose family is known — either an explicit
+	// upstream_model_type: tag, or derived from a model_routes reference
+	// (see cfg.CredpoolFamilies / resolveCredpoolFamilies).
 	passthroughSelectors map[string]selector.Selector
 	// usageAcc holds one entry per credstone-backed named pool, keyed by the
 	// same "credsource:"+poolName SelectionID the pool uses internally, so
@@ -83,6 +85,12 @@ type Server struct {
 	// disabled or sidecar.credsource is enabled) and reused across Reload —
 	// changing local_state config requires a restart, same as server.port.
 	localStateStore *localstate.Store
+
+	// wardenFlushCancel stops the periodic warden-stats-to-local_state flush
+	// loop started in New() (nil when warden or local_state is disabled).
+	// Warden isn't reload-aware, so unlike credSourceCancel this has a
+	// simple 1:1 lifetime with the process, not a per-generation one.
+	wardenFlushCancel context.CancelFunc
 }
 
 // credentialFromConfig wraps a raw key into the appropriate typed Credential.
@@ -179,20 +187,20 @@ func newCredPool(
 // longer happens here — see dispatchFor in upstream.go, which compares each
 // request's actual (dynamically-detected) client protocol against the
 // target's static protocol at dispatch time, per attempt.
-func buildUpstreamAdapter(proto, providerModel, apiBase string) coreup.UpstreamAdapter {
+func buildUpstreamAdapter(proto, upstreamModel, apiBase string) coreup.UpstreamAdapter {
 	switch proto {
 	case "anthropic":
-		return intup.NewAnthropicUpstream(providerModel, apiBase)
+		return intup.NewAnthropicUpstream(upstreamModel, apiBase)
 	case "openai":
-		return intup.NewOpenAI(providerModel, apiBase)
+		return intup.NewOpenAI(upstreamModel, apiBase)
 	case "deepseek":
-		return intup.NewDeepSeek(providerModel, apiBase)
+		return intup.NewDeepSeek(upstreamModel, apiBase)
 	case "grok":
-		return intup.NewGrok(providerModel, apiBase)
+		return intup.NewGrok(upstreamModel, apiBase)
 	case "glm":
-		return intup.NewGLM(providerModel, apiBase)
+		return intup.NewGLM(upstreamModel, apiBase)
 	default: // "gemini" or empty
-		return intup.NewGeminiWithConfig(providerModel, apiBase)
+		return intup.NewGeminiWithConfig(upstreamModel, apiBase)
 	}
 }
 
@@ -200,7 +208,7 @@ func buildUpstreamAdapter(proto, providerModel, apiBase string) coreup.UpstreamA
 func resolveProto(m config.ModelEntry) (proto string) {
 	proto = m.Protocol
 	if proto == "" {
-		proto = m.Provider
+		proto = m.ProviderRef
 	}
 	return proto
 }
@@ -264,12 +272,16 @@ func buildRoutingState(cfg *config.Config, localStore *localstate.Store) (*routi
 		timeouts[m.ModelName] = modelTimeout(m)
 	}
 
-	// Build passthrough selectors from credpools tagged with provider: "anthropic"|"openai".
-	// These handle models that are not in model_routes: the client's model name is forwarded
-	// as-is to the upstream provider (e.g. claude-opus-4-8 → Anthropic, gpt-5.4 → OpenAI).
+	// Build passthrough selectors from credpools whose upstream provider family
+	// is known — either an explicit upstream_model_type tag, or derived from
+	// how model_routes already reference the pool (cfg.CredpoolFamilies; see
+	// resolveCredpoolFamilies). These handle models that are not in
+	// model_routes: the client's model name is forwarded as-is to the
+	// upstream provider (e.g. claude-opus-4-8 → Anthropic, gpt-5.4 → OpenAI).
 	passthrough := make(map[string]selector.Selector)
-	for poolName, kp := range cfg.CredPools {
-		if kp.Provider == "" {
+	for poolName := range cfg.CredPools {
+		family := cfg.CredpoolFamilies[poolName]
+		if family == "" {
 			continue
 		}
 		pool, ok := namedPools[poolName]
@@ -277,17 +289,17 @@ func buildRoutingState(cfg *config.Config, localStore *localstate.Store) (*routi
 			continue
 		}
 		var apiBase string
-		if p, exists := cfg.Providers[kp.Provider]; exists {
+		if p, exists := cfg.Providers[family]; exists {
 			apiBase = p.BaseURL
 		}
 		// "passthrough" here means the client's raw model name is forwarded
 		// as-is (no model_routes entry matched it) — unrelated to protocol
 		// passthrough. The real-vs-raw protocol decision is still made per
 		// request in dispatchFor, same as every other target.
-		upstream := buildUpstreamAdapter(kp.Provider, "", apiBase)
+		upstream := buildUpstreamAdapter(family, "", apiBase)
 		rawAdapter := intup.NewPassthrough(apiBase, "")
-		passthrough[kp.Provider] = selector.NewTargetSelector(pool, upstream, "", kp.Provider, rawAdapter, false)
-		slog.Info("passthrough selector built", "provider", kp.Provider, "pool", poolName)
+		passthrough[family] = selector.NewTargetSelector(pool, upstream, "", family, rawAdapter, false)
+		slog.Info("passthrough selector built", "provider", family, "pool", poolName)
 	}
 
 	return &routingState{selectors: sels, timeouts: timeouts, passthroughSelectors: passthrough, usageAcc: usageAcc}, cancelPollers
@@ -332,9 +344,14 @@ func New(cfg *config.Config, cfgPath string) *Server {
 
 	plugins := []pipeline.Plugin{newUpstreamExecutor(probers, s.tokenStats, rt.usageAcc)}
 	if cfg.Warden.Enabled {
-		wp, ws := buildWardenPlugin(&cfg.Warden)
+		wp, ws := buildWardenPlugin(&cfg.Warden, s.localStateStore)
 		s.wardenStats = ws
 		plugins = append([]pipeline.Plugin{wp}, plugins...)
+		if s.localStateStore != nil {
+			ctx, cancel := context.WithCancel(context.Background())
+			startWardenStatsFlushLoop(ctx, ws, s.localStateStore)
+			s.wardenFlushCancel = cancel
+		}
 	}
 	if cfg.Compress.Enabled {
 		cp, cs := buildCompressPlugin(&cfg.Compress)
@@ -370,7 +387,7 @@ func openLocalStateStore(cfg *config.Config) *localstate.Store {
 	if path == "" {
 		path = "./miroxy-local-state.db"
 	}
-	slog.Info("local_state enabled — credential health will be cached to disk", "path", path)
+	slog.Info("local_state enabled — credential health and warden stats will be cached to disk", "path", path)
 	return localstate.Open(path)
 }
 
@@ -449,8 +466,10 @@ func buildCompressPlugin(cfg *config.CompressConfig) (*compress.CompressPlugin, 
 
 // buildWardenPlugin constructs a WardenPlugin from the config block. A
 // fresh BuiltinWarden+Stats is built each call, same as buildCompressPlugin
-// above — stats reset on every New()/Reload(), matching existing convention.
-func buildWardenPlugin(cfg *config.WardenConfig) (*intwarden.WardenPlugin, *intwarden.Stats) {
+// above. When store is non-nil, a prior run's persisted counters are
+// restored before the plugin/stats are returned — i.e. before any request
+// can reach them, same contract as CredPool.RestoreHealth.
+func buildWardenPlugin(cfg *config.WardenConfig, store *localstate.Store) (*intwarden.WardenPlugin, *intwarden.Stats) {
 	wc := &intwarden.Config{
 		Enabled:    cfg.Enabled,
 		Mode:       cfg.Mode,
@@ -463,7 +482,72 @@ func buildWardenPlugin(cfg *config.WardenConfig) (*intwarden.WardenPlugin, *intw
 	w := intwarden.NewBuiltinWarden()
 	w.UpdateConfig(wc)
 	st := intwarden.NewStats()
+	if store != nil {
+		if persisted, ok := store.LoadWardenStats(); ok {
+			st.Restore(wardenStatsFromPersisted(persisted))
+		}
+	}
 	return intwarden.NewWardenPlugin(w, st), st
+}
+
+// wardenStatsFromPersisted converts the on-disk shape to the in-process
+// StatsSnapshot shape Stats.Restore expects.
+func wardenStatsFromPersisted(p localstate.WardenStats) intwarden.StatsSnapshot {
+	var startedAt time.Time
+	if p.StartedAtUnixNano != 0 {
+		startedAt = time.Unix(0, p.StartedAtUnixNano)
+	}
+	return intwarden.StatsSnapshot{
+		RequestsInspected: p.RequestsInspected,
+		SecretsFound:      p.SecretsFound,
+		PIIFound:          p.PIIFound,
+		InjectionsBlocked: p.InjectionsBlocked,
+		JailbreaksBlocked: p.JailbreaksBlocked,
+		TokensVaulted:     p.TokensVaulted,
+		ByType:            p.ByType,
+		StartedAt:         startedAt,
+	}
+}
+
+// healthSnapshotInterval (defined alongside startHealthSnapshotLoop) is
+// reused for warden's flush cadence too — same tradeoff, same constant.
+
+// startWardenStatsFlushLoop persists ws's counters to store every
+// healthSnapshotInterval, plus once more when ctx is cancelled so Close()
+// gets a final up-to-date snapshot. Warden isn't reload-aware today (Reload
+// never rebuilds s.pipe), so ctx here has a simple 1:1 lifetime with the one
+// warden instance built in New() — unlike the per-generation pollerCtx used
+// for credential health.
+func startWardenStatsFlushLoop(ctx context.Context, ws *intwarden.Stats, store *localstate.Store) {
+	go func() {
+		ticker := time.NewTicker(healthSnapshotInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				flushWardenStats(ws, store)
+			case <-ctx.Done():
+				flushWardenStats(ws, store)
+				return
+			}
+		}
+	}()
+}
+
+func flushWardenStats(ws *intwarden.Stats, store *localstate.Store) {
+	snap := ws.Snapshot()
+	if err := store.SaveWardenStats(localstate.WardenStats{
+		RequestsInspected: snap.RequestsInspected,
+		SecretsFound:      snap.SecretsFound,
+		PIIFound:          snap.PIIFound,
+		InjectionsBlocked: snap.InjectionsBlocked,
+		JailbreaksBlocked: snap.JailbreaksBlocked,
+		TokensVaulted:     snap.TokensVaulted,
+		ByType:            snap.ByType,
+		StartedAtUnixNano: snap.StartedAt.UnixNano(),
+	}); err != nil {
+		slog.Warn("warden: failed to flush stats to local_state", "error", err)
+	}
 }
 
 // buildModelSelector creates the Selector for one model_routes entry.
@@ -477,7 +561,7 @@ func buildModelSelector(m config.ModelEntry, namedPools map[string]*selector.Cre
 // buildSimpleSelector handles a simple (single-provider) model_routes entry.
 func buildSimpleSelector(m config.ModelEntry, namedPools map[string]*selector.CredPool, cfg *config.Config) selector.Selector {
 	proto := resolveProto(m)
-	trans := buildUpstreamAdapter(proto, m.ProviderModel, m.APIBase)
+	trans := buildUpstreamAdapter(proto, m.UpstreamModel, m.APIBase)
 	rawAdapter := intup.NewPassthrough(m.APIBase, "")
 	forcePassthrough := m.Mode == "passthrough"
 
@@ -490,7 +574,7 @@ func buildSimpleSelector(m config.ModelEntry, namedPools map[string]*selector.Cr
 		pool = selector.NewCredPool(selector.CredPoolConfig{
 			Keys:                specs,
 			Upstream:            trans, // kept for inline pools (prober compat)
-			ProviderModel:       m.ProviderModel,
+			UpstreamModel:       m.UpstreamModel,
 			Protocol:            proto,
 			PassthroughUpstream: rawAdapter,
 			ForcePassthrough:    forcePassthrough,
@@ -505,7 +589,7 @@ func buildSimpleSelector(m config.ModelEntry, namedPools map[string]*selector.Cr
 		return pool
 	}
 
-	return selector.NewTargetSelector(pool, trans, m.ProviderModel, proto, rawAdapter, forcePassthrough)
+	return selector.NewTargetSelector(pool, trans, m.UpstreamModel, proto, rawAdapter, forcePassthrough)
 }
 
 // buildRoutingSelector handles a routing (multi-provider) model_routes entry.
@@ -519,7 +603,7 @@ func buildRoutingSelector(m config.ModelEntry, namedPools map[string]*selector.C
 				"model", m.ModelName, "credpool_ref", t.CredpoolRef)
 			continue
 		}
-		trans := buildUpstreamAdapter(t.Protocol, t.ProviderModel, t.APIBase)
+		trans := buildUpstreamAdapter(t.Protocol, t.UpstreamModel, t.APIBase)
 		rawAdapter := intup.NewPassthrough(t.APIBase, "")
 		// Each target's real-vs-passthrough choice is made per request, per
 		// attempt, in dispatchFor — comparing the request's actual client
@@ -527,7 +611,7 @@ func buildRoutingSelector(m config.ModelEntry, namedPools map[string]*selector.C
 		// routing entry (e.g. gemini/anthropic/openai targets) correct
 		// per-target behavior: transform for the two that differ from the
 		// client's protocol, raw passthrough for the one that matches.
-		inner = append(inner, selector.NewTargetSelector(pool, trans, t.ProviderModel, t.Protocol, rawAdapter, forcePassthrough))
+		inner = append(inner, selector.NewTargetSelector(pool, trans, t.UpstreamModel, t.Protocol, rawAdapter, forcePassthrough))
 	}
 	return selector.NewRoutingSelector(m.Routing.Strategy, inner)
 }
@@ -542,7 +626,7 @@ func NewWithTranslators(cfg *config.Config, translators map[string]coreup.Upstre
 		pool := selector.NewCredPool(selector.CredPoolConfig{
 			Keys:          specs,
 			Upstream:      trans,
-			ProviderModel: m.ProviderModel,
+			UpstreamModel: m.UpstreamModel,
 			Strategy:      m.CredPool.Strategy,
 			Threshold:     m.CredPool.CircuitBreakThreshold,
 			Cooldown:      time.Duration(m.CredPool.CooldownSeconds) * time.Second,
@@ -847,10 +931,13 @@ func (s *Server) Close() {
 	if s.credSourceCancel != nil {
 		s.credSourceCancel()
 	}
-	// The health-snapshot loop's final flush (triggered by the cancel above)
-	// runs in its own goroutine and may not finish before this Close call —
-	// acceptable: it's a best-effort cache, same tolerance as every other
-	// local_state write.
+	if s.wardenFlushCancel != nil {
+		s.wardenFlushCancel()
+	}
+	// The health-snapshot/warden-stats loops' final flush (triggered by the
+	// cancels above) runs in its own goroutine and may not finish before
+	// this Close call — acceptable: it's a best-effort cache, same
+	// tolerance as every other local_state write.
 	if s.localStateStore != nil {
 		_ = s.localStateStore.Close()
 	}

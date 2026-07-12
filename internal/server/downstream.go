@@ -47,7 +47,7 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 		slog.Debug("model routed to default", "requested", req.Model, "default", entry.ModelName)
 	}
 	slog.Debug("model resolved",
-		"alias", req.Model, "provider_model", entry.ProviderModel, "provider", entry.Provider)
+		"alias", req.Model, "upstream_model", entry.UpstreamModel, "provider", entry.ProviderRef)
 
 	if req.Stream {
 		if _, ok := w.(http.Flusher); !ok {
@@ -64,8 +64,8 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 		Invisible: entry.Invisible,
 		Model: router.ModelInfo{
 			Name:          entry.ModelName,
-			ProviderModel: entry.ProviderModel,
-			Provider:      entry.Provider,
+			UpstreamModel: entry.UpstreamModel,
+			Provider:      entry.ProviderRef,
 		},
 		Selector:   rt.selectors[entry.ModelName],
 		Timeout:    rt.timeouts[entry.ModelName],

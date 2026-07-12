@@ -29,8 +29,8 @@ providers:
   gemini: {}
 model_routes:
   - model_name: claude-haiku
-    provider: gemini
-    provider_model: gemini-2.5-flash
+    provider_ref: gemini
+    upstream_model: gemini-2.5-flash
     credpool:
       strategy: round_robin
       keys:
@@ -60,8 +60,8 @@ providers:
   gemini: {}
 model_routes:
   - model_name: claude-haiku
-    provider: gemini
-    provider_model: gemini-2.5-flash
+    provider_ref: gemini
+    upstream_model: gemini-2.5-flash
     credpool:
       keys:
         - ${TEST_GEMINI_KEY}
@@ -82,8 +82,8 @@ func TestYAMLStore_Load_UnsetEnvVarFails(t *testing.T) {
 	path := writeTempConfig(t, `
 model_routes:
   - model_name: claude-haiku
-    provider: gemini
-    provider_model: gemini-2.5-flash
+    provider_ref: gemini
+    upstream_model: gemini-2.5-flash
     credpool:
       keys:
         - ${DEFINITELY_NOT_SET_XYZ123}
@@ -121,7 +121,7 @@ func TestYAMLStore_Load_APIBaseMismatch(t *testing.T) {
 model_routes:
   - model_name: m
     protocol: openai
-    provider_model: some-model
+    upstream_model: some-model
     api_base: https://generativelanguage.googleapis.com/v1
     auth_style: bearer
     credpool:
@@ -135,7 +135,7 @@ model_routes:
 model_routes:
   - model_name: m
     protocol: gemini
-    provider_model: some-model
+    upstream_model: some-model
     api_base: https://api.openai.com/v1
     credpool:
       keys: [test-key]
@@ -148,7 +148,7 @@ model_routes:
 model_routes:
   - model_name: m
     protocol: openai
-    provider_model: deepseek-chat
+    upstream_model: deepseek-chat
     api_base: https://api.deepseek.com/v1
     auth_style: bearer
     credpool:
@@ -162,7 +162,7 @@ model_routes:
 model_routes:
   - model_name: m
     protocol: openai
-    provider_model: some-model
+    upstream_model: some-model
     api_base: https://my-proxy.internal/v1
     auth_style: bearer
     credpool:
@@ -176,7 +176,7 @@ model_routes:
 model_routes:
   - model_name: m
     protocol: openai
-    provider_model: some-model
+    upstream_model: some-model
     api_base: "not a url"
     auth_style: bearer
     credpool:
@@ -191,7 +191,7 @@ model_routes:
   - model_name: m
     protocol: anthropic
     mode: passthrough
-    provider_model: claude-haiku-4-5-20251001
+    upstream_model: claude-haiku-4-5-20251001
     api_base: https://generativelanguage.googleapis.com/any/path
     auth_style: bearer
     credpool:
@@ -217,18 +217,18 @@ model_routes:
 func TestConfig_LookupModel(t *testing.T) {
 	cfg := &config.Config{
 		ModelRoutes: []config.ModelEntry{
-			{ModelName: "haiku", ProviderModel: "gemini-flash"},
-			{ModelName: "haiku-mini", ProviderModel: "gemini-mini"},
-			{ModelName: "opus", ProviderModel: "glm"},
-			{ModelName: "sonnet-5", ProviderModel: "gemini-pro"},
-			{ModelName: "gpt-5.4", ProviderModel: "deepseek"},
+			{ModelName: "haiku", UpstreamModel: "gemini-flash"},
+			{ModelName: "haiku-mini", UpstreamModel: "gemini-mini"},
+			{ModelName: "opus", UpstreamModel: "glm"},
+			{ModelName: "sonnet-5", UpstreamModel: "gemini-pro"},
+			{ModelName: "gpt-5.4", UpstreamModel: "deepseek"},
 		},
 		Server: config.ServerConfig{DefaultModel: "haiku"},
 	}
 
 	cases := []struct {
 		input  string
-		wantPM string // expected ProviderModel
+		wantPM string // expected UpstreamModel
 		wantOK bool
 	}{
 		// exact match
@@ -258,15 +258,15 @@ func TestConfig_LookupModel(t *testing.T) {
 			t.Errorf("LookupModel(%q) ok=%v want %v", tc.input, ok, tc.wantOK)
 			continue
 		}
-		if ok && e.ProviderModel != tc.wantPM {
-			t.Errorf("LookupModel(%q) providerModel=%q want %q", tc.input, e.ProviderModel, tc.wantPM)
+		if ok && e.UpstreamModel != tc.wantPM {
+			t.Errorf("LookupModel(%q) upstreamModel=%q want %q", tc.input, e.UpstreamModel, tc.wantPM)
 		}
 	}
 
 	// no match without default
 	cfgNoDefault := &config.Config{
 		ModelRoutes: []config.ModelEntry{
-			{ModelName: "haiku", ProviderModel: "gemini-flash"},
+			{ModelName: "haiku", UpstreamModel: "gemini-flash"},
 		},
 	}
 	if _, ok := cfgNoDefault.LookupModel("claude-opus-4-8"); ok {
@@ -300,8 +300,8 @@ credpools:
           secret_access_key: ${TEST_AWS_SECRET_KEY}
 model_routes:
   - model_name: claude-bedrock
-    provider: anthropic
-    provider_model: claude-3
+    provider_ref: anthropic
+    upstream_model: claude-3
     credpool_ref: bedrock-claude
     auth_style: sigv4
 `)
@@ -347,8 +347,8 @@ credpools:
         secret_access_key: ${TEST_AWS_SECRET_KEY}
 model_routes:
   - model_name: claude-bedrock
-    provider: anthropic
-    provider_model: claude-3
+    provider_ref: anthropic
+    upstream_model: claude-3
     credpool_ref: bedrock-claude
     auth_style: sigv4
 `)
@@ -375,8 +375,8 @@ credpools:
           access_key_id: AKIA-only
 model_routes:
   - model_name: claude-bedrock
-    provider: anthropic
-    provider_model: claude-3
+    provider_ref: anthropic
+    upstream_model: claude-3
     credpool_ref: bedrock-claude
     auth_style: sigv4
 `)
@@ -399,5 +399,97 @@ credpools:
 `)
 	if _, err := config.NewYAMLStore(path).Load(); err == nil {
 		t.Fatal("expected error for invalid credpool auth_style")
+	}
+}
+
+func TestYAMLStore_Load_CredpoolFamilyDerivedFromModelRoutes(t *testing.T) {
+	path := writeTempConfig(t, `
+providers:
+  gemini: {}
+credpools:
+  shared-keys:
+    keys:
+      - main: test-key
+model_routes:
+  - model_name: claude-haiku
+    provider_ref: gemini
+    upstream_model: gemini-2.5-flash
+    credpool_ref: shared-keys
+`)
+	cfg, err := config.NewYAMLStore(path).Load()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got := cfg.CredpoolFamilies["shared-keys"]; got != "gemini" {
+		t.Errorf("CredpoolFamilies[shared-keys] = %q, want %q (derived from model_routes, no explicit upstream_model_type tag)", got, "gemini")
+	}
+}
+
+func TestYAMLStore_Load_CredpoolFamilyExplicitTagWins(t *testing.T) {
+	path := writeTempConfig(t, `
+providers:
+  gemini: {}
+credpools:
+  tagged:
+    upstream_model_type: gemini
+    keys:
+      - main: test-key
+model_routes:
+  - model_name: claude-haiku
+    provider_ref: gemini
+    upstream_model: gemini-2.5-flash
+    credpool_ref: tagged
+`)
+	cfg, err := config.NewYAMLStore(path).Load()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got := cfg.CredpoolFamilies["tagged"]; got != "gemini" {
+		t.Errorf("CredpoolFamilies[tagged] = %q, want %q", got, "gemini")
+	}
+}
+
+func TestYAMLStore_Load_CredpoolFamilyConflictFails(t *testing.T) {
+	path := writeTempConfig(t, `
+providers:
+  gemini: {}
+  anthropic: {}
+credpools:
+  shared-keys:
+    keys:
+      - main: test-key
+model_routes:
+  - model_name: claude-haiku
+    provider_ref: gemini
+    upstream_model: gemini-2.5-flash
+    credpool_ref: shared-keys
+  - model_name: claude-sonnet
+    provider_ref: anthropic
+    upstream_model: claude-sonnet-real
+    credpool_ref: shared-keys
+`)
+	if _, err := config.NewYAMLStore(path).Load(); err == nil {
+		t.Fatal("expected error: same credpool_ref referenced with conflicting provider_ref values")
+	}
+}
+
+func TestYAMLStore_Load_CredpoolFamilyConflictWithExplicitTagFails(t *testing.T) {
+	path := writeTempConfig(t, `
+providers:
+  gemini: {}
+  anthropic: {}
+credpools:
+  tagged:
+    upstream_model_type: anthropic
+    keys:
+      - main: test-key
+model_routes:
+  - model_name: claude-haiku
+    provider_ref: gemini
+    upstream_model: gemini-2.5-flash
+    credpool_ref: tagged
+`)
+	if _, err := config.NewYAMLStore(path).Load(); err == nil {
+		t.Fatal("expected error: model_routes provider_ref contradicts the pool's explicit upstream_model_type")
 	}
 }

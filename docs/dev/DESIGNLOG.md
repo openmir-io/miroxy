@@ -1369,3 +1369,83 @@ actually constructs the value non-pointer, silently never matching).
 `tool_use`/`tool_result` content-block payloads are not scanned — only
 `system` text and `text`-type content blocks. A documented v1 scope limit,
 not an oversight.
+
+---
+
+## 2026-07-12 — Warden stats persisted to the existing local_state buntdb cache
+
+### Context
+
+`internal/warden.Stats` was process-memory only; a restart zeroed
+`requests_inspected`/`secrets_found`/`pii_found`/`injections_blocked`/
+`jailbreaks_blocked`/`tokens_vaulted`/`by_type`. Requested: survive a restart
+when `local_state.enabled` is on, same as per-credential health already does.
+
+This is the second thing asked to live in the `local_state` buntdb cache
+since the 2026-07-11 entry that introduced it — that entry explicitly
+**deferred** a broader idea (multi-dimensional usage stats: per model/
+provider/pool/key, historical session browsing) as "genuinely relational,
+doesn't fit a KV store well," and `CLAUDE.md`'s "No DB in v1" exception
+points here precisely to stop that kind of thing from drifting in silently.
+Worth being explicit about why this one is different: warden stats are a
+handful of global `int64` counters plus one flat `map[string]int64`
+(`by_type`) — no per-model/per-key dimensioning, no historical/session
+queries. Structurally identical to `CredHealth` (a few scalars per
+credential), the thing already being persisted — not the relational shape
+that was deferred. This is an application of the existing pattern, not a
+reopening of that decision.
+
+### Design
+
+- **No new config field.** Reuses `local_state.enabled`/`s.localStateStore`
+  as-is — a second key namespace (`"warden:stats"`, one global JSON blob)
+  in the same buntdb file alongside the existing `"cred:<pool>:<id>"` keys.
+  One cache, one on/off switch. Warden stats have no sidecar-authority
+  equivalent to credstone (there's nothing analogous to "credstone already
+  owns this data" for warden), but piggybacking on the same store/gate
+  keeps the mental model at one local-cache toggle instead of fragmenting
+  into a second one for marginal benefit — so warden stats persistence is
+  also disabled whenever `sidecar.credsource.enabled` is true, purely as a
+  side effect of sharing the store, not because of any real dependency
+  between the two features. Documented as a deliberate simplification.
+- **Exact mirror of `CredHealth`/`HealthSnapshot`/`RestoreHealth`.**
+  `internal/localstate.WardenStats` + `SaveWardenStats`/`LoadWardenStats`
+  (`internal/localstate/store.go`) parallel `CredHealth`/`SaveAllCredHealth`/
+  `LoadAllCredHealth`. `Stats.Restore(snap StatsSnapshot)`
+  (`internal/warden/stats.go`) parallels `CredPool.RestoreHealth` — same
+  contract, call once before serving traffic. `StartedAt` is adopted as-is
+  from the restored snapshot (when non-zero) so the reported "Window: since
+  ..." stays anchored to the original first start across restarts, not
+  reset every restart.
+- **Independent lifecycle, not the per-generation `pollerCtx`.** Credential
+  health's flush loop is tied to `pollerCtx`, which gets recreated every
+  `Reload()`. Warden isn't reload-aware at all today (confirmed in the
+  previous entry — `Reload()` never rebuilds `s.pipe`), so its flush loop
+  gets its own `context.WithCancel(context.Background())` created once in
+  `New()`, cancelled once in `Close()` (`Server.wardenFlushCancel`) — a
+  simple 1:1 lifetime matching the single warden instance that exists for
+  the process's life, rather than forcing it into a reload-generation model
+  it doesn't participate in.
+- **Same flush cadence and shutdown tolerance.** Reuses the existing
+  `healthSnapshotInterval` (30s) constant and the same "flush once more on
+  `ctx.Done()`" shape, so `Close()` gets a final snapshot for free — with
+  the same pre-existing, documented race: the final flush goroutine may not
+  finish before `Close()` closes the underlying buntdb file. Accepted
+  tolerance, not new; it already applied to credential health.
+- **`core/warden` untouched.** `Stats`/`Restore` live in `internal/warden`
+  (already an `internal/` type, no interface to keep IO-free) — same split
+  as `CredHealthSnapshot` being pure data in `core/selector` while the disk
+  I/O lives in `internal/localstate` + `internal/server`.
+
+### Files
+
+Modified: `internal/localstate/store.go` (`WardenStats`, `SaveWardenStats`,
+`LoadWardenStats`), `internal/warden/stats.go` (`Stats.Restore`),
+`internal/server/server.go` (`buildWardenPlugin` gains a `store` param,
+`wardenFlushCancel` field, `startWardenStatsFlushLoop`/`flushWardenStats`,
+wiring in `New()`/`Close()`, updated the `openLocalStateStore` log line and
+`LocalStateConfig`'s doc comment to reflect the broader scope).
+Tests: `internal/server/server_test.go` (`TestWardenStats_PersistsAcrossRestart`
+— two independent warden instances against the same buntdb file, proving a
+flush from the first is visible to the second, and that a live increment
+after restore builds on the restored baseline rather than replacing it).

@@ -213,7 +213,7 @@ Shows: uptime, in-flight count, model routing table, credpool health.`,
   :miroxy model <question>   — get model info then ask the LLM <question>
 
 Read-only. Shows: current default model, model_routes (client model name →
-provider / provider_model), configured providers, and each credpool's key
+provider / upstream_model), configured providers, and each credpool's key
 names (never key values).
 
 To switch models, use /model in Claude Code or Codex — the native picker,

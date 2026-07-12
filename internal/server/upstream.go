@@ -33,7 +33,7 @@ type keyAttempt struct {
 }
 
 // allKeysFailed builds the error returned when every retry attempt ended in failure.
-func allKeysFailed(modelName, providerModel string, attempts []keyAttempt, invisible bool) *pipeline.PipelineError {
+func allKeysFailed(modelName, upstreamModel string, attempts []keyAttempt, invisible bool) *pipeline.PipelineError {
 	if invisible && len(attempts) > 0 {
 		last := attempts[len(attempts)-1]
 		return &pipeline.PipelineError{
@@ -45,7 +45,7 @@ func allKeysFailed(modelName, providerModel string, attempts []keyAttempt, invis
 	for i, a := range attempts {
 		parts[i] = fmt.Sprintf("%s: %d %s", a.keyID, a.status, a.msg)
 	}
-	msg := fmt.Sprintf("%s <=> %s - %s", modelName, providerModel, strings.Join(parts, "; "))
+	msg := fmt.Sprintf("%s <=> %s - %s", modelName, upstreamModel, strings.Join(parts, "; "))
 	return &pipeline.PipelineError{
 		Status:  http.StatusServiceUnavailable,
 		ErrType: "overloaded_error",
@@ -123,7 +123,7 @@ func (e *UpstreamExecutor) executeNonStream(c *pipeline.LLMContext) error {
 			if p := e.probers[model.Name]; p != nil {
 				p.trigger()
 			}
-			return allKeysFailed(model.Name, model.ProviderModel, attempts, invisible)
+			return allKeysFailed(model.Name, model.UpstreamModel, attempts, invisible)
 		}
 		slog.Debug("upstream key selected", "attempt", attempt+1, "key_id", plan.SelectionID, "model", model.Name)
 
@@ -209,7 +209,7 @@ func (e *UpstreamExecutor) executeNonStream(c *pipeline.LLMContext) error {
 		return nil
 	}
 
-	return allKeysFailed(model.Name, model.ProviderModel, attempts, invisible)
+	return allKeysFailed(model.Name, model.UpstreamModel, attempts, invisible)
 }
 
 // tokenRecorder is satisfied by CredPool (type assertion, not part of the
@@ -252,7 +252,7 @@ func (e *UpstreamExecutor) executeStream(c *pipeline.LLMContext) error {
 				pr.trigger()
 			}
 			cancel()
-			return allKeysFailed(model.Name, model.ProviderModel, attempts, invisible)
+			return allKeysFailed(model.Name, model.UpstreamModel, attempts, invisible)
 		}
 		slog.Debug("stream key selected", "attempt", attempt+1, "key_id", p.SelectionID, "model", model.Name)
 
@@ -314,7 +314,7 @@ func (e *UpstreamExecutor) executeStream(c *pipeline.LLMContext) error {
 
 	if plan == nil {
 		cancel()
-		return allKeysFailed(model.Name, model.ProviderModel, attempts, invisible)
+		return allKeysFailed(model.Name, model.UpstreamModel, attempts, invisible)
 	}
 
 	msgID := idgen.NewMsgID()

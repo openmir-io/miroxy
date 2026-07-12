@@ -24,7 +24,7 @@ import (
 // Provider-specific differences (temperature clamp, finish_reason normalization)
 // are encapsulated in the UpstreamConverter implementation injected via upstream.
 type OpenAICompatAdapter struct {
-	providerModel string
+	upstreamModel string
 	baseURL       string // trimmed of trailing slash; no path suffix
 	downstream         irc.DownstreamConverter
 	upstream       irc.UpstreamBackend
@@ -35,29 +35,29 @@ type OpenAICompatAdapter struct {
 
 // NewOpenAI creates a translator for the standard OpenAI API.
 // baseURL defaults to the official OpenAI endpoint when empty.
-func NewOpenAI(providerModel, baseURL string) *OpenAICompatAdapter {
+func NewOpenAI(upstreamModel, baseURL string) *OpenAICompatAdapter {
 	if baseURL == "" {
 		baseURL = "https://api.openai.com/v1"
 	}
 	return &OpenAICompatAdapter{
-		providerModel: providerModel,
+		upstreamModel: upstreamModel,
 		baseURL:       strings.TrimRight(baseURL, "/"),
 		downstream:         irc.AnthropicConverter{},
-		upstream:       irc.NewBuiltinBackend(irc.NewOpenAIConverter(providerModel)),
+		upstream:       irc.NewBuiltinBackend(irc.NewOpenAIConverter(upstreamModel)),
 	}
 }
 
 // NewDeepSeek creates a translator for the DeepSeek API.
 // baseURL defaults to the official DeepSeek endpoint when empty.
-func NewDeepSeek(providerModel, baseURL string) *OpenAICompatAdapter {
+func NewDeepSeek(upstreamModel, baseURL string) *OpenAICompatAdapter {
 	if baseURL == "" {
 		baseURL = "https://api.deepseek.com/v1"
 	}
 	return &OpenAICompatAdapter{
-		providerModel: providerModel,
+		upstreamModel: upstreamModel,
 		baseURL:       strings.TrimRight(baseURL, "/"),
 		downstream:         irc.AnthropicConverter{},
-		upstream:       irc.NewBuiltinBackend(irc.NewOpenAICompatConverter(providerModel, "deepseek")),
+		upstream:       irc.NewBuiltinBackend(irc.NewOpenAICompatConverter(upstreamModel, "deepseek")),
 	}
 }
 
@@ -65,30 +65,30 @@ func NewDeepSeek(providerModel, baseURL string) *OpenAICompatAdapter {
 // baseURL defaults to the official xAI endpoint when empty.
 // GrokConverter is used (not the generic OpenAICompatConverter) so that
 // Grok-specific overrides can be added to grok_irc.go without touching this file.
-func NewGrok(providerModel, baseURL string) *OpenAICompatAdapter {
+func NewGrok(upstreamModel, baseURL string) *OpenAICompatAdapter {
 	if baseURL == "" {
 		baseURL = "https://api.x.ai/v1"
 	}
 	return &OpenAICompatAdapter{
-		providerModel: providerModel,
+		upstreamModel: upstreamModel,
 		baseURL:       strings.TrimRight(baseURL, "/"),
 		downstream:    irc.AnthropicConverter{},
-		upstream:      irc.NewBuiltinBackend(irc.NewGrokConverter(providerModel)),
+		upstream:      irc.NewBuiltinBackend(irc.NewGrokConverter(upstreamModel)),
 	}
 }
 
 // NewGLM creates a translator for Zhipu AI (GLM/ZAI).
 // baseURL defaults to the international ZAI endpoint when empty.
 // For China region, set baseURL to "https://open.bigmodel.cn/api/paas/v4".
-func NewGLM(providerModel, baseURL string) *OpenAICompatAdapter {
+func NewGLM(upstreamModel, baseURL string) *OpenAICompatAdapter {
 	if baseURL == "" {
 		baseURL = "https://api.z.ai/api/paas/v4"
 	}
 	return &OpenAICompatAdapter{
-		providerModel: providerModel,
+		upstreamModel: upstreamModel,
 		baseURL:       strings.TrimRight(baseURL, "/"),
 		downstream:         irc.AnthropicConverter{},
-		upstream:       irc.NewBuiltinBackend(irc.NewGLMConverter(providerModel)),
+		upstream:       irc.NewBuiltinBackend(irc.NewGLMConverter(upstreamModel)),
 	}
 }
 
@@ -105,7 +105,7 @@ func (t *OpenAICompatAdapter) buildHTTPRequest(
 	credential cred.Credential,
 ) (*http.Request, error) {
 	slog.Debug("building upstream request",
-		"provider_model", t.providerModel,
+		"upstream_model", t.upstreamModel,
 		"messages", len(req.Messages),
 		"max_tokens", req.MaxTokens,
 		"has_system", len(req.System) > 0,
@@ -167,7 +167,7 @@ func (t *OpenAICompatAdapter) StreamFromUpstream(
 	resp *http.Response,
 	msgID, modelAlias string,
 ) (<-chan types.SSEEvent, error) {
-	slog.Debug("stream started", "provider_model", t.providerModel, "msg_id", msgID, "model_alias", modelAlias)
+	slog.Debug("stream started", "upstream_model", t.upstreamModel, "msg_id", msgID, "model_alias", modelAlias)
 	out := make(chan types.SSEEvent, 32)
 	go func() {
 		defer resp.Body.Close()

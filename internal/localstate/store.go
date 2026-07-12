@@ -107,3 +107,57 @@ func (s *Store) LoadAllCredHealth(poolName string) map[string]CredHealth {
 	})
 	return out
 }
+
+// WardenStats is a serializable snapshot of warden's cumulative counters —
+// same shape/purpose as CredHealth, just one global blob instead of one
+// entry per credential (there's exactly one warden instance per process).
+type WardenStats struct {
+	RequestsInspected int64            `json:"requests_inspected"`
+	SecretsFound      int64            `json:"secrets_found"`
+	PIIFound          int64            `json:"pii_found"`
+	InjectionsBlocked int64            `json:"injections_blocked"`
+	JailbreaksBlocked int64            `json:"jailbreaks_blocked"`
+	TokensVaulted     int64            `json:"tokens_vaulted"`
+	ByType            map[string]int64 `json:"by_type"`
+	StartedAtUnixNano int64            `json:"started_at_unix_nano"`
+}
+
+const wardenStatsKey = "warden:stats"
+
+// SaveWardenStats persists stats as a single JSON blob, overwriting any
+// prior snapshot.
+func (s *Store) SaveWardenStats(stats WardenStats) error {
+	if s.db == nil {
+		return nil
+	}
+	data, err := json.Marshal(stats)
+	if err != nil {
+		return err
+	}
+	return s.db.Update(func(tx *buntdb.Tx) error {
+		_, _, err := tx.Set(wardenStatsKey, string(data), nil)
+		return err
+	})
+}
+
+// LoadWardenStats returns the persisted snapshot, or (zero, false) when
+// none exists yet or the store is a no-op (nil db) — same "missing or
+// corrupt is not fatal" tolerance as LoadAllCredHealth.
+func (s *Store) LoadWardenStats() (WardenStats, bool) {
+	var out WardenStats
+	if s.db == nil {
+		return out, false
+	}
+	found := false
+	_ = s.db.View(func(tx *buntdb.Tx) error {
+		val, err := tx.Get(wardenStatsKey)
+		if err != nil {
+			return nil
+		}
+		if json.Unmarshal([]byte(val), &out) == nil {
+			found = true
+		}
+		return nil
+	})
+	return out, found
+}

@@ -27,7 +27,7 @@ const defaultGeminiBase = "https://generativelanguage.googleapis.com"
 //	FromUpstream:       Gemini    → [upstream.ResponseToIR] → IR → [downstream.ResponseFromIR] → Anthropic
 //	StreamFromUpstream: Gemini SSE → [upstream.StreamToIR] → IR events → [downstream.StreamFromIR] → Anthropic SSE
 type GeminiAdapter struct {
-	providerModel string
+	upstreamModel string
 	baseURL       string
 	// authStyle removed: credential type now encodes how auth is applied (Apply method).
 
@@ -37,9 +37,9 @@ type GeminiAdapter struct {
 
 var _ coreup.UpstreamAdapter = (*GeminiAdapter)(nil)
 
-func newGeminiTranslator(providerModel, baseURL string) *GeminiAdapter {
+func newGeminiTranslator(upstreamModel, baseURL string) *GeminiAdapter {
 	return &GeminiAdapter{
-		providerModel: providerModel,
+		upstreamModel: upstreamModel,
 		baseURL:       baseURL,
 		downstream:         irc.AnthropicConverter{},
 		upstream:       irc.NewBuiltinBackend(&irc.GeminiConverter{}),
@@ -47,32 +47,32 @@ func newGeminiTranslator(providerModel, baseURL string) *GeminiAdapter {
 }
 
 // NewGemini creates a translator pointed at the default Google AI Studio endpoint.
-func NewGemini(providerModel string) *GeminiAdapter {
-	return newGeminiTranslator(providerModel, defaultGeminiBase)
+func NewGemini(upstreamModel string) *GeminiAdapter {
+	return newGeminiTranslator(upstreamModel, defaultGeminiBase)
 }
 
 // NewGeminiWithBase creates a translator with a custom base URL — used in integration tests.
-func NewGeminiWithBase(providerModel, baseURL string) *GeminiAdapter {
-	return newGeminiTranslator(providerModel, baseURL)
+func NewGeminiWithBase(upstreamModel, baseURL string) *GeminiAdapter {
+	return newGeminiTranslator(upstreamModel, baseURL)
 }
 
 // NewGeminiWithConfig creates a translator with a custom base URL and provider model.
 // If baseURL is empty, defaults to the Google AI Studio endpoint.
 // Auth style (query key vs bearer) is now encoded in the Credential passed to
 // ToUpstream/ToUpstreamStream — QueryCredential for ?key=, HeaderCredential for Bearer.
-func NewGeminiWithConfig(providerModel, baseURL string) *GeminiAdapter {
+func NewGeminiWithConfig(upstreamModel, baseURL string) *GeminiAdapter {
 	if baseURL == "" {
 		baseURL = defaultGeminiBase
 	}
-	return newGeminiTranslator(providerModel, baseURL)
+	return newGeminiTranslator(upstreamModel, baseURL)
 }
 
 func (t *GeminiAdapter) endpointURL() string {
-	return fmt.Sprintf("%s/v1beta/models/%s:generateContent", t.baseURL, t.providerModel)
+	return fmt.Sprintf("%s/v1beta/models/%s:generateContent", t.baseURL, t.upstreamModel)
 }
 
 func (t *GeminiAdapter) streamEndpointURL() string {
-	return fmt.Sprintf("%s/v1beta/models/%s:streamGenerateContent?alt=sse", t.baseURL, t.providerModel)
+	return fmt.Sprintf("%s/v1beta/models/%s:streamGenerateContent?alt=sse", t.baseURL, t.upstreamModel)
 }
 
 func (t *GeminiAdapter) ToUpstream(ctx context.Context, req *types.MessageRequest, credential cred.Credential) (*http.Request, error) {
@@ -85,7 +85,7 @@ func (t *GeminiAdapter) ToUpstreamStream(ctx context.Context, req *types.Message
 
 func (t *GeminiAdapter) buildHTTPRequest(ctx context.Context, req *types.MessageRequest, url string, credential cred.Credential) (*http.Request, error) {
 	slog.Debug("building upstream request",
-		"provider_model", t.providerModel,
+		"upstream_model", t.upstreamModel,
 		"messages", len(req.Messages),
 		"max_tokens", req.MaxTokens,
 		"has_system", len(req.System) > 0,
@@ -124,7 +124,7 @@ func (t *GeminiAdapter) FromUpstream(resp *http.Response) (*types.MessageRespons
 }
 
 func (t *GeminiAdapter) StreamFromUpstream(ctx context.Context, resp *http.Response, msgID, modelAlias string) (<-chan types.SSEEvent, error) {
-	slog.Debug("stream started", "provider_model", t.providerModel, "msg_id", msgID, "model_alias", modelAlias)
+	slog.Debug("stream started", "upstream_model", t.upstreamModel, "msg_id", msgID, "model_alias", modelAlias)
 	out := make(chan types.SSEEvent, 32)
 	go func() {
 		defer resp.Body.Close()

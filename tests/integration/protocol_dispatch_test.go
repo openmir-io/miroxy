@@ -83,9 +83,9 @@ func TestRoundRobin_DynamicProtocolDispatch(t *testing.T) {
 			Routing: &config.RoutingConfig{
 				Strategy: "round_robin",
 				Targets: []config.RoutingTarget{
-					{Provider: "gemini", ProviderModel: "gemini-target", CredpoolRef: "pool-gemini", Protocol: "gemini", APIBase: geminiStub.URL},
-					{Provider: "anthropic", ProviderModel: "claude-target", CredpoolRef: "pool-anthropic", Protocol: "anthropic", APIBase: anthropicStub.URL},
-					{Provider: "openai", ProviderModel: "gpt-target", CredpoolRef: "pool-openai", Protocol: "openai", APIBase: openaiStub.URL},
+					{ProviderRef: "gemini", UpstreamModel: "gemini-target", CredpoolRef: "pool-gemini", Protocol: "gemini", APIBase: geminiStub.URL},
+					{ProviderRef: "anthropic", UpstreamModel: "claude-target", CredpoolRef: "pool-anthropic", Protocol: "anthropic", APIBase: anthropicStub.URL},
+					{ProviderRef: "openai", UpstreamModel: "gpt-target", CredpoolRef: "pool-openai", Protocol: "openai", APIBase: openaiStub.URL},
 				},
 			},
 			TimeoutSeconds: 5,

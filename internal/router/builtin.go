@@ -75,15 +75,15 @@ func (b *BuiltinRouter) Route(ctx context.Context, model string) (*coreouter.Rou
 
 	table := b.table.Load()
 	sel := table.Selectors[entry.ModelName]
-	providerModel := entry.ProviderModel
+	upstreamModel := entry.UpstreamModel
 
 	// Passthrough: entry came from LookupModel's inferred-provider step. No
 	// pre-built selector exists; use the passthrough selector for the
 	// provider and forward the original model name to the upstream as-is.
-	if sel == nil && entry.Provider != "" {
-		sel = table.PassthroughSelectors[entry.Provider]
-		if providerModel == "" {
-			providerModel = model
+	if sel == nil && entry.ProviderRef != "" {
+		sel = table.PassthroughSelectors[entry.ProviderRef]
+		if upstreamModel == "" {
+			upstreamModel = model
 		}
 	}
 
@@ -91,8 +91,8 @@ func (b *BuiltinRouter) Route(ctx context.Context, model string) (*coreouter.Rou
 		Invisible: entry.Invisible,
 		Model: coreouter.ModelInfo{
 			Name:          entry.ModelName,
-			ProviderModel: providerModel,
-			Provider:      entry.Provider,
+			UpstreamModel: upstreamModel,
+			Provider:      entry.ProviderRef,
 		},
 		Selector:   sel,
 		Timeout:    table.Timeouts[entry.ModelName],

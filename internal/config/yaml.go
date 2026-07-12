@@ -46,6 +46,8 @@ func (s *YAMLStore) Load() (*Config, error) {
 		return nil, fmt.Errorf("invalid config: %w", err)
 	}
 
+	cfg.CredpoolFamilies = resolveCredpoolFamilies(&cfg)
+
 	return &cfg, nil
 }
 
@@ -74,6 +76,7 @@ func LoadFromBytesWithEnv(data []byte, extraEnv map[string]string) (*Config, err
 	if err := validateConfig(&cfg); err != nil {
 		return nil, fmt.Errorf("invalid config: %w", err)
 	}
+	cfg.CredpoolFamilies = resolveCredpoolFamilies(&cfg)
 	return &cfg, nil
 }
 
@@ -119,12 +122,12 @@ func resolveProviders(cfg *Config) error {
 			// Routing entry: resolve each target.
 			for j := range m.Routing.Targets {
 				t := &m.Routing.Targets[j]
-				if t.Provider == "" {
+				if t.ProviderRef == "" {
 					continue
 				}
-				pd, ok := lookupProvider(t.Provider)
+				pd, ok := lookupProvider(t.ProviderRef)
 				if !ok {
-					return fmt.Errorf("model_routes[%d] %q: routing target[%d] references unknown provider %q", i, m.ModelName, j, t.Provider)
+					return fmt.Errorf("model_routes[%d] %q: routing target[%d] references unknown provider_ref %q", i, m.ModelName, j, t.ProviderRef)
 				}
 				if t.Protocol == "" {
 					t.Protocol = pd.Protocol
@@ -140,19 +143,19 @@ func resolveProviders(cfg *Config) error {
 		}
 
 		// Simple or inline-credpool entry.
-		if m.Provider == "" {
+		if m.ProviderRef == "" {
 			continue
 		}
-		pd, ok := lookupProvider(m.Provider)
+		pd, ok := lookupProvider(m.ProviderRef)
 		if !ok {
 			// Provider not declared in providers block.
 			// Allowed only when api_base + protocol are set directly on the entry
 			// (fully self-contained route that needs no provider definition).
 			if m.Protocol == "" && m.APIBase == "" {
-				return fmt.Errorf("model_routes[%d] %q: provider %q is not declared in the providers block — "+
+				return fmt.Errorf("model_routes[%d] %q: provider_ref %q is not declared in the providers block — "+
 					"add a providers.%s entry (fields can be empty to use built-in defaults), "+
 					"or set api_base and protocol directly on this model_routes entry",
-					i, m.ModelName, m.Provider, m.Provider)
+					i, m.ModelName, m.ProviderRef, m.ProviderRef)
 			}
 			continue
 		}
@@ -167,6 +170,81 @@ func resolveProviders(cfg *Config) error {
 		}
 	}
 	return nil
+}
+
+// validateCredpoolFamilyConsistency ensures every credpool_ref is associated
+// with at most one upstream provider family. A credpool's keys belong to a
+// single provider, so the same credpool_ref showing up under two different
+// provider_ref values (or contradicting its own explicit
+// upstream_model_type tag) is always a config mistake, never a valid
+// multi-provider pool — fail the load instead of silently picking one.
+func validateCredpoolFamilyConsistency(cfg *Config) error {
+	seen := make(map[string]string, len(cfg.CredPools))
+	for name, kp := range cfg.CredPools {
+		if kp.UpstreamModelType != "" {
+			seen[name] = kp.UpstreamModelType
+		}
+	}
+	check := func(context, poolRef, provider string) error {
+		if poolRef == "" || provider == "" {
+			return nil
+		}
+		if prev, ok := seen[poolRef]; ok && prev != provider {
+			return fmt.Errorf("%s: credpool_ref %q is used with provider_ref %q, but is already associated with %q — "+
+				"a credpool's keys belong to a single upstream provider", context, poolRef, provider, prev)
+		}
+		seen[poolRef] = provider
+		return nil
+	}
+	for i, m := range cfg.ModelRoutes {
+		if m.Routing != nil {
+			for j, t := range m.Routing.Targets {
+				if err := check(fmt.Sprintf("model_routes[%d] %q routing.targets[%d]", i, m.ModelName, j), t.CredpoolRef, t.ProviderRef); err != nil {
+					return err
+				}
+			}
+			continue
+		}
+		if err := check(fmt.Sprintf("model_routes[%d] %q", i, m.ModelName), m.CredpoolRef, m.ProviderRef); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// resolveCredpoolFamilies derives each credpool's upstream provider family
+// (anthropic/openai/gemini) from how model_routes reference it via
+// credpool_ref + provider_ref, so a credpool doesn't need an explicit
+// upstream_model_type tag unless it's never referenced by a static route
+// (e.g. a pool held only for provider passthrough — see LookupModel step 4).
+// An explicit upstream_model_type tag always wins over the derived value.
+// validateCredpoolFamilyConsistency has already rejected any conflicting
+// associations by the time this runs, so last-write is safe.
+func resolveCredpoolFamilies(cfg *Config) map[string]string {
+	families := make(map[string]string, len(cfg.CredPools))
+	for name, kp := range cfg.CredPools {
+		if kp.UpstreamModelType != "" {
+			families[name] = kp.UpstreamModelType
+		}
+	}
+	assign := func(poolRef, provider string) {
+		if poolRef == "" || provider == "" {
+			return
+		}
+		if _, ok := families[poolRef]; !ok {
+			families[poolRef] = provider
+		}
+	}
+	for _, m := range cfg.ModelRoutes {
+		if m.Routing != nil {
+			for _, t := range m.Routing.Targets {
+				assign(t.CredpoolRef, t.ProviderRef)
+			}
+			continue
+		}
+		assign(m.CredpoolRef, m.ProviderRef)
+	}
+	return families
 }
 
 var validLogLevels = map[string]bool{"debug": true, "info": true, "warn": true, "error": true, "fatal": true, "": true}
@@ -232,9 +310,9 @@ func validateConfig(cfg *Config) error {
 			continue
 		}
 
-		// Simple entry: needs provider_model.
-		if m.ProviderModel == "" {
-			return fmt.Errorf("model_routes[%d] %q: provider_model is required", i, m.ModelName)
+		// Simple entry: needs upstream_model.
+		if m.UpstreamModel == "" {
+			return fmt.Errorf("model_routes[%d] %q: upstream_model is required", i, m.ModelName)
 		}
 
 		if m.CredpoolRef != "" {
@@ -270,10 +348,14 @@ func validateConfig(cfg *Config) error {
 		if err := validateKeys(-1, "credpools."+name, kp.Keys, kp.AuthStyle); err != nil {
 			return err
 		}
-		if kp.Provider != "" && !validProviderTags[kp.Provider] {
-			return fmt.Errorf("credpools.%s: provider %q is invalid — accepted values: %s",
-				name, kp.Provider, joinKeys(validProviderTags))
+		if kp.UpstreamModelType != "" && !validUpstreamModelTypes[kp.UpstreamModelType] {
+			return fmt.Errorf("credpools.%s: upstream_model_type %q is invalid — accepted values: %s",
+				name, kp.UpstreamModelType, joinKeys(validUpstreamModelTypes))
 		}
+	}
+
+	if err := validateCredpoolFamilyConsistency(cfg); err != nil {
+		return err
 	}
 
 	// Validate protocol and auth_style on providers block and model_routes.
@@ -363,8 +445,8 @@ var (
 	validAuthStyles = map[string]bool{
 		"bearer": true, "api_key": true, "none": true, "query_key": true, "sigv4": true,
 	}
-	validProviderTags = map[string]bool{
-		"anthropic": true, "openai": true,
+	validUpstreamModelTypes = map[string]bool{
+		"anthropic": true, "openai": true, "gemini": true,
 	}
 )
 
@@ -395,11 +477,11 @@ func validateRoutingEntry(idx int, m *ModelEntry, credpoolNames map[string]bool)
 		return fmt.Errorf("model_routes[%d] %q: routing.strategy %q is invalid (fallback | round_robin | least_requests)", idx, m.ModelName, r.Strategy)
 	}
 	for j, t := range r.Targets {
-		if t.Provider == "" {
-			return fmt.Errorf("model_routes[%d] %q: routing.targets[%d].provider is required", idx, m.ModelName, j)
+		if t.ProviderRef == "" {
+			return fmt.Errorf("model_routes[%d] %q: routing.targets[%d].provider_ref is required", idx, m.ModelName, j)
 		}
-		if t.ProviderModel == "" {
-			return fmt.Errorf("model_routes[%d] %q: routing.targets[%d].provider_model is required", idx, m.ModelName, j)
+		if t.UpstreamModel == "" {
+			return fmt.Errorf("model_routes[%d] %q: routing.targets[%d].upstream_model is required", idx, m.ModelName, j)
 		}
 		if t.CredpoolRef == "" {
 			return fmt.Errorf("model_routes[%d] %q: routing.targets[%d].credpool_ref is required", idx, m.ModelName, j)
@@ -483,7 +565,7 @@ func validateAPIBase(idx int, m *ModelEntry) error {
 
 	proto := m.Protocol
 	if proto == "" {
-		proto = m.Provider
+		proto = m.ProviderRef
 	}
 	if proto == "" {
 		proto = "gemini"

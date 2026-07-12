@@ -191,16 +191,16 @@ func (s *Server) adminStatus(w http.ResponseWriter, _ *http.Request) {
 
 	type modelRow struct {
 		ModelName     string `json:"model_name"`
-		Provider      string `json:"provider"`
-		ProviderModel string `json:"provider_model"`
+		ProviderRef   string `json:"provider_ref"`
+		UpstreamModel string `json:"upstream_model"`
 		Strategy      string `json:"strategy,omitempty"`
 	}
 	models := make([]modelRow, 0, len(cfg.ModelRoutes))
 	for _, m := range cfg.ModelRoutes {
 		row := modelRow{
 			ModelName:     m.ModelName,
-			Provider:      m.Provider,
-			ProviderModel: m.ProviderModel,
+			ProviderRef:   m.ProviderRef,
+			UpstreamModel: m.UpstreamModel,
 		}
 		if m.Routing != nil {
 			row.Strategy = m.Routing.Strategy
@@ -345,10 +345,10 @@ func (s *Server) StatsText() string {
 		if m.Routing != nil {
 			fmt.Fprintf(&b, "  %-22s [%s]\n", m.ModelName, m.Routing.Strategy)
 			for _, t := range m.Routing.Targets {
-				fmt.Fprintf(&b, "    └─ %-12s %s\n", t.Provider, t.ProviderModel)
+				fmt.Fprintf(&b, "    └─ %-12s %s\n", t.ProviderRef, t.UpstreamModel)
 			}
 		} else {
-			fmt.Fprintf(&b, "  %-22s %s / %s\n", m.ModelName, m.Provider, m.ProviderModel)
+			fmt.Fprintf(&b, "  %-22s %s / %s\n", m.ModelName, m.ProviderRef, m.UpstreamModel)
 		}
 	}
 	return b.String()
@@ -405,7 +405,7 @@ func (s *Server) buildConfigResponse(cfg *config.Config, sections ...string) map
 			Key  string `json:"key"`
 		}
 		type poolView struct {
-			Provider              string     `json:"provider,omitempty"`
+			UpstreamModelType     string     `json:"upstream_model_type,omitempty"`
 			Strategy              string     `json:"strategy,omitempty"`
 			CircuitBreakThreshold int        `json:"circuit_break_threshold,omitempty"`
 			CooldownSeconds       int        `json:"cooldown_seconds,omitempty"`
@@ -415,7 +415,7 @@ func (s *Server) buildConfigResponse(cfg *config.Config, sections ...string) map
 		pools := map[string]poolView{}
 		for name, kp := range cfg.CredPools {
 			pv := poolView{
-				Provider:              kp.Provider,
+				UpstreamModelType:     kp.UpstreamModelType,
 				Strategy:              kp.Strategy,
 				CircuitBreakThreshold: kp.CircuitBreakThreshold,
 				CooldownSeconds:       kp.CooldownSeconds,
@@ -437,8 +437,8 @@ func (s *Server) buildConfigResponse(cfg *config.Config, sections ...string) map
 		type routeView struct {
 			ModelName     string                `json:"model_name"`
 			DisplayName   string                `json:"display_name,omitempty"`
-			Provider      string                `json:"provider,omitempty"`
-			ProviderModel string                `json:"provider_model,omitempty"`
+			ProviderRef   string                `json:"provider_ref,omitempty"`
+			UpstreamModel string                `json:"upstream_model,omitempty"`
 			Protocol      string                `json:"protocol,omitempty"`
 			APIBase       string                `json:"api_base,omitempty"`
 			AuthStyle     string                `json:"auth_style,omitempty"`
@@ -449,7 +449,7 @@ func (s *Server) buildConfigResponse(cfg *config.Config, sections ...string) map
 		for i, m := range cfg.ModelRoutes {
 			routes[i] = routeView{
 				ModelName: m.ModelName, DisplayName: m.DisplayName,
-				Provider: m.Provider, ProviderModel: m.ProviderModel,
+				ProviderRef: m.ProviderRef, UpstreamModel: m.UpstreamModel,
 				Protocol: m.Protocol, APIBase: m.APIBase, AuthStyle: m.AuthStyle,
 				CredpoolRef: m.CredpoolRef, Routing: m.Routing,
 			}
@@ -562,11 +562,11 @@ func (s *Server) ModelInfoText() string {
 					tree = "└─"
 				}
 				fmt.Fprintf(&b, "    %s %-14s %-20s  credpool: %s\n",
-					tree, t.Provider, t.ProviderModel, orDash(t.CredpoolRef))
+					tree, t.ProviderRef, t.UpstreamModel, orDash(t.CredpoolRef))
 			}
 		} else {
 			fmt.Fprintf(&b, "  %-20s %-14s %-20s  credpool: %s\n",
-				m.ModelName, m.Provider, m.ProviderModel, orDash(m.CredpoolRef))
+				m.ModelName, m.ProviderRef, m.UpstreamModel, orDash(m.CredpoolRef))
 		}
 	}
 
@@ -585,7 +585,7 @@ func (s *Server) ModelInfoText() string {
 	for _, name := range sortedKeys(cfg.CredPools) {
 		kp := cfg.CredPools[name]
 		fmt.Fprintf(&b, "  %-14s provider=%-10s strategy=%-14s keys: %s\n",
-			name, orDash(kp.Provider), orDash(kp.Strategy), keyNames(kp.Keys))
+			name, orDash(kp.UpstreamModelType), orDash(kp.Strategy), keyNames(kp.Keys))
 	}
 
 	return b.String()
@@ -641,8 +641,8 @@ func sanitizeConfig(cfg *config.Config) map[string]any {
 		CooldownSecs int       `json:"cooldown_seconds,omitempty"`
 	}
 	type targetView struct {
-		Provider      string `json:"provider"`
-		ProviderModel string `json:"provider_model"`
+		ProviderRef   string `json:"provider_ref"`
+		UpstreamModel string `json:"upstream_model"`
 		CredpoolRef   string `json:"credpool_ref,omitempty"`
 	}
 	type routingView struct {
@@ -651,8 +651,8 @@ func sanitizeConfig(cfg *config.Config) map[string]any {
 	}
 	type modelView struct {
 		ModelName     string       `json:"model_name"`
-		Provider      string       `json:"provider,omitempty"`
-		ProviderModel string       `json:"provider_model,omitempty"`
+		ProviderRef   string       `json:"provider_ref,omitempty"`
+		UpstreamModel string       `json:"upstream_model,omitempty"`
 		CredpoolRef   string       `json:"credpool_ref,omitempty"`
 		Routing       *routingView `json:"routing,omitempty"`
 	}
@@ -683,16 +683,16 @@ func sanitizeConfig(cfg *config.Config) map[string]any {
 	for i, m := range cfg.ModelRoutes {
 		mv := modelView{
 			ModelName:     m.ModelName,
-			Provider:      m.Provider,
-			ProviderModel: m.ProviderModel,
+			ProviderRef:   m.ProviderRef,
+			UpstreamModel: m.UpstreamModel,
 			CredpoolRef:   m.CredpoolRef,
 		}
 		if m.Routing != nil {
 			targets := make([]targetView, len(m.Routing.Targets))
 			for j, t := range m.Routing.Targets {
 				targets[j] = targetView{
-					Provider:      t.Provider,
-					ProviderModel: t.ProviderModel,
+					ProviderRef:   t.ProviderRef,
+					UpstreamModel: t.UpstreamModel,
 					CredpoolRef:   t.CredpoolRef,
 				}
 			}

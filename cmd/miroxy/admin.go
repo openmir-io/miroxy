@@ -109,8 +109,8 @@ func formatStat(raw []byte) string {
 		Config   string `json:"config"`
 		Models   []struct {
 			ModelName     string `json:"model_name"`
-			Provider      string `json:"provider"`
-			ProviderModel string `json:"provider_model"`
+			ProviderRef   string `json:"provider_ref"`
+			UpstreamModel string `json:"upstream_model"`
 			Strategy      string `json:"strategy"`
 		} `json:"models"`
 		CredPools []struct {
@@ -143,7 +143,7 @@ func formatStat(raw []byte) string {
 			strategy = "  [" + m.Strategy + "]"
 		}
 		fmt.Fprintf(&b, "  %-20s →  %s  /  %s%s\n",
-			m.ModelName, m.Provider, m.ProviderModel, strategy)
+			m.ModelName, m.ProviderRef, m.UpstreamModel, strategy)
 	}
 
 	fmt.Fprintf(&b, "\nKey Pools\n%s\n", sub)

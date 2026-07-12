@@ -1,0 +1,77 @@
+# config.yaml.example.warden
+# Builtin content defense: secrets/PII/prompt-injection/jailbreak detection,
+# with reversible tokenization for the response side.
+#
+# Warden runs first in the pipeline (PriorityWarden=300), before compress.
+# It inspects the inbound request, rewrites anything it flags according to
+# `mode`, and — in tokenize mode — restores the original values in the
+# response before the client sees them.
+#
+# Check progress any time via `GET /stats` (admin API): the "warden" section
+# reports requests_inspected, secrets_found, pii_found, injections_blocked,
+# jailbreaks_blocked, tokens_vaulted, and a by_type breakdown.
+
+server:
+  default_model: miroxy
+
+auth:
+  allowed_keys:
+    - ${MIROXY_CLIENT_KEY}
+
+providers:
+  gemini: {}   # built-in default: generativelanguage.googleapis.com
+
+credpools:
+  my-pool:
+    keys:
+      - my_key: ${GEMINI_KEY}
+
+model_routes:
+  - model_name: miroxy
+    provider: gemini
+    provider_model: gemini-2.5-flash
+    credpool_ref: my-pool
+
+# ── Content defense ────────────────────────────────────────────────────────
+warden:
+  enabled: true               # master switch — everything below is a no-op while false
+
+  # How a Redact/Block-verdict finding gets rewritten. A Block verdict halts
+  # the request outright regardless of mode; mode only controls what happens
+  # to Redact-verdict findings (the common case: a leaked key, an email, a
+  # detected PII value).
+  #
+  #   redact     - destructive masking, e.g. j***@example.com (default).
+  #                Simplest option — the model never sees the real value,
+  #                and there's nothing to restore on the way back.
+  #
+  #   tokenize   - the real value is replaced with a reversible placeholder
+  #                like ⟦EMAIL:001⟧ before the request reaches the model.
+  #                If the model echoes that placeholder back (e.g. "I'll
+  #                email ⟦EMAIL:001⟧ about this"), Warden restores the real
+  #                value before the client sees the response — so the user
+  #                experience is unaffected, but the raw value still never
+  #                left the machine. Works for both streaming and
+  #                non-streaming responses, and for both real IR-transform
+  #                and byte-for-byte passthrough dispatch.
+  #
+  #   block_only - never rewrite anything; only a Block-verdict finding
+  #                (e.g. a strong prompt-injection phrase) stops the
+  #                request. Use this if you only want the injection/
+  #                jailbreak guardrail without any PII/secret rewriting.
+  mode: tokenize
+
+  # Each detector below defaults to true once warden.enabled is true — set
+  # any of these to false to disable just that detector.
+  secrets: true      # AWS/GitHub/Anthropic/OpenAI/GCP/Slack/Stripe keys, JWTs,
+                      # private-key blocks, plus a generic high-entropy fallback
+  pii: true           # email, phone, IP address, credit card (Luhn), IBAN (mod-97), SSN-shaped numbers
+  injection: true      # "ignore all previous instructions", "reveal your system prompt", ...
+  jailbreak: true       # "DAN mode", "pretend you have no restrictions", ...
+
+  # If true, a detector error (e.g. a recovered panic in one Inspector)
+  # blocks the request instead of passing it through best-effort. Default
+  # false — a brand-new detector failing closed by default risks
+  # false-positive outages more than it buys safety; flip this on once
+  # you've built confidence in the detectors for your traffic.
+  fail_closed: false

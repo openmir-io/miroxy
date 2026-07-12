@@ -154,8 +154,8 @@ func newTestServer(t *testing.T, cfg miroxyConfig) *httptest.Server {
 		Auth: config.AuthConfig{AllowedKeys: []string{testClientKey}},
 		ModelRoutes: []config.ModelEntry{{
 			ModelName:     "claude-haiku",
-			Provider:      "gemini",
-			ProviderModel: "gemini-2.5-flash",
+			ProviderRef:   "gemini",
+			UpstreamModel: "gemini-2.5-flash",
 			CredPool: config.CredPoolCfg{
 				Strategy:              "round_robin",
 				CircuitBreakThreshold: cfg.threshold,

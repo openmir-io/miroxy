@@ -150,7 +150,7 @@ providers:
 
   # Case 2: Third-party aggregator relay (e.g. OpenRouter, PortKey, LiteLLM)
   # These relays expose an OpenAI-compatible API but proxy multiple providers.
-  # The model name in provider_model controls which upstream the relay picks.
+  # The model name in upstream_model controls which upstream the relay picks.
   # openrouter:
   #   base_url: https://openrouter.ai/api/v1
   #   protocol: openai
@@ -241,7 +241,7 @@ credpools:
       - backup_key: ${DEEPSEEK_KEY_2}
 
   anthropic:
-    provider: anthropic     # triggers auto-discovery of Anthropic models at startup
+    upstream_model_type: anthropic     # triggers auto-discovery of Anthropic models at startup
     strategy: least_requests
     circuit_break_threshold: 3
     cooldown_seconds: 60
@@ -249,7 +249,7 @@ credpools:
       - main_key: ${ANTHROPIC_KEY_1}
 
   openai-pool:
-    provider: openai        # triggers auto-discovery of OpenAI (gpt-*, o1*, o3*) models
+    upstream_model_type: openai        # triggers auto-discovery of OpenAI (gpt-*, o1*, o3*) models
     strategy: least_requests
     circuit_break_threshold: 3
     cooldown_seconds: 60
@@ -396,9 +396,9 @@ local_state:
 # ┌─────────────────────────────────────────────────────────────────────────┐
 # │ Style 3 — Native model passthrough  (what you configure is what runs)  │
 # │                                                                         │
-# │ model_name matches provider_model exactly. The client picks the real   │
+# │ model_name matches upstream_model exactly. The client picks the real   │
 # │ upstream model by name; miroxy adds key management and fallback on top. │
-# │ Example: model_name: gemini-2.5-flash → provider_model: gemini-2.5-flash│
+# │ Example: model_name: gemini-2.5-flash → upstream_model: gemini-2.5-flash│
 # └─────────────────────────────────────────────────────────────────────────┘
 #
 # routing.strategy (Style 1 and multi-target Style 3):
@@ -451,12 +451,12 @@ model_routes:
     routing:
       strategy: fallback
       targets:
-        - provider: gemini
-          provider_model: gemini-2.5-flash
+        - provider_ref: gemini
+          upstream_model: gemini-2.5-flash
           credpool_ref: gemini-flash
           timeout_seconds: 30
-        - provider: deepseek-openai
-          provider_model: deepseek-chat
+        - provider_ref: deepseek-openai
+          upstream_model: deepseek-chat
           credpool_ref: deepseek
           timeout_seconds: 30
 
@@ -467,16 +467,16 @@ model_routes:
     routing:
       strategy: fallback
       targets:
-        - provider: deepseek-openai
-          provider_model: deepseek-reasoner
+        - provider_ref: deepseek-openai
+          upstream_model: deepseek-reasoner
           credpool_ref: deepseek
           timeout_seconds: 120
-        - provider: anthropic
-          provider_model: claude-sonnet-4-6
+        - provider_ref: anthropic
+          upstream_model: claude-sonnet-4-6
           credpool_ref: anthropic
           timeout_seconds: 60
-        - provider: gemini
-          provider_model: gemini-2.5-pro
+        - provider_ref: gemini
+          upstream_model: gemini-2.5-pro
           credpool_ref: gemini-pro
           timeout_seconds: 60
 
@@ -487,16 +487,16 @@ model_routes:
     routing:
       strategy: fallback
       targets:
-        - provider: anthropic
-          provider_model: claude-sonnet-4-6
+        - provider_ref: anthropic
+          upstream_model: claude-sonnet-4-6
           credpool_ref: anthropic
           timeout_seconds: 60
-        - provider: gemini
-          provider_model: gemini-2.5-pro
+        - provider_ref: gemini
+          upstream_model: gemini-2.5-pro
           credpool_ref: gemini-pro
           timeout_seconds: 60
-        - provider: deepseek-openai
-          provider_model: deepseek-chat
+        - provider_ref: deepseek-openai
+          upstream_model: deepseek-chat
           credpool_ref: deepseek
           timeout_seconds: 30
 
@@ -507,12 +507,12 @@ model_routes:
     routing:
       strategy: round_robin
       targets:
-        - provider: gemini
-          provider_model: gemini-2.5-flash
+        - provider_ref: gemini
+          upstream_model: gemini-2.5-flash
           credpool_ref: gemini-flash
           timeout_seconds: 60
-        - provider: deepseek-openai
-          provider_model: deepseek-chat
+        - provider_ref: deepseek-openai
+          upstream_model: deepseek-chat
           credpool_ref: deepseek
           timeout_seconds: 60
 
@@ -523,12 +523,12 @@ model_routes:
     routing:
       strategy: least_requests
       targets:
-        - provider: gemini
-          provider_model: gemini-2.5-flash
+        - provider_ref: gemini
+          upstream_model: gemini-2.5-flash
           credpool_ref: gemini-flash
           timeout_seconds: 20
-        - provider: deepseek-openai
-          provider_model: deepseek-chat
+        - provider_ref: deepseek-openai
+          upstream_model: deepseek-chat
           credpool_ref: deepseek
           timeout_seconds: 20
 
@@ -539,12 +539,12 @@ model_routes:
     routing:
       strategy: fallback
       targets:
-        - provider: anthropic
-          provider_model: claude-opus-4-8
+        - provider_ref: anthropic
+          upstream_model: claude-opus-4-8
           credpool_ref: anthropic
           timeout_seconds: 120
-        - provider: gemini
-          provider_model: gemini-2.5-pro
+        - provider_ref: gemini
+          upstream_model: gemini-2.5-pro
           credpool_ref: gemini-pro
           timeout_seconds: 120
 
@@ -561,21 +561,21 @@ model_routes:
 
   # - model_name: claude-haiku-4-5-20251001   # exact ID from GET /v1/models (model_discovery: auto)
   #   display_name: "Claude Haiku 4.5 → Gemini Flash"  # optional; shown in client model picker
-  #   provider: gemini                               # routed to Gemini behind the scenes
-  #   provider_model: gemini-2.5-flash
+  #   provider_ref: gemini                               # routed to Gemini behind the scenes
+  #   upstream_model: gemini-2.5-flash
   #   credpool_ref: gemini-flash                      # shared pool — in-flight counts stay accurate
   #   timeout_seconds: 30
 
   # - model_name: claude-sonnet-4-6-20250219        # exact versioned ID overrides auto-discovery
   #   display_name: "Claude Sonnet 4.6 → Gemini Pro"
-  #   provider: gemini
-  #   provider_model: gemini-2.5-pro
+  #   provider_ref: gemini
+  #   upstream_model: gemini-2.5-pro
   #   credpool_ref: gemini-pro
   #   timeout_seconds: 30
 
   # - model_name: claude-opus-4-8
-  #   provider: gemini
-  #   provider_model: gemini-2.5-pro
+  #   provider_ref: gemini
+  #   upstream_model: gemini-2.5-pro
   #   credpool_ref: gemini-pro
   #   timeout_seconds: 60
 
@@ -584,25 +584,25 @@ model_routes:
   #
   # The client picks the real upstream model by name.  miroxy adds key
   # management, 429 rotation, and optional fallback on top — nothing more.
-  # model_name == provider_model: what you configure is what runs.
+  # model_name == upstream_model: what you configure is what runs.
   # ════════════════════════════════════════════════════════════════════════
 
   # Single provider, multiple keys (rotation + 429 handling only):
   # - model_name: gemini-2.5-flash
-  #   provider: gemini
-  #   provider_model: gemini-2.5-flash
+  #   provider_ref: gemini
+  #   upstream_model: gemini-2.5-flash
   #   credpool_ref: gemini-flash
   #   timeout_seconds: 30
 
   # - model_name: deepseek-chat
-  #   provider: deepseek-openai
-  #   provider_model: deepseek-chat
+  #   provider_ref: deepseek-openai
+  #   upstream_model: deepseek-chat
   #   credpool_ref: deepseek
   #   timeout_seconds: 30
 
   # - model_name: deepseek-reasoner
-  #   provider: deepseek-openai
-  #   provider_model: deepseek-reasoner
+  #   provider_ref: deepseek-openai
+  #   upstream_model: deepseek-reasoner
   #   credpool_ref: deepseek
   #   timeout_seconds: 120
 
@@ -612,27 +612,27 @@ model_routes:
   #   routing:
   #     strategy: fallback
   #     targets:
-  #       - provider: gemini
-  #         provider_model: gemini-2.5-pro
+  #       - provider_ref: gemini
+  #         upstream_model: gemini-2.5-pro
   #         credpool_ref: gemini-pro
   #         timeout_seconds: 60
-  #       - provider: deepseek-openai
-  #         provider_model: deepseek-chat
+  #       - provider_ref: deepseek-openai
+  #         upstream_model: deepseek-chat
   #         credpool_ref: deepseek
   #         timeout_seconds: 30
 
   # Local Ollama — no API key needed, inline credpool:
   # - model_name: llama3:8b
-  #   provider: ollama
-  #   provider_model: llama3:8b
+  #   provider_ref: ollama
+  #   upstream_model: llama3:8b
   #   credpool:
   #     keys: []
   #   timeout_seconds: 120
 
   # GLM (智谱) native:
   # - model_name: glm-4-flash
-  #   provider: glm
-  #   provider_model: glm-4-flash
+  #   provider_ref: glm
+  #   upstream_model: glm-4-flash
   #   credpool:
   #     strategy: least_requests
   #     keys:

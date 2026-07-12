@@ -87,9 +87,13 @@ components:
     CredPool:
       type: object
       properties:
-        provider:
+        upstream_model_type:
           type: string
-          description: Provider tag for auto-discovery (anthropic | openai).
+          description: >
+            Upstream provider family this pool's keys belong to (anthropic | openai | gemini).
+            Optional if the pool is already referenced by a model_routes entry's provider_ref
+            (the family is derived from that); required for a pool held only for passthrough.
+            Also used for model auto-discovery (anthropic | openai).
           example: "gemini"
         auth_style:
           type: string
@@ -120,9 +124,9 @@ components:
     RoutingTarget:
       type: object
       properties:
-        provider:
+        provider_ref:
           type: string
-        provider_model:
+        upstream_model:
           type: string
         credpool_ref:
           type: string
@@ -149,10 +153,10 @@ components:
         display_name:
           type: string
           example: "Gemini 2.5 Flash (via miroxy)"
-        provider:
+        provider_ref:
           type: string
           example: "gemini"
-        provider_model:
+        upstream_model:
           type: string
           example: "gemini-2.5-flash"
         protocol:

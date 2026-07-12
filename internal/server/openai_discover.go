@@ -46,8 +46,8 @@ func tryInjectOpenAIModels(cfg *config.Config) {
 		cfg.ModelRoutes = append(cfg.ModelRoutes, config.ModelEntry{
 			ModelName:     m.ID,
 			DisplayName:   display,
-			Provider:      "openai",
-			ProviderModel: m.ID,
+			ProviderRef:   "openai",
+			UpstreamModel: m.ID,
 			CredpoolRef:   poolName,
 		})
 		injected++
@@ -58,19 +58,19 @@ func tryInjectOpenAIModels(cfg *config.Config) {
 
 // findOpenAIPoolKey returns the first credpool configured for OpenAI.
 // Checks in order:
-//  1. Credpools with provider: "openai" tag (explicit, no model_routes needed)
-//  2. Model routes with provider: "openai" referencing a named credpool (legacy)
+//  1. Credpools with upstream_model_type: "openai" tag (explicit, no model_routes needed)
+//  2. Model routes with provider_ref: "openai" referencing a named credpool (legacy)
 func findOpenAIPoolKey(cfg *config.Config) (poolName, key, baseURL string) {
 	// 1. Explicit credpool tag.
 	for name, pool := range cfg.CredPools {
-		if pool.Provider == "openai" && len(pool.Keys) > 0 {
+		if pool.UpstreamModelType == "openai" && len(pool.Keys) > 0 {
 			base := resolveOpenAIBaseFromPool(cfg, name)
 			return name, pool.Keys[0].Key, base
 		}
 	}
 	// 2. Infer from model_routes (backward compat).
 	for _, m := range cfg.ModelRoutes {
-		if m.Provider != "openai" || m.CredpoolRef == "" {
+		if m.ProviderRef != "openai" || m.CredpoolRef == "" {
 			continue
 		}
 		pool, ok := cfg.CredPools[m.CredpoolRef]

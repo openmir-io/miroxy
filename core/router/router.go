@@ -11,7 +11,7 @@ import (
 // ModelInfo describes a model from both the client-facing and upstream perspectives.
 type ModelInfo struct {
 	Name          string // client-facing alias, e.g. claude-sonnet-4-6
-	ProviderModel string // upstream model name, e.g. gemini-2.5-flash
+	UpstreamModel string // upstream model name, e.g. gemini-2.5-flash
 	Provider      string // gemini / openai / kiro
 }
 

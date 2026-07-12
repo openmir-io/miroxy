@@ -71,8 +71,8 @@ func TestWardenPlugin_RedactsSecretAcrossPassthroughAndTransform(t *testing.T) {
 			Routing: &config.RoutingConfig{
 				Strategy: "round_robin",
 				Targets: []config.RoutingTarget{
-					{Provider: "anthropic", ProviderModel: "claude-target", CredpoolRef: "pool-anthropic", Protocol: "anthropic", APIBase: anthropicStub.URL},
-					{Provider: "gemini", ProviderModel: "gemini-target", CredpoolRef: "pool-gemini", Protocol: "gemini", APIBase: geminiStub.URL},
+					{ProviderRef: "anthropic", UpstreamModel: "claude-target", CredpoolRef: "pool-anthropic", Protocol: "anthropic", APIBase: anthropicStub.URL},
+					{ProviderRef: "gemini", UpstreamModel: "gemini-target", CredpoolRef: "pool-gemini", Protocol: "gemini", APIBase: geminiStub.URL},
 				},
 			},
 			TimeoutSeconds: 5,
@@ -144,7 +144,7 @@ func TestWardenPlugin_TokenizeMode_ResolvesInNonStreamingPassthroughResponse(t *
 		},
 		ModelRoutes: []config.ModelEntry{{
 			ModelName:      "miroxy-code",
-			ProviderModel:  "claude-target",
+			UpstreamModel:  "claude-target",
 			CredpoolRef:    "pool",
 			Protocol:       "anthropic",
 			APIBase:        stub.URL,
@@ -220,7 +220,7 @@ func TestWardenPlugin_TokenizeMode_ResolvesInStreamingTransformResponse(t *testi
 		},
 		ModelRoutes: []config.ModelEntry{{
 			ModelName:      "miroxy-code",
-			ProviderModel:  "gemini-target",
+			UpstreamModel:  "gemini-target",
 			CredpoolRef:    "pool",
 			Protocol:       "gemini",
 			APIBase:        stub.URL,

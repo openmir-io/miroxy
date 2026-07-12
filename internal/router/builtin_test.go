@@ -25,7 +25,7 @@ func newTestRouter(t *testing.T) *BuiltinRouter {
 	r := NewBuiltinRouter(nil)
 	r.UpdateConfig(&config.Config{
 		ModelRoutes: []config.ModelEntry{
-			{ModelName: "claude-sonnet", Provider: "anthropic", ProviderModel: "claude-sonnet-real"},
+			{ModelName: "claude-sonnet", ProviderRef: "anthropic", UpstreamModel: "claude-sonnet-real"},
 		},
 	})
 	r.UpdateRouting(&RoutingTable{
@@ -45,7 +45,7 @@ func TestBuiltinRouter_Route_ExactMatch(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Route: %v", err)
 	}
-	if target.Model.Name != "claude-sonnet" || target.Model.ProviderModel != "claude-sonnet-real" || target.Model.Provider != "anthropic" {
+	if target.Model.Name != "claude-sonnet" || target.Model.UpstreamModel != "claude-sonnet-real" || target.Model.Provider != "anthropic" {
 		t.Errorf("target.Model = %+v, want claude-sonnet/claude-sonnet-real/anthropic", target.Model)
 	}
 	if target.Timeout != 30*time.Second {
@@ -68,14 +68,14 @@ func TestBuiltinRouter_Route_UnknownModel(t *testing.T) {
 func TestBuiltinRouter_Route_PassthroughFallback(t *testing.T) {
 	r := newTestRouter(t)
 
-	// This model_routes entry has a Provider tag but no matching entry in
+	// This model_routes entry has a ProviderRef tag but no matching entry in
 	// RoutingTable.Selectors (only "claude-sonnet" does) — exercises the
 	// fallback-to-PassthroughSelectors branch in Route, the same branch
 	// LookupModel's own provider-inference step (config.go step 4) would
 	// also land in for a model name matching no model_routes entry at all.
 	r.UpdateConfig(&config.Config{
 		ModelRoutes: []config.ModelEntry{
-			{ModelName: "gemini-1.5-flash", Provider: "gemini"},
+			{ModelName: "gemini-1.5-flash", ProviderRef: "gemini"},
 		},
 	})
 
@@ -87,10 +87,10 @@ func TestBuiltinRouter_Route_PassthroughFallback(t *testing.T) {
 	if !ok || fs.name != "gemini-passthrough" {
 		t.Errorf("target.Selector = %+v, want the gemini passthrough fakeSelector", target.Selector)
 	}
-	// No provider_model configured -> the original requested model name is
+	// No upstream_model configured -> the original requested model name is
 	// forwarded upstream as-is.
-	if target.Model.ProviderModel != "gemini-1.5-flash" {
-		t.Errorf("target.Model.ProviderModel = %q, want the original requested model name", target.Model.ProviderModel)
+	if target.Model.UpstreamModel != "gemini-1.5-flash" {
+		t.Errorf("target.Model.UpstreamModel = %q, want the original requested model name", target.Model.UpstreamModel)
 	}
 }
 

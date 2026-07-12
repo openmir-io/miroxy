@@ -8,14 +8,14 @@ import (
 	"miroxy/internal/types"
 )
 
-// TargetSelector wraps a CredPool with a specific Translator and ProviderModel.
+// TargetSelector wraps a CredPool with a specific Translator and UpstreamModel.
 // Multiple model_routes entries can share the same CredPool via separate
 // TargetSelectors — credential rotation, circuit-break, and 429 accounting
 // are shared; the translator and model name are per-entry.
 type TargetSelector struct {
 	pool          *CredPool
 	upstream      upstream.UpstreamAdapter
-	providerModel string
+	upstreamModel string
 
 	// protocol/passthroughUpstream/forcePassthrough are embedded in each
 	// ExecutionPlan so UpstreamExecutor can pick real transform vs raw
@@ -29,11 +29,11 @@ type TargetSelector struct {
 // protocol is this target's static upstream wire protocol; passthroughUpstream
 // is the raw-forwarding adapter to use when a request's actual client
 // protocol matches it (or forcePassthrough is set unconditionally).
-func NewTargetSelector(pool *CredPool, trans upstream.UpstreamAdapter, providerModel string, protocol string, passthroughUpstream upstream.UpstreamAdapter, forcePassthrough bool) *TargetSelector {
+func NewTargetSelector(pool *CredPool, trans upstream.UpstreamAdapter, upstreamModel string, protocol string, passthroughUpstream upstream.UpstreamAdapter, forcePassthrough bool) *TargetSelector {
 	return &TargetSelector{
 		pool:                pool,
 		upstream:            trans,
-		providerModel:       providerModel,
+		upstreamModel:       upstreamModel,
 		protocol:            protocol,
 		passthroughUpstream: passthroughUpstream,
 		forcePassthrough:    forcePassthrough,
@@ -45,7 +45,7 @@ func (t *TargetSelector) Select(ctx context.Context, req *types.MessageRequest) 
 	if err != nil {
 		return nil, err
 	}
-	plan.Model = t.providerModel
+	plan.Model = t.upstreamModel
 	plan.Upstream = t.upstream
 	plan.Protocol = t.protocol
 	plan.PassthroughUpstream = t.passthroughUpstream
@@ -63,7 +63,7 @@ func (t *TargetSelector) TakeRateLimited(ctx context.Context) []*ExecutionPlan {
 	plans := t.pool.TakeRateLimited(ctx)
 	for _, p := range plans {
 		p.Upstream = t.upstream
-		p.Model = t.providerModel
+		p.Model = t.upstreamModel
 		p.Protocol = t.protocol
 		p.PassthroughUpstream = t.passthroughUpstream
 		p.ForcePassthrough = t.forcePassthrough

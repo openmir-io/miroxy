@@ -96,7 +96,7 @@ type CredSpec struct {
 type CredPoolConfig struct {
 	Keys          []CredSpec
 	Upstream      upstream.UpstreamAdapter // embedded in each ExecutionPlan
-	ProviderModel string                   // embedded in each ExecutionPlan
+	UpstreamModel string                   // embedded in each ExecutionPlan
 	Strategy      string                   // "round_robin" | "least_requests" (default: round_robin)
 	Threshold     int                      // consecutive failures before circuit-break (default: 5)
 	Cooldown      time.Duration            // circuit-break cooldown (default: 60s)
@@ -136,7 +136,7 @@ type CredPool struct {
 	counter   uint64
 
 	upstream      upstream.UpstreamAdapter
-	providerModel string
+	upstreamModel string
 
 	protocol            string
 	passthroughUpstream upstream.UpstreamAdapter
@@ -194,7 +194,7 @@ func NewCredPool(cfg CredPoolConfig) *CredPool {
 		threshold:           threshold,
 		cooldown:            cooldown,
 		upstream:            cfg.Upstream,
-		providerModel:       cfg.ProviderModel,
+		upstreamModel:       cfg.UpstreamModel,
 		protocol:            cfg.Protocol,
 		passthroughUpstream: cfg.PassthroughUpstream,
 		forcePassthrough:    cfg.ForcePassthrough,
@@ -298,7 +298,7 @@ func (p *CredPool) Select(ctx context.Context, _ *types.MessageRequest) (*Execut
 	return &ExecutionPlan{
 		SelectionID:         selected.id,
 		Credential:          credential,
-		Model:               p.providerModel,
+		Model:               p.upstreamModel,
 		Upstream:            p.upstream,
 		Protocol:            p.protocol,
 		PassthroughUpstream: p.passthroughUpstream,
@@ -443,7 +443,7 @@ func (p *CredPool) TakeRateLimited(ctx context.Context) []*ExecutionPlan {
 		plans = append(plans, &ExecutionPlan{
 			SelectionID:         c.entry.id,
 			Credential:          cred,
-			Model:               p.providerModel,
+			Model:               p.upstreamModel,
 			Upstream:            p.upstream,
 			Protocol:            p.protocol,
 			PassthroughUpstream: p.passthroughUpstream,

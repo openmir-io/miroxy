@@ -42,8 +42,8 @@ func tryInjectAnthropicModels(cfg *config.Config) {
 		cfg.ModelRoutes = append(cfg.ModelRoutes, config.ModelEntry{
 			ModelName:     m.ID,
 			DisplayName:   m.DisplayName,
-			Provider:      "anthropic",
-			ProviderModel: m.ID,
+			ProviderRef:   "anthropic",
+			UpstreamModel: m.ID,
 			CredpoolRef:   poolName,
 		})
 		injected++
@@ -54,18 +54,18 @@ func tryInjectAnthropicModels(cfg *config.Config) {
 
 // findAnthropicPoolKey returns the first credpool configured for Anthropic.
 // Checks in order:
-//  1. Credpools with provider: "anthropic" tag (explicit)
-//  2. Model routes with provider: "anthropic" referencing a named credpool (legacy)
+//  1. Credpools with upstream_model_type: "anthropic" tag (explicit)
+//  2. Model routes with provider_ref: "anthropic" referencing a named credpool (legacy)
 func findAnthropicPoolKey(cfg *config.Config) (poolName, key string) {
 	// 1. Explicit credpool tag.
 	for name, pool := range cfg.CredPools {
-		if pool.Provider == "anthropic" && len(pool.Keys) > 0 {
+		if pool.UpstreamModelType == "anthropic" && len(pool.Keys) > 0 {
 			return name, pool.Keys[0].Key
 		}
 	}
 	// 2. Infer from model_routes (backward compat).
 	for _, m := range cfg.ModelRoutes {
-		if m.Provider != "anthropic" || m.CredpoolRef == "" {
+		if m.ProviderRef != "anthropic" || m.CredpoolRef == "" {
 			continue
 		}
 		pool, ok := cfg.CredPools[m.CredpoolRef]

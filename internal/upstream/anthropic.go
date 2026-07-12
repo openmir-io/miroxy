@@ -20,7 +20,7 @@ import (
 // were themselves modeled on Anthropic's Messages API, this transform is
 // near-identity: set the upstream's own model name, marshal, send.
 type AnthropicUpstream struct {
-	providerModel  string
+	upstreamModel  string
 	endpoint       string
 	streamEndpoint string
 }
@@ -28,8 +28,8 @@ type AnthropicUpstream struct {
 // NewAnthropicUpstream creates an AnthropicUpstream pointed at apiBase
 // (expected to already include the full messages path, matching how
 // api_base is used by every other adapter in this package).
-func NewAnthropicUpstream(providerModel, apiBase string) *AnthropicUpstream {
-	return &AnthropicUpstream{providerModel: providerModel, endpoint: apiBase, streamEndpoint: apiBase}
+func NewAnthropicUpstream(upstreamModel, apiBase string) *AnthropicUpstream {
+	return &AnthropicUpstream{upstreamModel: upstreamModel, endpoint: apiBase, streamEndpoint: apiBase}
 }
 
 func (a *AnthropicUpstream) ToUpstream(ctx context.Context, req *types.MessageRequest, credential cred.Credential) (*http.Request, error) {
@@ -45,7 +45,7 @@ func (a *AnthropicUpstream) build(ctx context.Context, req *types.MessageRequest
 	// request; other retry attempts (possibly against a different target)
 	// must not see this target's provider model name.
 	outReq := *req
-	outReq.Model = a.providerModel
+	outReq.Model = a.upstreamModel
 	body, err := json.Marshal(&outReq)
 	if err != nil {
 		return nil, fmt.Errorf("anthropic upstream: marshal request: %w", err)

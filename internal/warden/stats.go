@@ -64,6 +64,30 @@ func (s *Stats) Record(findings []corewarden.Finding, tokensVaulted int) {
 	}
 }
 
+// Restore seeds counters from a prior snapshot — same contract as
+// core/selector.CredPool.RestoreHealth: call once, right after NewStats,
+// before serving traffic. Live increments during this run build on top of
+// the restored baseline. StartedAt is adopted as-is (when non-zero) so the
+// reported "since ..." window stays anchored to the original first start
+// across restarts, not reset to this run's start time.
+func (s *Stats) Restore(snap StatsSnapshot) {
+	s.RequestsInspected.Store(snap.RequestsInspected)
+	s.SecretsFound.Store(snap.SecretsFound)
+	s.PIIFound.Store(snap.PIIFound)
+	s.InjectionsBlocked.Store(snap.InjectionsBlocked)
+	s.JailbreaksBlocked.Store(snap.JailbreaksBlocked)
+	s.TokensVaulted.Store(snap.TokensVaulted)
+	if !snap.StartedAt.IsZero() {
+		s.startedAt = snap.StartedAt
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for k, v := range snap.ByType {
+		s.byType[k] = v
+	}
+}
+
 // Snapshot returns an immutable point-in-time view of the counters.
 func (s *Stats) Snapshot() StatsSnapshot {
 	s.mu.Lock()

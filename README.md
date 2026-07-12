@@ -72,8 +72,8 @@ credpools:
 
 model_routes:
   - model_name: miroxy
-    provider: gemini
-    provider_model: gemini-2.5-flash
+    provider_ref: gemini
+    upstream_model: gemini-2.5-flash
     credpool_ref: my-pool
 ```
 
@@ -232,17 +232,17 @@ credpools:
 
 Key name (e.g. `key_alice`) appears in `key_id` log fields on 429 and circuit-break events — makes it easy to identify which key is causing problems.
 
-**Passthrough auto-routing**: tag a credpool with `provider: anthropic` or `provider: openai` to enable zero-config passthrough routing for `claude-*` or `gpt-*` models respectively:
+**Passthrough auto-routing**: tag a credpool with `upstream_model_type: anthropic` or `upstream_model_type: openai` to enable zero-config passthrough routing for `claude-*` or `gpt-*` models respectively. This tag is optional whenever the pool is already referenced by a `model_routes` entry — its family is derived automatically from that entry's `provider_ref` — but it's required for a pool that exists only for passthrough, with no static route pointing at it:
 
 ```yaml
 credpools:
   anthropic-pool:
-    provider: anthropic        # enables passthrough for any claude-* model
+    upstream_model_type: anthropic   # enables passthrough for any claude-* model
     keys:
       - main: ${ANTHROPIC_KEY}
 
   openai-pool:
-    provider: openai           # enables passthrough for gpt-*, o1*, o3*
+    upstream_model_type: openai      # enables passthrough for gpt-*, o1*, o3*
     keys:
       - main: ${OPENAI_KEY}
 ```
@@ -255,8 +255,8 @@ With these pools configured, clients can select `claude-opus-4-8` or `gpt-5.4` a
 model_routes:
   # Simple: one provider, one model
   - model_name: miroxy
-    provider: gemini
-    provider_model: gemini-2.5-flash
+    provider_ref: gemini
+    upstream_model: gemini-2.5-flash
     credpool_ref: gemini-flash
     timeout_seconds: 30
 
@@ -265,12 +265,12 @@ model_routes:
     routing:
       strategy: fallback
       targets:
-        - provider: anthropic
-          provider_model: claude-sonnet-4-6
+        - provider_ref: anthropic
+          upstream_model: claude-sonnet-4-6
           credpool_ref: anthropic-pool
           timeout_seconds: 60
-        - provider: gemini
-          provider_model: gemini-2.5-pro
+        - provider_ref: gemini
+          upstream_model: gemini-2.5-pro
           credpool_ref: gemini-pro
           timeout_seconds: 60
 ```
@@ -328,7 +328,7 @@ calls the provider's `/v1/models` at startup and injects discovered models:
 ```yaml
 credpools:
   anthropic-pool:
-    provider: anthropic    # triggers GET api.anthropic.com/v1/models on startup
+    upstream_model_type: anthropic   # triggers GET api.anthropic.com/v1/models on startup
     keys:
       - main: ${ANTHROPIC_KEY}
 ```

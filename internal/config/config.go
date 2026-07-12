@@ -20,13 +20,19 @@ type Config struct {
 	Providers   map[string]ProviderDef `yaml:"providers"`
 	CredPools   map[string]CredPoolCfg `yaml:"credpools"`
 	ModelRoutes []ModelEntry           `yaml:"model_routes"`
-	Metrics     MetricsConfig          `yaml:"metrics"`
-	Warden      WardenConfig           `yaml:"warden"`
-	Compress    CompressConfig         `yaml:"compress"`
-	Dump        DumpConfig             `yaml:"dump"`
-	Transparent TransparentConfig      `yaml:"transparent"`
-	Sidecar     SidecarConfig          `yaml:"sidecar"`
-	LocalState  LocalStateConfig       `yaml:"local_state"`
+	// CredpoolFamilies maps each credpool name to its upstream provider
+	// family (anthropic/openai/gemini), resolved once at load time by
+	// resolveCredpoolFamilies — see that function's doc comment. Not a YAML
+	// field; populated after validateConfig has rejected any conflicting
+	// associations.
+	CredpoolFamilies map[string]string `yaml:"-"`
+	Metrics          MetricsConfig     `yaml:"metrics"`
+	Warden           WardenConfig      `yaml:"warden"`
+	Compress         CompressConfig    `yaml:"compress"`
+	Dump             DumpConfig        `yaml:"dump"`
+	Transparent      TransparentConfig `yaml:"transparent"`
+	Sidecar          SidecarConfig     `yaml:"sidecar"`
+	LocalState       LocalStateConfig  `yaml:"local_state"`
 }
 
 // SidecarConfig groups every optional external-service integration under one
@@ -49,9 +55,10 @@ type CredSourceConfig struct {
 }
 
 // LocalStateConfig configures optional on-disk caching of local runtime state
-// (currently: per-credential health — state/cooldown/failure counters) via a
-// small embedded buntdb store. Disabled by default — miroxy is fully
-// in-memory and resets on restart unless this is turned on.
+// (currently: per-credential health — state/cooldown/failure counters — and
+// warden's cumulative counters) via a small embedded buntdb store. Disabled
+// by default — miroxy is fully in-memory and resets on restart unless this
+// is turned on.
 //
 // Meaningless (and ignored, with a startup warning) when
 // sidecar.credsource.enabled is true: credstone is already the
@@ -119,7 +126,7 @@ type ProviderDef struct {
 //
 // Simple (single provider):
 //
-//	model_name + provider + provider_model + credpool_ref (or inline credpool)
+//	model_name + provider_ref + upstream_model + credpool_ref (or inline credpool)
 //
 // Routing (multiple providers):
 //
@@ -136,9 +143,9 @@ type ProviderDef struct {
 type ModelEntry struct {
 	ModelName      string         `yaml:"model_name"`
 	DisplayName    string         `yaml:"display_name,omitempty"` // human-readable label for /v1/models; defaults to ModelName
-	Provider       string         `yaml:"provider"`
+	ProviderRef    string         `yaml:"provider_ref"`           // key into the top-level providers: block
 	Protocol       string         `yaml:"protocol"`
-	ProviderModel  string         `yaml:"provider_model"`
+	UpstreamModel  string         `yaml:"upstream_model"`
 	CredPool       CredPoolCfg    `yaml:"credpool"`
 	CredpoolRef    string         `yaml:"credpool_ref"`
 	Routing        *RoutingConfig `yaml:"routing"`
@@ -160,8 +167,8 @@ type RoutingConfig struct {
 // Protocol, APIBase, and AuthStyle are resolved from the providers block
 // at config load time and not expected in YAML.
 type RoutingTarget struct {
-	Provider       string `yaml:"provider"`
-	ProviderModel  string `yaml:"provider_model"`
+	ProviderRef    string `yaml:"provider_ref"` // key into the top-level providers: block
+	UpstreamModel  string `yaml:"upstream_model"`
 	CredpoolRef    string `yaml:"credpool_ref"`
 	TimeoutSeconds int    `yaml:"timeout_seconds"`
 	// Resolved by resolveProviders — not user-facing YAML fields.
@@ -247,11 +254,21 @@ type sigv4Fields struct {
 }
 
 type CredPoolCfg struct {
-	// Provider optionally tags this credpool for auto-discovery.
-	// Accepted values: "anthropic", "openai".
-	// When model_discovery: auto is set, miroxy calls the provider's
-	// /v1/models endpoint at startup and injects discovered models.
-	Provider string `yaml:"provider,omitempty"`
+	// UpstreamModelType tags this credpool with the upstream provider family
+	// its keys belong to: "anthropic", "openai", or "gemini". A credpool's
+	// keys always belong to a single family — this is not a per-model
+	// binding (see UpstreamModel on ModelEntry/RoutingTarget for that).
+	//
+	// Optional whenever this pool is already referenced by a model_routes
+	// entry/target — the family is derived automatically from that
+	// reference's provider_ref (see resolveCredpoolFamilies in yaml.go).
+	// Required (and used as an explicit override otherwise) for a pool held
+	// only for provider passthrough — see LookupModel step 4 — since there's
+	// no model_routes reference to derive it from. Also used for model
+	// auto-discovery: when model_discovery: auto is set, miroxy calls the
+	// provider's /v1/models endpoint at startup and injects discovered
+	// models (anthropic/openai only).
+	UpstreamModelType string `yaml:"upstream_model_type,omitempty"`
 
 	// AuthStyle declares this pool's credential kind up front: "bearer",
 	// "api_key", "query_key", "sigv4", or "none". Optional for header/query
@@ -402,15 +419,17 @@ func (c *Config) LookupModel(name string) (ModelEntry, bool) {
 	}
 
 	// 4. Provider passthrough: infer provider from model name pattern, find a
-	//    credpool tagged with that provider. Returns a synthetic ModelEntry so
-	//    the executor can use the passthroughSelectors built at startup.
+	//    credpool whose family (explicit upstream_model_type, or derived from
+	//    its model_routes usage — see resolveCredpoolFamilies) matches.
+	//    Returns a synthetic ModelEntry so the executor can use the
+	//    passthroughSelectors built at startup.
 	if provider := inferModelProvider(name); provider != "" {
 		for poolName, pool := range c.CredPools {
-			if pool.Provider == provider && len(pool.Keys) > 0 {
+			if c.CredpoolFamilies[poolName] == provider && len(pool.Keys) > 0 {
 				return ModelEntry{
 					ModelName:     name,
-					Provider:      provider,
-					ProviderModel: name, // forward the original model name to the upstream
+					ProviderRef:   provider,
+					UpstreamModel: name, // forward the original model name to the upstream
 					CredpoolRef:   poolName,
 				}, true
 			}
@@ -439,6 +458,9 @@ func inferModelProvider(name string) string {
 		if strings.HasPrefix(name, pfx) {
 			return "openai"
 		}
+	}
+	if strings.HasPrefix(name, "gemini-") {
+		return "gemini"
 	}
 	return ""
 }

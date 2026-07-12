@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"miroxy/core/cred"
+	corewarden "miroxy/core/warden"
 	"miroxy/internal/config"
 	"miroxy/internal/localstate"
 )
@@ -107,7 +108,7 @@ func TestAdminEndpoints_IndependentOfCredstoneReachability(t *testing.T) {
 			},
 		},
 		ModelRoutes: []config.ModelEntry{
-			{ModelName: "test-model", Provider: "gemini", ProviderModel: "test-model", CredpoolRef: "pool-a"},
+			{ModelName: "test-model", ProviderRef: "gemini", UpstreamModel: "test-model", CredpoolRef: "pool-a"},
 		},
 		Metrics: config.MetricsConfig{Enabled: true},
 		Sidecar: config.SidecarConfig{
@@ -240,5 +241,66 @@ func TestOpenLocalStateStore_StandaloneEnabled(t *testing.T) {
 	}
 	if _, err := os.Stat(path); err != nil {
 		t.Errorf("expected local_state file at %s: %v", path, err)
+	}
+}
+
+// TestWardenStats_PersistsAcrossRestart proves the restart-recovery path:
+// a flush from one warden instance is readable by a second, independent
+// warden instance opened against the same local_state file afterward —
+// simulating a process restart without needing an actual second process.
+func TestWardenStats_PersistsAcrossRestart(t *testing.T) {
+	path := t.TempDir() + "/warden-state.db"
+	cfg := &config.Config{LocalState: config.LocalStateConfig{Enabled: true, Path: path}}
+	wardenCfg := &config.WardenConfig{Enabled: true, Mode: "redact"}
+
+	store1 := openLocalStateStore(cfg)
+	if store1 == nil {
+		t.Fatal("expected a non-nil store in standalone mode with local_state enabled")
+	}
+
+	_, stats1 := buildWardenPlugin(wardenCfg, store1)
+	stats1.Record([]corewarden.Finding{
+		{Category: corewarden.CategorySecret, Type: "aws_access_key_id", Verdict: corewarden.VerdictRedact},
+	}, 0)
+	flushWardenStats(stats1, store1)
+	if err := store1.Close(); err != nil {
+		t.Fatalf("store1.Close: %v", err)
+	}
+
+	// Simulate a restart: a fresh store and a fresh warden instance against
+	// the same file, with no in-memory state carried over.
+	store2 := openLocalStateStore(cfg)
+	if store2 == nil {
+		t.Fatal("expected a non-nil store on reopen")
+	}
+	defer store2.Close()
+
+	_, stats2 := buildWardenPlugin(wardenCfg, store2)
+	snap := stats2.Snapshot()
+
+	if snap.RequestsInspected != 1 {
+		t.Errorf("RequestsInspected = %d, want 1", snap.RequestsInspected)
+	}
+	if snap.SecretsFound != 1 {
+		t.Errorf("SecretsFound = %d, want 1", snap.SecretsFound)
+	}
+	if got := snap.ByType["secret:aws_access_key_id"]; got != 1 {
+		t.Errorf("ByType[secret:aws_access_key_id] = %d, want 1", got)
+	}
+
+	// A subsequent live increment on the restored instance builds on top of
+	// the restored baseline rather than replacing it.
+	stats2.Record([]corewarden.Finding{
+		{Category: corewarden.CategoryPII, Type: "email", Verdict: corewarden.VerdictRedact},
+	}, 0)
+	snap2 := stats2.Snapshot()
+	if snap2.RequestsInspected != 2 {
+		t.Errorf("RequestsInspected after a live increment = %d, want 2", snap2.RequestsInspected)
+	}
+	if snap2.SecretsFound != 1 {
+		t.Errorf("SecretsFound should still reflect the restored baseline: got %d, want 1", snap2.SecretsFound)
+	}
+	if snap2.PIIFound != 1 {
+		t.Errorf("PIIFound = %d, want 1", snap2.PIIFound)
 	}
 }

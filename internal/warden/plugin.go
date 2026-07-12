@@ -42,7 +42,15 @@ func (p *WardenPlugin) Execute(c *pipeline.LLMContext, next pipeline.Handler) er
 	findings, substitutions, scanErr := p.sanitizeRequest(c.RequestCtx, c, vault)
 
 	if p.stats != nil {
-		p.stats.Record(findings, len(substitutions))
+		// substitutions counts every acted-on finding regardless of Mode —
+		// in "redact" mode those are destructive masks, not vault tokens,
+		// so only report tokensVaulted when tokenize mode actually minted
+		// real vault entries.
+		tokensVaulted := 0
+		if cfg.Mode == "tokenize" {
+			tokensVaulted = len(substitutions)
+		}
+		p.stats.Record(findings, tokensVaulted)
 	}
 	if scanErr != nil && cfg.FailClosed {
 		return &pipeline.PipelineError{
