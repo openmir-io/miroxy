@@ -185,11 +185,12 @@ model_routes:
 			wantErr: true,
 		},
 		{
-			name: "passthrough skips mismatch check",
+			name: "mode: passthrough skips mismatch check",
 			yaml: `
 model_routes:
   - model_name: m
     protocol: anthropic
+    mode: passthrough
     provider_model: claude-haiku-4-5-20251001
     api_base: https://generativelanguage.googleapis.com/any/path
     auth_style: bearer

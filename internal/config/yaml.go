@@ -334,6 +334,25 @@ func applyConfigDefaults(cfg *Config) {
 	if cfg.Sidecar.CredSource.SyncInterval == 0 {
 		cfg.Sidecar.CredSource.SyncInterval = 300
 	}
+	if cfg.Warden.Enabled {
+		if cfg.Warden.Mode == "" {
+			cfg.Warden.Mode = "redact"
+		}
+		boolDefaultTrue(&cfg.Warden.Secrets)
+		boolDefaultTrue(&cfg.Warden.PII)
+		boolDefaultTrue(&cfg.Warden.Injection)
+		boolDefaultTrue(&cfg.Warden.Jailbreak)
+	}
+}
+
+// boolDefaultTrue sets *p to true when the config author omitted the field
+// (nil) — used for WardenConfig's per-detector toggles, which default on
+// once Warden itself is enabled.
+func boolDefaultTrue(p **bool) {
+	if *p == nil {
+		v := true
+		*p = &v
+	}
 }
 
 var (
@@ -470,11 +489,7 @@ func validateAPIBase(idx int, m *ModelEntry) error {
 		proto = "gemini"
 	}
 
-	clientProto := m.ClientProtocol
-	if clientProto == "" {
-		clientProto = "anthropic"
-	}
-	if m.Mode == "passthrough" || clientProto == proto {
+	if m.Mode == "passthrough" {
 		return nil
 	}
 

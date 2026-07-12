@@ -101,6 +101,13 @@ type CredPoolConfig struct {
 	Threshold     int                      // consecutive failures before circuit-break (default: 5)
 	Cooldown      time.Duration            // circuit-break cooldown (default: 60s)
 
+	// Protocol/PassthroughUpstream/ForcePassthrough are embedded in each
+	// ExecutionPlan so UpstreamExecutor can pick real transform vs raw
+	// passthrough per attempt — see ExecutionPlan's doc comment.
+	Protocol            string
+	PassthroughUpstream upstream.UpstreamAdapter
+	ForcePassthrough    bool
+
 	// Proactive rate limiting — sliding window per credential.
 	RateLimitRPM  int           // per-credential requests-per-minute cap; 0 = disabled
 	RateSoftLimit int           // rotate at this count before hitting the cap
@@ -130,6 +137,10 @@ type CredPool struct {
 
 	upstream      upstream.UpstreamAdapter
 	providerModel string
+
+	protocol            string
+	passthroughUpstream upstream.UpstreamAdapter
+	forcePassthrough    bool
 
 	rateLimit     int
 	rateSoftLimit int
@@ -178,17 +189,20 @@ func NewCredPool(cfg CredPoolConfig) *CredPool {
 	}
 
 	return &CredPool{
-		creds:          entries,
-		strategy:       strategy,
-		threshold:      threshold,
-		cooldown:       cooldown,
-		upstream:       cfg.Upstream,
-		providerModel:  cfg.ProviderModel,
-		rateLimit:      cfg.RateLimitRPM,
-		rateSoftLimit:  softLimit,
-		rateWindow:     rateWindow,
-		tpmLimit:       cfg.RateLimitTPM,
-		rateLimitTiers: tiers,
+		creds:               entries,
+		strategy:            strategy,
+		threshold:           threshold,
+		cooldown:            cooldown,
+		upstream:            cfg.Upstream,
+		providerModel:       cfg.ProviderModel,
+		protocol:            cfg.Protocol,
+		passthroughUpstream: cfg.PassthroughUpstream,
+		forcePassthrough:    cfg.ForcePassthrough,
+		rateLimit:           cfg.RateLimitRPM,
+		rateSoftLimit:       softLimit,
+		rateWindow:          rateWindow,
+		tpmLimit:            cfg.RateLimitTPM,
+		rateLimitTiers:      tiers,
 	}
 }
 
@@ -282,10 +296,13 @@ func (p *CredPool) Select(ctx context.Context, _ *types.MessageRequest) (*Execut
 	}
 
 	return &ExecutionPlan{
-		SelectionID: selected.id,
-		Credential:  credential,
-		Model:       p.providerModel,
-		Upstream:    p.upstream,
+		SelectionID:         selected.id,
+		Credential:          credential,
+		Model:               p.providerModel,
+		Upstream:            p.upstream,
+		Protocol:            p.protocol,
+		PassthroughUpstream: p.passthroughUpstream,
+		ForcePassthrough:    p.forcePassthrough,
 	}, nil
 }
 
@@ -424,10 +441,13 @@ func (p *CredPool) TakeRateLimited(ctx context.Context) []*ExecutionPlan {
 			continue
 		}
 		plans = append(plans, &ExecutionPlan{
-			SelectionID: c.entry.id,
-			Credential:  cred,
-			Model:       p.providerModel,
-			Upstream:    p.upstream,
+			SelectionID:         c.entry.id,
+			Credential:          cred,
+			Model:               p.providerModel,
+			Upstream:            p.upstream,
+			Protocol:            p.protocol,
+			PassthroughUpstream: p.passthroughUpstream,
+			ForcePassthrough:    p.forcePassthrough,
 		})
 	}
 	return plans

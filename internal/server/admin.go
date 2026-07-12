@@ -34,6 +34,25 @@ func (s *Server) compressSnapshot() map[string]any {
 	}
 }
 
+// wardenSnapshot returns a JSON-friendly map of warden stats, or
+// {"enabled": false} when warden is disabled.
+func (s *Server) wardenSnapshot() map[string]any {
+	if s.wardenStats == nil {
+		return map[string]any{"enabled": false}
+	}
+	snap := s.wardenStats.Snapshot()
+	return map[string]any{
+		"enabled":            true,
+		"requests_inspected": snap.RequestsInspected,
+		"secrets_found":      snap.SecretsFound,
+		"pii_found":          snap.PIIFound,
+		"injections_blocked": snap.InjectionsBlocked,
+		"jailbreaks_blocked": snap.JailbreaksBlocked,
+		"tokens_vaulted":     snap.TokensVaulted,
+		"by_type":            snap.ByType,
+	}
+}
+
 // adminGuard enforces password-based access on all /admin/* routes.
 // Static UI files (/, *.js, *.css) are always served so the browser can load
 // the login form even before authentication.
@@ -239,6 +258,7 @@ func (s *Server) adminStatus(w http.ResponseWriter, _ *http.Request) {
 			"by_model":            usageModels,
 		},
 		"compress": s.compressSnapshot(),
+		"warden":   s.wardenSnapshot(),
 	})
 }
 
@@ -308,6 +328,15 @@ func (s *Server) StatsText() string {
 		fmt.Fprint(&b, snap.Format())
 	} else {
 		fmt.Fprintf(&b, "Compression: disabled  (set compress.enabled: true to enable)\n")
+	}
+
+	// ── Security (warden) ────────────────────────────────────
+	fmt.Fprintf(&b, "\n%s\n", sep)
+	if s.wardenStats != nil {
+		snap := s.wardenStats.Snapshot()
+		fmt.Fprint(&b, snap.Format())
+	} else {
+		fmt.Fprintf(&b, "Warden: disabled  (set warden.enabled: true to enable)\n")
 	}
 
 	// ── Config summary ───────────────────────────────────────

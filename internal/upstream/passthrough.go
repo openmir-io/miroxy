@@ -9,16 +9,23 @@ import (
 	"net/http"
 
 	"miroxy/core/cred"
+	coreup "miroxy/core/upstream"
 	"miroxy/internal/types"
 )
 
-// PassthroughTranslator forwards the Anthropic-format request body to the upstream
-// endpoint without any format conversion. It is used when the client protocol and
-// the upstream protocol are identical or compatible (e.g. client → Bedrock Claude,
-// which accepts the same Anthropic Messages API format).
+// PassthroughAdapter forwards a request/response verbatim, with no IR
+// transform in either direction. The caller (UpstreamExecutor) only selects
+// this adapter for an attempt when it has already established that the
+// client's actual wire protocol matches this target's protocol — see
+// ExecutionPlan.PassthroughUpstream/ForcePassthrough — so every method here
+// can assume raw byte forwarding is correct without re-checking protocols.
 //
-// The Credential is applied to the outgoing request; the upstream response and SSE
-// events are returned as-is (deserialized as Anthropic wire format).
+// ToUpstream/ToUpstreamStream send coreup.RawBodyFromContext(ctx) verbatim
+// when the caller attached it (the normal case); falling back to
+// json.Marshal(req) only covers a caller that selected this adapter without
+// raw bytes available. FromUpstream always raw-captures the response body
+// into types.MessageResponse's RawBody escape hatch; the delivery layer
+// (internal/server) writes it directly instead of re-encoding.
 type PassthroughAdapter struct {
 	endpoint       string // full URL for non-streaming POST
 	streamEndpoint string // full URL for streaming POST (falls back to endpoint when empty)
@@ -47,9 +54,13 @@ func (t *PassthroughAdapter) ToUpstreamStream(ctx context.Context, req *types.Me
 }
 
 func (t *PassthroughAdapter) buildHTTPRequest(ctx context.Context, req *types.MessageRequest, url string, credential cred.Credential) (*http.Request, error) {
-	body, err := json.Marshal(req)
-	if err != nil {
-		return nil, fmt.Errorf("passthrough: marshal request: %w", err)
+	body, ok := coreup.RawBodyFromContext(ctx)
+	if !ok {
+		var err error
+		body, err = json.Marshal(req)
+		if err != nil {
+			return nil, fmt.Errorf("passthrough: marshal request: %w", err)
+		}
 	}
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
@@ -62,22 +73,36 @@ func (t *PassthroughAdapter) buildHTTPRequest(ctx context.Context, req *types.Me
 	return httpReq, nil
 }
 
-// FromUpstream deserializes an Anthropic-format response body.
+// FromUpstream reads the raw response body and returns it via the
+// MessageResponse.RawBody escape hatch — no parsing, since the caller has
+// already established the upstream's wire shape matches what the client
+// expects verbatim.
 func (t *PassthroughAdapter) FromUpstream(resp *http.Response) (*types.MessageResponse, error) {
 	defer resp.Body.Close()
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, fmt.Errorf("passthrough: read response: %w", err)
 	}
-	var msgResp types.MessageResponse
-	if err := json.Unmarshal(body, &msgResp); err != nil {
-		return nil, fmt.Errorf("passthrough: parse response: %w", err)
+	ct := resp.Header.Get("Content-Type")
+	if ct == "" {
+		ct = "application/json"
 	}
-	return &msgResp, nil
+	return &types.MessageResponse{RawBody: body, RawContentType: ct, RawStatus: resp.StatusCode}, nil
 }
 
-// StreamFromUpstream forwards upstream Anthropic SSE events directly to the channel.
+// StreamFromUpstream is unreachable in normal operation — UpstreamExecutor
+// bypasses it for passthrough attempts (see LLMContext.SetRawStream) and
+// relays raw bytes directly. Kept only for UpstreamAdapter conformance and as
+// a defensive fallback if this adapter is ever invoked outside that path.
 func (t *PassthroughAdapter) StreamFromUpstream(ctx context.Context, resp *http.Response, msgID, modelAlias string) (<-chan types.SSEEvent, error) {
+	return parseAnthropicSSE(ctx, resp)
+}
+
+// parseAnthropicSSE hand-parses a real Anthropic-wire SSE stream into the
+// canonical SSEEvent channel. Shared by PassthroughAdapter's defensive
+// fallback and AnthropicUpstream (a genuine Anthropic-protocol upstream
+// target, whose wire format is byte-identical to canonical SSE by design).
+func parseAnthropicSSE(ctx context.Context, resp *http.Response) (<-chan types.SSEEvent, error) {
 	out := make(chan types.SSEEvent, 32)
 	go func() {
 		defer close(out)

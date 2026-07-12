@@ -21,6 +21,7 @@ type Config struct {
 	CredPools   map[string]CredPoolCfg `yaml:"credpools"`
 	ModelRoutes []ModelEntry           `yaml:"model_routes"`
 	Metrics     MetricsConfig          `yaml:"metrics"`
+	Warden      WardenConfig           `yaml:"warden"`
 	Compress    CompressConfig         `yaml:"compress"`
 	Dump        DumpConfig             `yaml:"dump"`
 	Transparent TransparentConfig      `yaml:"transparent"`
@@ -124,14 +125,18 @@ type ProviderDef struct {
 //
 //	model_name + routing.strategy + routing.targets[]
 //
-// client_protocol selects the FrontendConverter (how to read the client request).
-// protocol selects the ProviderConverter (how to write the upstream request).
-// When they match, miroxy forwards the request as-is (passthrough mode).
+// The FrontendConverter that reads the client request is chosen structurally,
+// by which HTTP path the request hit (see core/downstream.DownstreamAdapter) —
+// not by config. protocol selects the ProviderConverter (how to write the
+// upstream request). Whether a given attempt forwards raw bytes instead of
+// running the IR transform is decided per request, per attempt, by comparing
+// the request's actual client protocol against this value (see
+// internal/server/upstream.go's dispatchFor) — mode: passthrough below
+// forces raw forwarding unconditionally regardless of that comparison.
 type ModelEntry struct {
 	ModelName      string         `yaml:"model_name"`
 	DisplayName    string         `yaml:"display_name,omitempty"` // human-readable label for /v1/models; defaults to ModelName
 	Provider       string         `yaml:"provider"`
-	ClientProtocol string         `yaml:"client_protocol"`
 	Protocol       string         `yaml:"protocol"`
 	ProviderModel  string         `yaml:"provider_model"`
 	CredPool       CredPoolCfg    `yaml:"credpool"`
@@ -313,6 +318,34 @@ type CompressConfig struct {
 	// Leave empty to use the in-memory store (session-scoped, no persistence).
 	// Example: /data/ccr.db
 	CCRPath string `yaml:"ccr_path"`
+}
+
+// WardenConfig controls the builtin content-defense pipeline: secret/PII
+// detection, prompt-injection and jailbreak phrase matching, and reversible
+// tokenization. All fields are optional; zero values use the defaults
+// documented below.
+type WardenConfig struct {
+	// Enabled turns WardenPlugin on. Default false (opt-in).
+	Enabled bool `yaml:"enabled"`
+
+	// Mode selects how Redact/Block-verdict findings are rewritten:
+	// "redact" (destructive masking, the default), "tokenize" (reversible
+	// vault placeholders restored in the response), or "block_only" (never
+	// rewrite — a Block verdict still halts the request either way).
+	Mode string `yaml:"mode"`
+
+	// Secrets/PII/Injection/Jailbreak toggle each detector independently.
+	// Default true for all four when Warden itself is enabled.
+	Secrets   *bool `yaml:"secrets,omitempty"`
+	PII       *bool `yaml:"pii,omitempty"`
+	Injection *bool `yaml:"injection,omitempty"`
+	Jailbreak *bool `yaml:"jailbreak,omitempty"`
+
+	// FailClosed, when true, blocks a request outright if a detector
+	// errors (e.g. a recovered panic) instead of passing it through
+	// best-effort. Default false — a brand-new detector failing closed by
+	// default risks false-positive outages more than it buys safety.
+	FailClosed bool `yaml:"fail_closed"`
 }
 
 // LookupModel returns the ModelEntry matching name, then falls back to

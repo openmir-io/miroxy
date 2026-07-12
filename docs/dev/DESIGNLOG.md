@@ -1060,3 +1060,312 @@ default, and structurally disabled whenever a sidecar already owns the data
 it would cache. It's a materially smaller commitment than a real embedded
 SQL database. Flagging this explicitly rather than letting it drift in
 silently; see the added clarifying note under that constraint in `CLAUDE.md`.
+
+---
+
+## 2026-07-12 — Protocol discovery is URL-path-based, not config-based; `client_protocol` is a narrow passthrough hint
+
+### Context
+
+Design discussion clarifying how miroxy decides "what protocol did the
+client speak" once every client points its SDK's `base_url` at miroxy's own
+domain instead of a provider's domain directly. Prompted by a concern that
+`model_routes` (and its `client_protocol` field) might be the *only* signal
+available for this, which would make it impossible to know the client's real
+wire protocol independent of which backend the operator wants to route to.
+
+That concern doesn't hold once the actual dispatch code is traced through —
+this entry documents the mechanism as it already exists, since no code
+changed as a result of this discussion.
+
+### The mechanism
+
+Protocol discovery happens at the HTTP routing layer, before `model_routes`
+is ever consulted, and needs zero configuration:
+
+```go
+// internal/server/server.go
+func defaultAdapters() []coredown.DownstreamAdapter {
+    return []coredown.DownstreamAdapter{&AnthropicAdapter{}, &OpenAIAdapter{}, &ResponsesAdapter{}}
+}
+s.mux.Handle("POST "+a.Path(), authMW(http.HandlerFunc(s.makeHandler(a))))
+```
+
+Each `DownstreamAdapter` owns its own path (`AnthropicAdapter.Path() ==
+"/v1/messages"`, `OpenAIAdapter.Path() == "/v1/chat/completions"`,
+`ResponsesAdapter.Path() == "/v1/responses"`). `net/http.ServeMux` dispatches
+purely on that path. Pointing a client's `base_url` at miroxy does not erase
+this signal — every SDK appends its own hardcoded path suffix regardless of
+the domain it's pointed at (an Anthropic SDK always POSTs to
+`{base_url}/v1/messages`; an OpenAI-compatible SDK always POSTs to
+`{base_url}/v1/chat/completions`). The domain substitution never touches the
+path, so the protocol signal survives proxying unchanged.
+
+This produces a clean two-decision sequence, orthogonal to each other:
+
+1. **Decision A — "what protocol is this?"** Resolved structurally by which
+   path/mux handler fired. Zero config. Produces the canonical
+   `types.MessageRequest` (folded via that adapter's `Decode`).
+2. **Decision B — "where should this model be routed?"** Resolved from
+   `model_routes`, using the `model` field already present in the canonical
+   struct Decision A produced. This step is necessarily config-driven —
+   nothing in the client's request can say "send `claude-3-5-sonnet` to
+   Bedrock instead of real Anthropic"; only the operator's config knows that.
+
+`model_routes`/`resolveProto`'s `client_protocol` field was never meant to
+answer Decision A — that question is already closed by the time
+`resolveProto` runs. `client_protocol` answers a much narrower question:
+"does the canonical shape Decision A already produced happen to equal this
+route's upstream wire shape, so the fold-then-unfold round trip can be
+skipped (passthrough)?" Given today's `DownstreamAdapter` set, the only
+value that's ever valid is the default (`"anthropic"`), since that's the
+only shape any converter produces. It becomes meaningful for a new value
+once a *native* downstream endpoint for that protocol exists (e.g. a future
+Bedrock-native `/model/{modelId}/invoke` downstream adapter) and a route is
+known to be reachable only through it.
+
+### Why this isn't "protocol binding" the way litellm/cc-switch might imply
+
+Both sides of the pipeline are protocol-keyed, not model-keyed, at different
+layers with different discovery mechanisms: downstream by path (structural),
+upstream by the route's `protocol`/`provider` field (declarative, since the
+target is a deployment decision, not something inherent in the request).
+Adding a new upstream provider needs one new `UpstreamAdapter` and works
+against every existing downstream protocol for free; adding a new downstream
+protocol needs one new `DownstreamAdapter` and works against every existing
+upstream provider for free (N+M, not N×M). litellm's own proxy uses the same
+path-based discovery internally (separate routes for its anthropic-passthrough
+vs. chat/completions endpoints) even though its internal canonical shape is
+OpenAI-ish — the decoupling here isn't unusual, it's the standard mechanism
+for a real multi-protocol proxy, and it's already how miroxy works today.
+
+### Process note
+
+Per a new working rule for this project: every design discussion or decision
+— including ones that clarify existing behavior without changing code, and
+plan-mode discussions — gets a dated entry here, not just entries for shipped
+features.
+
+---
+
+## 2026-07-12 — Dynamic per-request protocol dispatch replaces the static `client_protocol` field; real byte-for-byte passthrough
+
+### Problem
+
+The previous entry's `client_protocol` field was a *static, per-route config
+value* compared against a target's `protocol` once at config-build time to
+decide real-transform vs. passthrough. Two real bugs followed from that:
+
+1. **Wrong target for a routing entry with mixed protocols.** A
+   `routing.targets` entry mixing gemini/anthropic/openai targets (e.g. one
+   round-robin pool serving a client that could be Anthropic-native, OpenAI,
+   or Codex) had exactly one static `client_protocol` for the whole route —
+   it could never correctly say "passthrough for the openai target, transform
+   for the other two," because the actual client protocol differs per
+   *request*, not per route.
+2. **Passthrough itself only worked for anthropic-in→anthropic-out.**
+   `PassthroughAdapter` forwarded `json.Marshal(canonical)` — but canonical
+   (`types.MessageRequest`) is unconditionally Anthropic-shaped regardless of
+   which `DownstreamAdapter` decoded the request. For an OpenAI-protocol
+   client (Codex) routed to an OpenAI-protocol upstream, "passthrough" would
+   have sent Anthropic-shaped JSON to a real OpenAI endpoint — broken, and
+   silently so. Fields with no Anthropic-canonical equivalent (e.g. Codex's
+   `reasoning_effort`) are also dropped by the canonical round-trip even on
+   the *correctly transformed* path — only true raw-byte forwarding avoids that.
+
+### Fix
+
+- **Client protocol is now detected dynamically, per request**, from which
+  `DownstreamAdapter` actually decoded it (`a.Protocol()`) — not read from
+  config. Carried on `pipeline.LLMContext.ClientProtocol`, set once in
+  `makeHandler`. The `ModelEntry.ClientProtocol` config field is removed.
+- **The real-vs-passthrough choice moved from config-build time to per-attempt
+  dispatch time** — `internal/server/upstream.go`'s new `dispatchFor` compares
+  `ClientProtocol` against each attempt's `ExecutionPlan.Protocol` (the
+  target's static upstream protocol) and picks `Upstream` (real IR transform)
+  or `PassthroughUpstream` (raw bytes) accordingly; `ForcePassthrough` (from
+  `mode: passthrough`) still overrides unconditionally. Since this runs per
+  attempt, a single round-robin routing entry now gets independently-correct
+  behavior per target — this was the concrete motivating case: gemini and
+  anthropic targets transform, an openai target byte-passthroughs, all under
+  one `miroxy-code` model_routes entry with 3 round-robin targets.
+- **Passthrough forwards real bytes, not a re-marshaled canonical struct** —
+  in both directions. `core/upstream.WithRawBody`/`RawBodyFromContext` carry
+  the original pre-decode request bytes (captured in `makeHandler`) to
+  `PassthroughAdapter.ToUpstream`; `types.MessageResponse` gained a
+  `RawBody`/`RawContentType`/`RawStatus` escape hatch that
+  `PassthroughAdapter.FromUpstream` always populates (same pattern as
+  `PipelineError.RawBody`, already used for the error path). Streaming raw
+  passthrough bypasses the canonical `SSEEvent` channel entirely —
+  `LLMContext.SetRawStream`/`RawStream()` hand the executor's raw
+  `io.ReadCloser` straight to `makeHandler`, which relays bytes with
+  per-chunk flushing. `PassthroughAdapter.StreamFromUpstream` is now
+  unreachable in normal operation (kept for interface conformance).
+- **Side discovery while wiring this**: `buildUpstreamAdapter`'s protocol
+  switch had no real `case "anthropic"` — under the old design that was
+  unreachable (a route with `protocol: anthropic` always took the static
+  passthrough branch, since `client_protocol` defaulted to `"anthropic"` and
+  matched unconditionally). Dynamic detection makes it reachable for the
+  first time (e.g. an OpenAI-protocol client routed to an `anthropic` target
+  — a genuine transform is needed, not passthrough). Added
+  `internal/upstream/anthropic.go`'s `AnthropicUpstream` — near-identity by
+  design, since canonical shape already *is* Anthropic's wire shape; it just
+  sets the target's own model name before marshaling.
+
+### Known limitation
+
+Usage/token accounting (`stats.Registry`, `UsageAccumulator`, TPM windows)
+reads `MessageResponse.Usage`, which is zero-valued on a raw-passthrough
+response — those attempts under-report usage. Not fixed here; would need a
+best-effort per-protocol usage extraction from the raw body, which is out of
+scope for this pass.
+
+### Files
+
+`core/selector/selector.go` (`ExecutionPlan.Protocol`/`PassthroughUpstream`/`ForcePassthrough`),
+`core/selector/{credpool,target_selector}.go`, `core/upstream/rawbody.go` (new),
+`internal/upstream/{passthrough,anthropic}.go`, `internal/types/anthropic.go`
+(`MessageResponse` raw fields), `internal/pipeline/context.go`
+(`ClientProtocol`, `RawRequestBody`, raw-stream accessors), `internal/server/server.go`
+(`makeHandler` raw capture/delivery, `dispatchFor` construction sites),
+`internal/server/upstream.go` (`dispatchFor`, both retry loops).
+Tests: `internal/server/upstream_test.go` (new, `dispatchFor` unit tests),
+`tests/integration/protocol_dispatch_test.go` (new — the 3-target round-robin
+scenario end-to-end), `tests/unit/config_test.go` (updated one case to use
+`mode: passthrough` explicitly instead of the removed implicit
+`client_protocol == protocol` skip).
+
+---
+
+## 2026-07-12 — `core/warden` + `internal/warden`: builtin content defense (secrets/PII/injection/jailbreak/tokenization)
+
+### Context
+
+Surveyed 5 local OSS security-proxy repos (`~/oss/{LLM-Redactor,contextio,tamga,
+aisecuritygateway,pii-redactor}`) to ground a new redaction subsystem in real
+prior art. Findings: tamga (Go) has the only genuinely complete, portable
+detection engine (regex+validator tables, weighted confidence scoring, an
+anti-evasion normalize package). pii-redactor (Python) has the only real
+reversible-tokenization design worth porting (stable per-value tokens, a
+streaming hold-back-buffer algorithm that survives a token split across SSE
+chunks). aisecuritygateway (Python/Presidio) and contextio (TypeScript, not Go
+despite its label) confirmed the fail-closed pattern and "presets are just
+data," but contributed no Go-portable code. LLM-Redactor (Go) confirmed what
+NOT to do — its advertised SSE redaction was deleted from its own codebase and
+never worked for responses at all. None of the five have a viable pure-Go NER
+or ML toxicity/jailbreak scorer — every repo with semantic PII detection
+delegates to Python/spaCy. This bounds the "80%-coverage, pure Go builtin"
+scope honestly: structured PII, secrets, phrase-based injection/jailbreak,
+reversible tokenization, and anti-evasion normalization are all buildable in
+pure Go today; semantic NER and real toxicity scoring are not, and are left as
+an explicit sidecar extension point (`core/warden.Warden` is a thin interface
+for exactly this reason — a future sidecar implementation, e.g. an external
+Presidio-backed service, swaps in without touching `internal/pipeline`).
+
+Every identifier below is deliberately distinct from its closest analogue in
+the surveyed repos (tamga's `Scanner`/`ConfidenceFactor`, pii-redactor's
+`Vault`/token format, contextio's `ProxyPlugin`, aisecuritygateway's
+`PatternRecognizer`) — same ideas, this project's own naming. Everything from
+a non-Go source (pii-redactor, aisecuritygateway are Python; contextio is
+TypeScript) is a full Go reimplementation of the design, not a wrapped call
+to the original.
+
+### Design
+
+- **`pipeline.PrioritySecurity` renamed to `PriorityWarden`** — it had been
+  reserved but unused since it was defined; this is its first real occupant,
+  and the name now matches its owning module (consistent with
+  `PriorityRouter`/`PriorityRectifier`). `CompressPlugin` already ran at
+  `PriorityWarden+50` with a doc comment saying "after security" — it had
+  been waiting for exactly this plugin to exist.
+- **Dual-representation scanning fixes a real passthrough/security
+  conflict.** miroxy's raw passthrough path (`dispatchFor`) ships
+  `c.RawRequestBody` — pristine pre-decode bytes — verbatim when
+  `ClientProtocol == plan.Protocol`, completely bypassing `c.Request`. A
+  Warden that only redacted `c.Request` would let secrets/PII through
+  unredacted on every passthrough-eligible attempt, defeating the point of
+  building it. Fix: `WardenPlugin.sanitizeRequest` scans+redacts
+  `c.Request`'s decoded text fields (feeds the transform path) *and* mirrors
+  the same substitutions onto `c.RawRequestBody` directly via byte-level
+  `bytes.ReplaceAll` (feeds the passthrough path) — not a second detector
+  pass, just the same substitutions applied to the second representation,
+  since a multi-target retry can land on either path per attempt.
+- **Response-side resolution is symmetric** across all four response shapes
+  (canonical non-streaming, canonical SSE, raw passthrough non-streaming, raw
+  passthrough streaming) — `WardenPlugin.resolveResponse` checks all four
+  after `next(c)` returns; exactly one ever does anything for a given
+  request, but checking needs no knowledge of which path this attempt took.
+  Canonical SSE resolution (`ResolveEvents`) wraps `c.StreamSrc()`'s channel
+  with a relay goroutine; raw passthrough resolution (`ResolvingReader`)
+  wraps the `io.ReadCloser` directly. Both use the same
+  `StreamResolver.Feed`/`Flush` hold-back-buffer algorithm (ported from
+  pii-redactor's design) so a vault token split across chunk boundaries —
+  including split mid-delimiter-byte for a raw byte reader, since the
+  delimiter itself is a multi-byte UTF-8 character — still resolves.
+  `LLMContext` gained one new getter, `ReleaseFunc()`, so a plugin wrapping
+  the stream can carry the original release callback forward without
+  `SetStream(new, c.ReleaseUpstream)` creating infinite recursion
+  (`releaseUpstream` would point back at `ReleaseUpstream`, which calls
+  `releaseUpstream`).
+- **Confidence scoring is this project's own scheme**, not copied from
+  tamga's Format/Algorithm/Database/Context factors: `PatternScore` +
+  `ChecksumScore` + `ContextScore` → a 0-100 score → `Block(>=85)` /
+  `Redact(>=60)` / `Log(>=35)` / `Allow`. Calibration matters here: a
+  known-provider-prefix secret match (AKIA, ghp_, sk-ant-, ...) or a
+  low-false-positive PII pattern (email, SSN) scores high enough *alone* to
+  cross the Redact threshold — requiring a nearby keyword before redacting
+  would under-protect the common case of a bare leaked key. A looser pattern
+  (phone, IP, generic-entropy fallback) scores lower and needs a checksum or
+  context hit to get there. (First cut had every pattern capped at 45,
+  which made pure-pattern matches structurally incapable of ever reaching
+  Redact — caught by `TestBuiltinWarden_Sanitize_RedactMode` failing.)
+- **Vault tokens use `⟦TYPE:NNN⟧`** (U+27E6/U+27E7, "mathematical white
+  square bracket") — distinct from pii-redactor's guillemets, chosen for the
+  same reason: a delimiter pair that essentially never occurs in real
+  request/response text. `BuiltinVault` is created fresh per request inside
+  `WardenPlugin.Execute` and discarded with it — no cross-request/session
+  persistence, consistent with "No DB in v1." A multi-turn vault would need
+  a session key and a store — an explicit non-goal here, not an oversight.
+- **Anti-evasion normalization** (`internal/warden/normalize`) strips
+  invisible/zero-width characters, folds Cyrillic/Greek cross-script
+  lookalikes, and folds accents — `golang.org/x/text/unicode/norm`'s NFKC
+  already folds fullwidth forms and the Mathematical Alphanumeric Symbols
+  block via their Unicode compatibility decomposition, so the hand-rolled
+  lookalike map only needs to cover genuine cross-script confusables, not
+  those two blocks tamga's own map also covers redundantly.
+- **No Aho-Corasick dependency for phrase matching.** tamga uses a
+  third-party AC library for its (much larger, config-hot-reloadable)
+  pattern set; miroxy's injection/jailbreak denylists are a few dozen
+  hand-curated phrases, where a plain `strings.Index` loop is enough —
+  matches this project's general "no unnecessary dependency" stance. The one
+  new dependency actually added is `golang.org/x/text/unicode/norm`
+  (NFKC/NFD only), justified by not hand-rolling Unicode normalization.
+
+### Files
+
+New: `core/warden/{warden.go,vault.go}`; `internal/warden/{builtin.go,
+secrets.go,pii.go,phrases.go,vault.go,stream.go,plugin.go,stats.go}`;
+`internal/warden/normalize/{unicode.go,encodings.go}`.
+Modified: `internal/pipeline/pipeline.go` (`PrioritySecurity`→`PriorityWarden`),
+`internal/pipeline/context.go` (`ReleaseFunc` getter), `internal/compress/plugin.go`
+(priority reference), `internal/config/{config.go,yaml.go}` (`WardenConfig`
++ defaults), `internal/server/server.go` (`buildWardenPlugin`, wiring into
+`New()` only — `Reload()` doesn't rebuild plugins/pipeline at all today, same
+pre-existing scope limit compress already has), `internal/server/admin.go`
+(`wardenSnapshot`, `/stats` JSON + `StatsText()` section), `config/config.yaml.example`.
+Tests: `tests/unit/warden_test.go` (detector true/false positives — Luhn/IBAN
+checksums, secret formats, phrase matching, homoglyph evasion, normalize
+round-trips), `tests/unit/warden_vault_test.go` (tokenize/resolve, streaming
+split-token cases including byte-by-byte and mid-delimiter splits),
+`tests/integration/warden_test.go` (end-to-end: secret redaction proven across
+both a passthrough-eligible and a transform target from one round-robin
+route; tokenize-mode response resolution proven for non-streaming passthrough
+and streaming transform paths — the streaming case caught a real bug, a type
+assertion checking `*types.ContentBlockDeltaData` when `internal/irc`
+actually constructs the value non-pointer, silently never matching).
+
+### Known limitation
+
+`tool_use`/`tool_result` content-block payloads are not scanned — only
+`system` text and `text`-type content blocks. A documented v1 scope limit,
+not an oversight.

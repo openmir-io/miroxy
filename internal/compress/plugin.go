@@ -12,7 +12,7 @@ import (
 	"miroxy/internal/types"
 )
 
-const priorityCompress = pipeline.PrioritySecurity + 50 // 350 — after security, before rectifier
+const priorityCompress = pipeline.PriorityWarden + 50 // 350 — after warden, before rectifier
 
 // CompressPlugin compresses the inbound message list to fit within the
 // configured token budget before forwarding to the upstream executor.
@@ -31,8 +31,8 @@ func NewCompressPlugin(comp ccomp.Compressor, threshold int) *CompressPlugin {
 	return &CompressPlugin{comp: comp, threshold: threshold}
 }
 
-func (p *CompressPlugin) Name() string     { return "compress" }
-func (p *CompressPlugin) Priority() int    { return priorityCompress }
+func (p *CompressPlugin) Name() string  { return "compress" }
+func (p *CompressPlugin) Priority() int { return priorityCompress }
 
 // Execute runs compression if the message list is large enough to warrant it.
 func (p *CompressPlugin) Execute(c *pipeline.LLMContext, next pipeline.Handler) error {

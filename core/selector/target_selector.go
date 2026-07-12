@@ -14,16 +14,29 @@ import (
 // are shared; the translator and model name are per-entry.
 type TargetSelector struct {
 	pool          *CredPool
-	upstream     upstream.UpstreamAdapter
+	upstream      upstream.UpstreamAdapter
 	providerModel string
+
+	// protocol/passthroughUpstream/forcePassthrough are embedded in each
+	// ExecutionPlan so UpstreamExecutor can pick real transform vs raw
+	// passthrough per attempt — see ExecutionPlan's doc comment.
+	protocol            string
+	passthroughUpstream upstream.UpstreamAdapter
+	forcePassthrough    bool
 }
 
 // NewTargetSelector creates a TargetSelector around an existing CredPool.
-func NewTargetSelector(pool *CredPool, trans upstream.UpstreamAdapter, providerModel string) *TargetSelector {
+// protocol is this target's static upstream wire protocol; passthroughUpstream
+// is the raw-forwarding adapter to use when a request's actual client
+// protocol matches it (or forcePassthrough is set unconditionally).
+func NewTargetSelector(pool *CredPool, trans upstream.UpstreamAdapter, providerModel string, protocol string, passthroughUpstream upstream.UpstreamAdapter, forcePassthrough bool) *TargetSelector {
 	return &TargetSelector{
-		pool:          pool,
-		upstream:      trans,
-		providerModel: providerModel,
+		pool:                pool,
+		upstream:            trans,
+		providerModel:       providerModel,
+		protocol:            protocol,
+		passthroughUpstream: passthroughUpstream,
+		forcePassthrough:    forcePassthrough,
 	}
 }
 
@@ -34,6 +47,9 @@ func (t *TargetSelector) Select(ctx context.Context, req *types.MessageRequest) 
 	}
 	plan.Model = t.providerModel
 	plan.Upstream = t.upstream
+	plan.Protocol = t.protocol
+	plan.PassthroughUpstream = t.passthroughUpstream
+	plan.ForcePassthrough = t.forcePassthrough
 	return plan, nil
 }
 
@@ -42,12 +58,15 @@ func (t *TargetSelector) Release(plan *ExecutionPlan, err error) {
 }
 
 // TakeRateLimited implements probeCapable so prober.go can probe rate-limited
-// keys. Delegates to the inner pool and fills Translator on each plan.
+// keys. Delegates to the inner pool and fills in per-target plan fields.
 func (t *TargetSelector) TakeRateLimited(ctx context.Context) []*ExecutionPlan {
 	plans := t.pool.TakeRateLimited(ctx)
 	for _, p := range plans {
 		p.Upstream = t.upstream
 		p.Model = t.providerModel
+		p.Protocol = t.protocol
+		p.PassthroughUpstream = t.passthroughUpstream
+		p.ForcePassthrough = t.forcePassthrough
 	}
 	return plans
 }

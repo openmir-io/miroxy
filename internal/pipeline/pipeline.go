@@ -11,7 +11,7 @@ import (
 const (
 	PriorityAuth      = 0
 	PriorityObserve   = 100
-	PrioritySecurity  = 300
+	PriorityWarden    = 300
 	PriorityRectifier = 400
 	PriorityRouter    = 500
 	PriorityTerminal  = 1000

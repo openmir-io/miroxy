@@ -148,6 +148,14 @@ type MessageResponse struct {
 	StopReason   string         `json:"stop_reason"`
 	StopSequence *string        `json:"stop_sequence"`
 	Usage        Usage          `json:"usage"`
+
+	// RawBody, when non-nil, is the verbatim upstream response body from a
+	// passthrough attempt (client and upstream protocols matched — no IR
+	// transform ran in either direction). The delivery layer writes it
+	// directly and ignores every other field above.
+	RawBody        []byte `json:"-"`
+	RawContentType string `json:"-"`
+	RawStatus      int    `json:"-"`
 }
 
 type Usage struct {

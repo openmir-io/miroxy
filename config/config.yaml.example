@@ -166,7 +166,8 @@ providers:
 
   # Case 4: Relay that speaks Anthropic protocol (e.g. a caching proxy)
   # Client sends Anthropic format → miroxy → Anthropic-speaking relay → Claude
-  # Because client_protocol == protocol == anthropic, miroxy auto-passthroughs.
+  # protocol: anthropic here matches an Anthropic-native client's actual wire
+  # protocol, so miroxy auto-passthroughs raw bytes for that request (no IR).
   # anthropic-relay:
   #   base_url: https://anthropic-cache.internal
   #   protocol: anthropic
@@ -254,6 +255,45 @@ credpools:
     cooldown_seconds: 60
     keys:
       - main_key: ${OPENAI_KEY_1}
+
+  # ── OAuth refresh_token credentials (auth_style: bearer + type: oauth_refresh) ──
+  # kind (auth_style) and lifecycle (type) are orthogonal: an oauth_refresh
+  # pool still attaches as a plain Bearer header, it just refreshes its own
+  # access token locally by exchanging client_id/client_secret + a per-key
+  # refresh_token — miroxy does this itself (credstone has no OAuth refresh
+  # support yet). Only use one oauth_refresh pool per replica if you're
+  # running more than one instance: there is no cross-replica coordination
+  # for the refresh_token exchange (miroxy logs a warning about this).
+  claude-oauth:
+    type: oauth_refresh
+    auth_style: bearer
+    client_id:     ${OAUTH_CLIENT_ID}
+    client_secret: ${OAUTH_CLIENT_SECRET}
+    strategy: round_robin
+    keys:
+      - user1: ${OAUTH_REFRESH_TOKEN_1}       # each key's value is that user's refresh_token
+      - user2: ${OAUTH_REFRESH_TOKEN_2}
+
+  # ── AWS Bedrock SigV4 credentials (auth_style: sigv4) ──────────────────────
+  # sigv4 needs multiple fields per key instead of one string, plus
+  # region/service shared by every key in the pool. auth_style must be set
+  # on the pool itself (not just inferred from a model_routes entry) because
+  # sigv4 validation happens at pool-definition time. Config/object-model
+  # only for now — actually signing and sending a request needs an
+  # SDKDispatcher that doesn't exist yet (see core/cred/credential.go).
+  bedrock-claude:
+    auth_style: sigv4
+    region: us-east-1
+    service: bedrock-runtime
+    strategy: round_robin
+    keys:
+      - prod:
+          access_key_id:     ${AWS_ACCESS_KEY_ID}
+          secret_access_key: ${AWS_SECRET_ACCESS_KEY}
+          session_token:     ${AWS_SESSION_TOKEN}   # optional — omit for long-term IAM creds
+      - backup:
+          access_key_id:     ${AWS_ACCESS_KEY_ID_2}
+          secret_access_key: ${AWS_SECRET_ACCESS_KEY_2}
 
 # ── Sidecars ─────────────────────────────────────────────────────────────────
 #
@@ -602,6 +642,29 @@ model_routes:
 metrics:
   enabled: false
   path: /metrics
+
+# ── Content defense (builtin, pure Go — secrets/PII/injection/jailbreak) ──────
+# Runs first in the pipeline (PriorityWarden=300), before compress. Detects and
+# rewrites secrets, structured PII, and prompt-injection/jailbreak phrases in
+# the inbound request, then restores any vault tokens in the response.
+warden:
+  enabled: false             # set true to activate WardenPlugin
+
+  # How Redact/Block-verdict findings are rewritten:
+  #   redact     - destructive masking, e.g. j***@example.com (default)
+  #   tokenize   - reversible ⟦TYPE:NNN⟧ placeholders, restored in the response
+  #   block_only - never rewrite; a Block verdict still halts the request
+  mode: redact
+
+  # Each detector defaults to true once warden.enabled is true.
+  secrets: true
+  pii: true
+  injection: true
+  jailbreak: true
+
+  # If true, a detector error (e.g. a recovered panic) blocks the request
+  # instead of passing it through best-effort. Default false.
+  fail_closed: false
 
 # ── Context compression (builtin, no ML required) ─────────────────────────────
 compress:

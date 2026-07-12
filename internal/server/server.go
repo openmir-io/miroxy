@@ -1,9 +1,11 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -15,7 +17,6 @@ import (
 	"miroxy/core/cred"
 	"miroxy/core/dispatch"
 	coredown "miroxy/core/downstream"
-	"miroxy/core/router"
 	"miroxy/core/rpc"
 	"miroxy/core/selector"
 	coreup "miroxy/core/upstream"
@@ -28,9 +29,11 @@ import (
 	"miroxy/internal/idgen"
 	"miroxy/internal/localstate"
 	"miroxy/internal/pipeline"
+	introuter "miroxy/internal/router"
 	"miroxy/internal/stats"
 	"miroxy/internal/types"
 	intup "miroxy/internal/upstream"
+	intwarden "miroxy/internal/warden"
 )
 
 // routingState is swapped atomically on hot reload.
@@ -55,12 +58,14 @@ type Server struct {
 	cfgPath       string                        // config file path for reload
 	cfg           atomic.Pointer[config.Config] // swapped atomically on reload
 	routing       atomic.Pointer[routingState]  // selectors + timeouts, swapped atomically
+	router        *introuter.BuiltinRouter      // model-name → RouteTarget; see internal/router
 	pipe          *pipeline.Pipeline
 	dispatcher    dispatch.Dispatcher
-	inFlight      atomic.Int64    // count of active requests, used for graceful shutdown logging
-	dumpStore     dump.Store      // nil when dump is disabled
-	tokenStats    *stats.Registry // in-process token usage counters; never nil
-	compressStats *ccomp.Stats    // nil when compress is disabled
+	inFlight      atomic.Int64     // count of active requests, used for graceful shutdown logging
+	dumpStore     dump.Store       // nil when dump is disabled
+	tokenStats    *stats.Registry  // in-process token usage counters; never nil
+	compressStats *ccomp.Stats     // nil when compress is disabled
+	wardenStats   *intwarden.Stats // nil when warden is disabled
 	startTime     time.Time
 
 	// Proxy lifecycle — used by the serve loop and admin stop/start endpoints.
@@ -169,12 +174,15 @@ func newCredPool(
 	return pool, usage
 }
 
-// buildTranslator creates the appropriate Translator for the given protocol and model.
-func buildUpstreamAdapter(proto, clientProto, mode, providerModel, apiBase string) coreup.UpstreamAdapter {
-	if mode == "passthrough" || clientProto == proto {
-		return intup.NewPassthrough(apiBase, "")
-	}
+// buildUpstreamAdapter creates the real IR-transform adapter for the given
+// upstream protocol and model. The client-protocol/passthrough decision no
+// longer happens here — see dispatchFor in upstream.go, which compares each
+// request's actual (dynamically-detected) client protocol against the
+// target's static protocol at dispatch time, per attempt.
+func buildUpstreamAdapter(proto, providerModel, apiBase string) coreup.UpstreamAdapter {
 	switch proto {
+	case "anthropic":
+		return intup.NewAnthropicUpstream(providerModel, apiBase)
 	case "openai":
 		return intup.NewOpenAI(providerModel, apiBase)
 	case "deepseek":
@@ -189,16 +197,12 @@ func buildUpstreamAdapter(proto, clientProto, mode, providerModel, apiBase strin
 }
 
 // resolveProto resolves the effective outgoing protocol for a model entry.
-func resolveProto(m config.ModelEntry) (proto, clientProto string) {
+func resolveProto(m config.ModelEntry) (proto string) {
 	proto = m.Protocol
 	if proto == "" {
 		proto = m.Provider
 	}
-	clientProto = m.ClientProtocol
-	if clientProto == "" {
-		clientProto = "anthropic"
-	}
-	return proto, clientProto
+	return proto
 }
 
 // namedPoolAuthStyle infers the auth_style for a named pool by scanning model
@@ -276,10 +280,13 @@ func buildRoutingState(cfg *config.Config, localStore *localstate.Store) (*routi
 		if p, exists := cfg.Providers[kp.Provider]; exists {
 			apiBase = p.BaseURL
 		}
-		// clientProto "anthropic": miroxy always receives Anthropic-format requests.
-		// proto = provider: translator knows how to speak to that provider.
-		upstream := buildUpstreamAdapter(kp.Provider, "anthropic", "", "", apiBase)
-		passthrough[kp.Provider] = selector.NewTargetSelector(pool, upstream, "")
+		// "passthrough" here means the client's raw model name is forwarded
+		// as-is (no model_routes entry matched it) — unrelated to protocol
+		// passthrough. The real-vs-raw protocol decision is still made per
+		// request in dispatchFor, same as every other target.
+		upstream := buildUpstreamAdapter(kp.Provider, "", apiBase)
+		rawAdapter := intup.NewPassthrough(apiBase, "")
+		passthrough[kp.Provider] = selector.NewTargetSelector(pool, upstream, "", kp.Provider, rawAdapter, false)
 		slog.Info("passthrough selector built", "provider", kp.Provider, "pool", poolName)
 	}
 
@@ -311,6 +318,12 @@ func New(cfg *config.Config, cfgPath string) *Server {
 	rt, cancelPollers := buildRoutingState(cfg, s.localStateStore)
 	s.routing.Store(rt)
 	s.credSourceCancel = cancelPollers
+	s.router.UpdateConfig(cfg)
+	s.router.UpdateRouting(&introuter.RoutingTable{
+		Selectors:            rt.selectors,
+		Timeouts:             rt.timeouts,
+		PassthroughSelectors: rt.passthroughSelectors,
+	})
 
 	probers := make(map[string]*keyProber, len(cfg.ModelRoutes))
 	for _, m := range cfg.ModelRoutes {
@@ -318,6 +331,11 @@ func New(cfg *config.Config, cfgPath string) *Server {
 	}
 
 	plugins := []pipeline.Plugin{newUpstreamExecutor(probers, s.tokenStats, rt.usageAcc)}
+	if cfg.Warden.Enabled {
+		wp, ws := buildWardenPlugin(&cfg.Warden)
+		s.wardenStats = ws
+		plugins = append([]pipeline.Plugin{wp}, plugins...)
+	}
 	if cfg.Compress.Enabled {
 		cp, cs := buildCompressPlugin(&cfg.Compress)
 		s.compressStats = cs
@@ -429,6 +447,25 @@ func buildCompressPlugin(cfg *config.CompressConfig) (*compress.CompressPlugin, 
 	return compress.NewCompressPlugin(comp, cfg.Threshold), comp.Stats()
 }
 
+// buildWardenPlugin constructs a WardenPlugin from the config block. A
+// fresh BuiltinWarden+Stats is built each call, same as buildCompressPlugin
+// above — stats reset on every New()/Reload(), matching existing convention.
+func buildWardenPlugin(cfg *config.WardenConfig) (*intwarden.WardenPlugin, *intwarden.Stats) {
+	wc := &intwarden.Config{
+		Enabled:    cfg.Enabled,
+		Mode:       cfg.Mode,
+		Secrets:    cfg.Secrets == nil || *cfg.Secrets,
+		PII:        cfg.PII == nil || *cfg.PII,
+		Injection:  cfg.Injection == nil || *cfg.Injection,
+		Jailbreak:  cfg.Jailbreak == nil || *cfg.Jailbreak,
+		FailClosed: cfg.FailClosed,
+	}
+	w := intwarden.NewBuiltinWarden()
+	w.UpdateConfig(wc)
+	st := intwarden.NewStats()
+	return intwarden.NewWardenPlugin(w, st), st
+}
+
 // buildModelSelector creates the Selector for one model_routes entry.
 func buildModelSelector(m config.ModelEntry, namedPools map[string]*selector.CredPool, cfg *config.Config) selector.Selector {
 	if m.Routing != nil {
@@ -439,8 +476,10 @@ func buildModelSelector(m config.ModelEntry, namedPools map[string]*selector.Cre
 
 // buildSimpleSelector handles a simple (single-provider) model_routes entry.
 func buildSimpleSelector(m config.ModelEntry, namedPools map[string]*selector.CredPool, cfg *config.Config) selector.Selector {
-	proto, clientProto := resolveProto(m)
-	trans := buildUpstreamAdapter(proto, clientProto, m.Mode, m.ProviderModel, m.APIBase)
+	proto := resolveProto(m)
+	trans := buildUpstreamAdapter(proto, m.ProviderModel, m.APIBase)
+	rawAdapter := intup.NewPassthrough(m.APIBase, "")
+	forcePassthrough := m.Mode == "passthrough"
 
 	var pool *selector.CredPool
 	if m.CredpoolRef != "" {
@@ -449,26 +488,30 @@ func buildSimpleSelector(m config.ModelEntry, namedPools map[string]*selector.Cr
 		// Inline credpool — backward-compatible path.
 		specs := buildCredSpecsFromPool(m.CredPool, m.AuthStyle, m.ModelName)
 		pool = selector.NewCredPool(selector.CredPoolConfig{
-			Keys:          specs,
-			Upstream:      trans, // kept for inline pools (prober compat)
-			ProviderModel: m.ProviderModel,
-			Strategy:      m.CredPool.Strategy,
-			Threshold:     m.CredPool.CircuitBreakThreshold,
-			Cooldown:      time.Duration(m.CredPool.CooldownSeconds) * time.Second,
-			RateLimitRPM:  m.CredPool.RateLimitRPM,
-			RateSoftLimit: m.CredPool.RateSoftLimit,
-			RateLimitTPM:  m.CredPool.RateLimitTPM,
+			Keys:                specs,
+			Upstream:            trans, // kept for inline pools (prober compat)
+			ProviderModel:       m.ProviderModel,
+			Protocol:            proto,
+			PassthroughUpstream: rawAdapter,
+			ForcePassthrough:    forcePassthrough,
+			Strategy:            m.CredPool.Strategy,
+			Threshold:           m.CredPool.CircuitBreakThreshold,
+			Cooldown:            time.Duration(m.CredPool.CooldownSeconds) * time.Second,
+			RateLimitRPM:        m.CredPool.RateLimitRPM,
+			RateSoftLimit:       m.CredPool.RateSoftLimit,
+			RateLimitTPM:        m.CredPool.RateLimitTPM,
 		})
 		// Inline pool: translator is embedded in the pool, no TargetSelector needed.
 		return pool
 	}
 
-	return selector.NewTargetSelector(pool, trans, m.ProviderModel)
+	return selector.NewTargetSelector(pool, trans, m.ProviderModel, proto, rawAdapter, forcePassthrough)
 }
 
 // buildRoutingSelector handles a routing (multi-provider) model_routes entry.
 func buildRoutingSelector(m config.ModelEntry, namedPools map[string]*selector.CredPool) selector.Selector {
 	inner := make([]selector.Selector, 0, len(m.Routing.Targets))
+	forcePassthrough := m.Mode == "passthrough"
 	for _, t := range m.Routing.Targets {
 		pool, ok := namedPools[t.CredpoolRef]
 		if !ok {
@@ -476,12 +519,15 @@ func buildRoutingSelector(m config.ModelEntry, namedPools map[string]*selector.C
 				"model", m.ModelName, "credpool_ref", t.CredpoolRef)
 			continue
 		}
-		clientProto := m.ClientProtocol
-		if clientProto == "" {
-			clientProto = "anthropic"
-		}
-		trans := buildUpstreamAdapter(t.Protocol, clientProto, m.Mode, t.ProviderModel, t.APIBase)
-		inner = append(inner, selector.NewTargetSelector(pool, trans, t.ProviderModel))
+		trans := buildUpstreamAdapter(t.Protocol, t.ProviderModel, t.APIBase)
+		rawAdapter := intup.NewPassthrough(t.APIBase, "")
+		// Each target's real-vs-passthrough choice is made per request, per
+		// attempt, in dispatchFor — comparing the request's actual client
+		// protocol against t.Protocol. This is what gives a round-robin
+		// routing entry (e.g. gemini/anthropic/openai targets) correct
+		// per-target behavior: transform for the two that differ from the
+		// client's protocol, raw passthrough for the one that matches.
+		inner = append(inner, selector.NewTargetSelector(pool, trans, t.ProviderModel, t.Protocol, rawAdapter, forcePassthrough))
 	}
 	return selector.NewRoutingSelector(m.Routing.Strategy, inner)
 }
@@ -509,6 +555,8 @@ func NewWithTranslators(cfg *config.Config, translators map[string]coreup.Upstre
 	}
 	s := newBase(cfg, "")
 	s.routing.Store(&routingState{selectors: sels, timeouts: timeouts})
+	s.router.UpdateConfig(cfg)
+	s.router.UpdateRouting(&introuter.RoutingTable{Selectors: sels, Timeouts: timeouts})
 
 	probers := make(map[string]*keyProber, len(cfg.ModelRoutes))
 	for _, m := range cfg.ModelRoutes {
@@ -531,6 +579,7 @@ func newBase(cfg *config.Config, cfgPath string) *Server {
 		startProxyCh: make(chan struct{}, 1),
 	}
 	s.cfg.Store(cfg)
+	s.router = introuter.NewBuiltinRouter(s.dispatcher)
 	return s
 }
 
@@ -576,6 +625,13 @@ func (s *Server) registerRoutes(cfg *config.Config) {
 // handleChatCompletions methods.
 func (s *Server) makeHandler(a coredown.DownstreamAdapter) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		rawBody, err := io.ReadAll(r.Body)
+		if err != nil {
+			a.WriteError(w, http.StatusBadRequest, "invalid_request_error", "failed to read request body")
+			return
+		}
+		r.Body = io.NopCloser(bytes.NewReader(rawBody))
+
 		req, err := a.Decode(r)
 		if err != nil {
 			slog.Debug("request decode/validate failed", "proto", a.Protocol(), "error", err)
@@ -594,50 +650,24 @@ func (s *Server) makeHandler(a coredown.DownstreamAdapter) http.HandlerFunc {
 			})
 		}
 
-		cfg := s.cfg.Load()
-		entry, ok := cfg.LookupModel(req.Model)
-		if !ok {
+		target, err := s.router.Route(r.Context(), req.Model)
+		if err != nil {
 			slog.Debug("model not found", "model", req.Model)
 			a.WriteError(w, http.StatusBadRequest, "invalid_request_error",
 				fmt.Sprintf("unknown model %q — see GET /v1/models for available models", req.Model))
 			return
 		}
-		if entry.ModelName != req.Model {
-			slog.Debug("model routed to default", "requested", req.Model, "routed", entry.ModelName)
-		}
 
-		rt := s.routing.Load()
-		sel := rt.selectors[entry.ModelName]
-		providerModel := entry.ProviderModel
-
-		// Passthrough: entry came from LookupModel step 4 (inferred provider).
-		// No pre-built selector exists; use the passthrough selector for the provider.
-		// Forward the original model name to the upstream as-is.
-		if sel == nil && entry.Provider != "" {
-			sel = rt.passthroughSelectors[entry.Provider]
-			if providerModel == "" {
-				providerModel = req.Model
-			}
-		}
-
-		c := pipeline.NewContext(r.Context(), req, router.RouteTarget{
-			Invisible: entry.Invisible,
-			Model: router.ModelInfo{
-				Name:          entry.ModelName,
-				ProviderModel: providerModel,
-				Provider:      entry.Provider,
-			},
-			Selector:   sel,
-			Timeout:    rt.timeouts[entry.ModelName],
-			Dispatcher: s.dispatcher,
-		})
+		c := pipeline.NewContext(r.Context(), req, *target)
+		c.ClientProtocol = a.Protocol()
+		c.RawRequestBody = rawBody
 
 		if err := s.pipe.Run(c); err != nil {
 			var pe *pipeline.PipelineError
 			if errors.As(err, &pe) {
 				slog.Debug("pipeline error", "proto", a.Protocol(),
 					"status", pe.Status, "type", pe.ErrType, "msg", pe.Msg)
-				if pe.RawBody != nil && entry.Invisible {
+				if pe.RawBody != nil && target.Invisible {
 					ct := pe.ContentType
 					if ct == "" {
 						ct = "application/json"
@@ -655,6 +685,14 @@ func (s *Server) makeHandler(a coredown.DownstreamAdapter) http.HandlerFunc {
 			return
 		}
 
+		// Raw passthrough streaming attempt (client and upstream protocols
+		// matched) — relay upstream bytes verbatim, bypassing the canonical
+		// SSEEvent channel entirely; the downstream adapter never reframes.
+		if body, ct, status, ok := c.RawStream(); ok {
+			writeRawStream(w, body, ct, status)
+			c.ReleaseUpstream(nil)
+			return
+		}
 		if c.StreamSrc() != nil {
 			if err := a.WriteStream(r.Context(), w, req, c.StreamSrc()); err != nil {
 				slog.Debug("stream delivery error", "proto", a.Protocol(), "error", err)
@@ -668,7 +706,54 @@ func (s *Server) makeHandler(a coredown.DownstreamAdapter) http.HandlerFunc {
 			a.WriteResponseAsStream(r.Context(), w, c.Response)
 			return
 		}
+		// Raw passthrough non-streaming attempt — write the verbatim upstream
+		// body instead of re-encoding c.Response's other fields.
+		if c.Response != nil && c.Response.RawBody != nil {
+			ct := c.Response.RawContentType
+			if ct == "" {
+				ct = "application/json"
+			}
+			status := c.Response.RawStatus
+			if status == 0 {
+				status = http.StatusOK
+			}
+			w.Header().Set("Content-Type", ct)
+			w.WriteHeader(status)
+			_, _ = w.Write(c.Response.RawBody)
+			return
+		}
 		a.WriteResponse(w, c.Response)
+	}
+}
+
+// writeRawStream relays a raw passthrough upstream stream directly to the
+// client, flushing after every chunk so it behaves like a real SSE stream
+// even though nothing here understands its framing.
+func writeRawStream(w http.ResponseWriter, body io.ReadCloser, contentType string, status int) {
+	defer body.Close()
+	if contentType == "" {
+		contentType = "text/event-stream"
+	}
+	if status == 0 {
+		status = http.StatusOK
+	}
+	w.Header().Set("Content-Type", contentType)
+	w.WriteHeader(status)
+	flusher, _ := w.(http.Flusher)
+	buf := make([]byte, 4096)
+	for {
+		n, err := body.Read(buf)
+		if n > 0 {
+			if _, werr := w.Write(buf[:n]); werr != nil {
+				return
+			}
+			if flusher != nil {
+				flusher.Flush()
+			}
+		}
+		if err != nil {
+			return
+		}
 	}
 }
 
@@ -734,6 +819,12 @@ func (s *Server) Reload() (*ReloadResult, error) {
 	s.routing.Store(newState)
 	s.cfg.Store(newCfg)
 	s.credSourceCancel = newCancelPollers
+	s.router.UpdateConfig(newCfg)
+	s.router.UpdateRouting(&introuter.RoutingTable{
+		Selectors:            newState.selectors,
+		Timeouts:             newState.timeouts,
+		PassthroughSelectors: newState.passthroughSelectors,
+	})
 
 	// Cancel the previous generation's CredSource pollers only after the new
 	// state is live, so there's no gap in health-check freshness.

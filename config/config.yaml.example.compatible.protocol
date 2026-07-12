@@ -53,7 +53,8 @@ providers:
 
   # ── Anthropic-compatible caching relay ────────────────────────────────────
   # A proxy that speaks Anthropic protocol and caches responses.
-  # miroxy detects client_protocol == protocol == anthropic and passthroughs.
+  # miroxy detects a match between the client's actual protocol and this
+  # route's protocol (anthropic) at request time and passthroughs raw bytes.
   # anthropic-relay:
   #   base_url: https://anthropic-cache.internal
   #   protocol: anthropic

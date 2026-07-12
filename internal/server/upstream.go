@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"miroxy/core/selector"
+	coreup "miroxy/core/upstream"
 	intcred "miroxy/internal/cred"
 	"miroxy/internal/idgen"
 	"miroxy/internal/irc"
@@ -54,6 +55,21 @@ func allKeysFailed(modelName, providerModel string, attempts []keyAttempt, invis
 
 // maxRetries caps the retry loop. ErrNoSelection terminates early when all keys are exhausted.
 const maxRetries = 10
+
+// dispatchFor decides, for one retry attempt, whether to dispatch through the
+// target's real IR-transform adapter or its raw-bytes passthrough adapter —
+// comparing the request's actual client protocol (which DownstreamAdapter
+// decoded it, carried on c.ClientProtocol) against this target's static
+// Protocol. Passthrough only fires when PassthroughUpstream was actually
+// built for this target; ctx carries the original request bytes so
+// PassthroughAdapter can forward them verbatim instead of re-marshaling req.
+func dispatchFor(ctx context.Context, plan *selector.ExecutionPlan, clientProtocol string, rawBody []byte) (context.Context, coreup.UpstreamAdapter) {
+	rawEligible := plan.ForcePassthrough || (clientProtocol != "" && clientProtocol == plan.Protocol)
+	if rawEligible && plan.PassthroughUpstream != nil {
+		return coreup.WithRawBody(ctx, rawBody), plan.PassthroughUpstream
+	}
+	return ctx, plan.Upstream
+}
 
 // UpstreamExecutor is the terminal pipeline plugin. It owns the retry loops for
 // both streaming and non-streaming upstream calls, using c.Target.Dispatcher for
@@ -111,13 +127,15 @@ func (e *UpstreamExecutor) executeNonStream(c *pipeline.LLMContext) error {
 		}
 		slog.Debug("upstream key selected", "attempt", attempt+1, "key_id", plan.SelectionID, "model", model.Name)
 
-		upstreamReq, err := plan.Upstream.ToUpstream(ctx, req, plan.Credential)
+		attemptCtx, dispatch := dispatchFor(ctx, plan, c.ClientProtocol, c.RawRequestBody)
+
+		upstreamReq, err := dispatch.ToUpstream(attemptCtx, req, plan.Credential)
 		if err != nil {
 			sel.Release(plan, nil)
 			return &pipeline.PipelineError{Status: http.StatusBadRequest, ErrType: "invalid_request_error", Msg: err.Error()}
 		}
 
-		resp, err := c.Target.Dispatcher.Do(ctx, upstreamReq)
+		resp, err := c.Target.Dispatcher.Do(attemptCtx, upstreamReq)
 		if err != nil {
 			sel.Release(plan, err)
 			attempts = append(attempts, keyAttempt{keyID: plan.SelectionID, status: http.StatusBadGateway, msg: err.Error()})
@@ -141,7 +159,7 @@ func (e *UpstreamExecutor) executeNonStream(c *pipeline.LLMContext) error {
 			continue
 		}
 
-		anthropicResp, err := plan.Upstream.FromUpstream(resp)
+		anthropicResp, err := dispatch.FromUpstream(resp)
 		if err != nil {
 			var upstreamErr *irc.UpstreamError
 			if errors.As(err, &upstreamErr) {
@@ -218,6 +236,7 @@ func (e *UpstreamExecutor) executeStream(c *pipeline.LLMContext) error {
 
 	var (
 		plan     *selector.ExecutionPlan
+		dispatch coreup.UpstreamAdapter
 		resp     *http.Response
 		attempts []keyAttempt
 	)
@@ -237,14 +256,16 @@ func (e *UpstreamExecutor) executeStream(c *pipeline.LLMContext) error {
 		}
 		slog.Debug("stream key selected", "attempt", attempt+1, "key_id", p.SelectionID, "model", model.Name)
 
-		upstreamReq, err := p.Upstream.ToUpstreamStream(ctx, req, p.Credential)
+		attemptCtx, d := dispatchFor(ctx, p, c.ClientProtocol, c.RawRequestBody)
+
+		upstreamReq, err := d.ToUpstreamStream(attemptCtx, req, p.Credential)
 		if err != nil {
 			sel.Release(p, nil)
 			cancel()
 			return &pipeline.PipelineError{Status: http.StatusBadRequest, ErrType: "invalid_request_error", Msg: err.Error()}
 		}
 
-		upstreamResp, err := c.Target.Dispatcher.Do(ctx, upstreamReq)
+		upstreamResp, err := c.Target.Dispatcher.Do(attemptCtx, upstreamReq)
 		if err != nil {
 			sel.Release(p, err)
 			attempts = append(attempts, keyAttempt{keyID: p.SelectionID, status: http.StatusBadGateway, msg: err.Error()})
@@ -286,6 +307,7 @@ func (e *UpstreamExecutor) executeStream(c *pipeline.LLMContext) error {
 		}
 
 		plan = p
+		dispatch = d
 		resp = upstreamResp
 		break
 	}
@@ -297,7 +319,18 @@ func (e *UpstreamExecutor) executeStream(c *pipeline.LLMContext) error {
 
 	msgID := idgen.NewMsgID()
 	slog.Debug("stream starting", "model", req.Model, "key_id", plan.SelectionID, "msg_id", msgID)
-	events, _ := plan.Upstream.StreamFromUpstream(ctx, resp, msgID, req.Model)
+
+	// Raw passthrough attempt: relay upstream stream bytes verbatim instead of
+	// decoding into the canonical SSEEvent channel — see dispatchFor.
+	if plan.PassthroughUpstream != nil && dispatch == plan.PassthroughUpstream {
+		c.SetRawStream(resp.Body, resp.Header.Get("Content-Type"), resp.StatusCode, func(streamErr error) {
+			sel.Release(plan, streamErr)
+			cancel()
+		})
+		return nil
+	}
+
+	events, _ := dispatch.StreamFromUpstream(ctx, resp, msgID, req.Model)
 	if e.stats != nil {
 		var tr tokenRecorder
 		if r, ok := sel.(tokenRecorder); ok {
