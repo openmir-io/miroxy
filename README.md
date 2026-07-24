@@ -1,5 +1,5 @@
 # Miroxy
-
+Inspired by LiteLLM, CC-Switch, 9Router, OmniRoute,etc.
 Miroxy is an Go version LLM API gateway based on [OpenMIR](https://github.com/openmir-io/openmir-spec). It accepts requests from any LLM Client and routes to any upstream providers
 Gemini, OpenAI, DeepSeek, Anthropic, GLM, Grok, and AWS Bedrock — behind a
 single endpoint. It manages API key pools (rotation, rate-limit backoff,
