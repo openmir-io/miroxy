@@ -299,6 +299,7 @@ launching `claude`):
 
 Then run `/model` inside Claude Code and pick any `claude-<model_name>`
 entry.
+![Example](docs/images/claude-miroxy-models.png)
 
 ### Codex
 

@@ -6,5 +6,5 @@ config/secrets.env
 /miroxy
 build/
 
-achive/
+archive/
 CLAUDE.md
