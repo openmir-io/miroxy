@@ -17,6 +17,7 @@ import (
 	"miroxy/core/cred"
 	"miroxy/core/dispatch"
 	coredown "miroxy/core/downstream"
+	"miroxy/core/ir"
 	"miroxy/core/rpc"
 	"miroxy/core/selector"
 	coreup "miroxy/core/upstream"
@@ -91,6 +92,14 @@ type Server struct {
 	// Warden isn't reload-aware, so unlike credSourceCancel this has a
 	// simple 1:1 lifetime with the process, not a per-generation one.
 	wardenFlushCancel context.CancelFunc
+
+	// tokenFlushCancel/compressFlushCancel are the same pattern as
+	// wardenFlushCancel, for token-usage and compression stats respectively.
+	// tokenStats is always active (unconditional in newBase), so its flush
+	// loop only depends on local_state being enabled; compressStats is nil
+	// unless compress.enabled is set too.
+	tokenFlushCancel    context.CancelFunc
+	compressFlushCancel context.CancelFunc
 }
 
 // credentialFromConfig wraps a raw key into the appropriate typed Credential.
@@ -115,14 +124,19 @@ func buildCredSpecsFromPool(kp config.CredPoolCfg, authStyle, poolName string) [
 	}
 	specs := make([]selector.CredSpec, 0, len(kp.Keys))
 	for _, k := range kp.Keys {
+		// validateConfig already warned and counted this key as unusable —
+		// skip it here too so an empty credential never reaches Select().
+		if !k.IsUsable(authStyle) {
+			continue
+		}
 		var src selector.CredentialSource
 		switch {
 		case kp.Type == "oauth_refresh":
 			src = intcred.NewOAuthSource(kp.ClientID, kp.ClientSecret, k.Key)
 		case authStyle == "sigv4":
-			// Static: SigV4Credential.Apply is intentionally unimplemented
-			// pending an SDKDispatcher (see core/cred/credential.go) — this
-			// wires the config → object model, not request dispatch itself.
+			// SigV4Credential.Apply signs the request in place (see
+			// core/cred/credential.go) — no AWS SDK or separate dispatch
+			// path involved.
 			src = selector.NewStaticSource(&cred.SigV4Credential{
 				AccessKeyID:     k.AccessKeyID,
 				SecretAccessKey: k.SecretAccessKey,
@@ -171,37 +185,19 @@ func newCredPool(
 		specs = append(specs, selector.CredSpec{Name: "credsource:" + poolName, Source: cs})
 	}
 	pool := selector.NewCredPool(selector.CredPoolConfig{
-		Keys:          specs,
-		Strategy:      kp.Strategy,
-		Threshold:     kp.CircuitBreakThreshold,
-		Cooldown:      time.Duration(kp.CooldownSeconds) * time.Second,
-		RateLimitRPM:  kp.RateLimitRPM,
-		RateSoftLimit: kp.RateSoftLimit,
-		RateLimitTPM:  kp.RateLimitTPM,
+		Name:            poolName,
+		Keys:            specs,
+		Strategy:        kp.Strategy,
+		Threshold:       kp.CircuitBreakThreshold,
+		Cooldown:        time.Duration(kp.CooldownSeconds) * time.Second,
+		RateLimitRPM:    kp.RateLimitRPM,
+		RateSoftLimit:   kp.RateSoftLimit,
+		RateLimitTPM:    kp.RateLimitTPM,
+		Sticky:          kp.Sticky,
+		StickyTTL:       time.Duration(kp.StickyTTLSeconds) * time.Second,
+		RoundRobinBatch: kp.RoundRobinBatchSize,
 	})
 	return pool, usage
-}
-
-// buildUpstreamAdapter creates the real IR-transform adapter for the given
-// upstream protocol and model. The client-protocol/passthrough decision no
-// longer happens here — see dispatchFor in upstream.go, which compares each
-// request's actual (dynamically-detected) client protocol against the
-// target's static protocol at dispatch time, per attempt.
-func buildUpstreamAdapter(proto, upstreamModel, apiBase string) coreup.UpstreamAdapter {
-	switch proto {
-	case "anthropic":
-		return intup.NewAnthropicUpstream(upstreamModel, apiBase)
-	case "openai":
-		return intup.NewOpenAI(upstreamModel, apiBase)
-	case "deepseek":
-		return intup.NewDeepSeek(upstreamModel, apiBase)
-	case "grok":
-		return intup.NewGrok(upstreamModel, apiBase)
-	case "glm":
-		return intup.NewGLM(upstreamModel, apiBase)
-	default: // "gemini" or empty
-		return intup.NewGeminiWithConfig(upstreamModel, apiBase)
-	}
 }
 
 // resolveProto resolves the effective outgoing protocol for a model entry.
@@ -213,26 +209,20 @@ func resolveProto(m config.ModelEntry) (proto string) {
 	return proto
 }
 
-// namedPoolAuthStyle infers the auth_style for a named pool by scanning model
-// entries and routing targets that reference it. Returns "bearer" as default.
+// namedPoolAuthStyle returns a named pool's auth_style, resolved by
+// resolveProviders from its provider_ref. Returns "bearer" as a defensive
+// default for a pool that somehow has neither (shouldn't happen for a
+// config that passed validateConfig).
 func namedPoolAuthStyle(poolName string, cfg *config.Config) string {
 	if kp, ok := cfg.CredPools[poolName]; ok && kp.AuthStyle != "" {
 		return kp.AuthStyle
 	}
-	for _, m := range cfg.ModelRoutes {
-		if m.Routing != nil {
-			for _, t := range m.Routing.Targets {
-				if t.CredpoolRef == poolName && t.AuthStyle != "" {
-					return t.AuthStyle
-				}
-			}
-			continue
-		}
-		if m.CredpoolRef == poolName && m.AuthStyle != "" {
-			return m.AuthStyle
-		}
-	}
 	return "bearer"
+}
+
+// namedPoolProvider returns a named credpool's provider_ref, or "" if unset.
+func namedPoolProvider(poolName string, cfg *config.Config) string {
+	return cfg.CredPools[poolName].ProviderRef
 }
 
 // buildRoutingState builds selectors and timeouts from a config.
@@ -272,34 +262,42 @@ func buildRoutingState(cfg *config.Config, localStore *localstate.Store) (*routi
 		timeouts[m.ModelName] = modelTimeout(m)
 	}
 
-	// Build passthrough selectors from credpools whose upstream provider family
-	// is known — either an explicit upstream_model_type tag, or derived from
-	// how model_routes already reference the pool (cfg.CredpoolFamilies; see
-	// resolveCredpoolFamilies). These handle models that are not in
-	// model_routes: the client's model name is forwarded as-is to the
-	// upstream provider (e.g. claude-opus-4-8 → Anthropic, gpt-5.4 → OpenAI).
+	// Build native-vendor passthrough selectors: credpools that opted in via
+	// native_passthrough: true serve requests for a model name that is
+	// globally unique to one vendor (claude-*/gpt-*/gemini-*) but matched no
+	// model_routes entry — see LookupModel step 4. Gated by the root
+	// native_passthrough_enable switch so a client's default model picker
+	// can't silently reach real vendor credentials unless the operator
+	// explicitly turns this on. Multiple pools for the same protocol are
+	// grouped under one round-robin RoutingSelector.
 	passthrough := make(map[string]selector.Selector)
-	for poolName := range cfg.CredPools {
-		family := cfg.CredpoolFamilies[poolName]
-		if family == "" {
-			continue
+	if cfg.NativePassthroughEnable {
+		byProtocol := make(map[string][]selector.Selector)
+		for poolName, kp := range cfg.CredPools {
+			if !kp.NativePassthrough {
+				continue
+			}
+			pool, ok := namedPools[poolName]
+			if !ok {
+				continue
+			}
+			// "passthrough" here means the client's raw model name is
+			// forwarded as-is (no model_routes entry matched it) — unrelated
+			// to protocol passthrough. The real-vs-raw protocol decision is
+			// still made per request in dispatchFor, same as every other
+			// target.
+			upstream := intup.Get(kp.Protocol, "", kp.APIBase)
+			rawEndpoint, rawStreamEndpoint := intup.PassthroughEndpoints(kp.Protocol, "", kp.APIBase)
+			rawAdapter := intup.NewPassthrough(rawEndpoint, rawStreamEndpoint, "")
+			byProtocol[kp.Protocol] = append(byProtocol[kp.Protocol], selector.NewTargetSelector(pool, upstream, "", kp.Protocol, rawAdapter, false))
+			slog.Info("native passthrough pool registered", "protocol", kp.Protocol, "pool", poolName)
 		}
-		pool, ok := namedPools[poolName]
-		if !ok {
-			continue
+		for protocol, sels := range byProtocol {
+			passthrough[protocol] = selector.NewRoutingSelector(selector.RoutingSelectorConfig{
+				Strategy:  "round_robin",
+				Selectors: sels,
+			})
 		}
-		var apiBase string
-		if p, exists := cfg.Providers[family]; exists {
-			apiBase = p.BaseURL
-		}
-		// "passthrough" here means the client's raw model name is forwarded
-		// as-is (no model_routes entry matched it) — unrelated to protocol
-		// passthrough. The real-vs-raw protocol decision is still made per
-		// request in dispatchFor, same as every other target.
-		upstream := buildUpstreamAdapter(family, "", apiBase)
-		rawAdapter := intup.NewPassthrough(apiBase, "")
-		passthrough[family] = selector.NewTargetSelector(pool, upstream, "", family, rawAdapter, false)
-		slog.Info("passthrough selector built", "provider", family, "pool", poolName)
 	}
 
 	return &routingState{selectors: sels, timeouts: timeouts, passthroughSelectors: passthrough, usageAcc: usageAcc}, cancelPollers
@@ -326,6 +324,14 @@ func New(cfg *config.Config, cfgPath string) *Server {
 	}
 
 	s.localStateStore = openLocalStateStore(cfg)
+	if s.localStateStore != nil {
+		if persisted, ok := s.localStateStore.LoadTokenStats(); ok {
+			s.tokenStats.Restore(tokenStatsFromPersisted(persisted))
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		startTokenStatsFlushLoop(ctx, s.tokenStats, s.localStateStore)
+		s.tokenFlushCancel = cancel
+	}
 
 	rt, cancelPollers := buildRoutingState(cfg, s.localStateStore)
 	s.routing.Store(rt)
@@ -354,9 +360,14 @@ func New(cfg *config.Config, cfgPath string) *Server {
 		}
 	}
 	if cfg.Compress.Enabled {
-		cp, cs := buildCompressPlugin(&cfg.Compress)
+		cp, cs := buildCompressPlugin(&cfg.Compress, s.localStateStore)
 		s.compressStats = cs
 		plugins = append([]pipeline.Plugin{cp}, plugins...)
+		if s.localStateStore != nil {
+			ctx, cancel := context.WithCancel(context.Background())
+			startCompressStatsFlushLoop(ctx, cs, s.localStateStore)
+			s.compressFlushCancel = cancel
+		}
 	}
 	// CommandPlugin runs at priority 5 (before everything else).
 	cmdCfg := pipeline.CommandConfig{Disabled: cfg.Server.Commands.Disabled, AllowDump: cfg.Server.Commands.AllowDump}
@@ -387,7 +398,7 @@ func openLocalStateStore(cfg *config.Config) *localstate.Store {
 	if path == "" {
 		path = "./miroxy-local-state.db"
 	}
-	slog.Info("local_state enabled — credential health and warden stats will be cached to disk", "path", path)
+	slog.Info("local_state enabled — credential health, warden, token, and compression stats will be cached to disk", "path", path)
 	return localstate.Open(path)
 }
 
@@ -452,7 +463,12 @@ func loadHealthSnapshot(store *localstate.Store, poolName string) map[string]sel
 }
 
 // buildCompressPlugin constructs a CompressPlugin from the config block.
-func buildCompressPlugin(cfg *config.CompressConfig) (*compress.CompressPlugin, *ccomp.Stats) {
+// buildCompressPlugin constructs a CompressPlugin from the config block. A
+// fresh BuiltinCompressor+Stats is built each call. When store is non-nil, a
+// prior run's persisted counters are restored before the plugin/stats are
+// returned — before any request can reach them, same contract as
+// buildWardenPlugin.
+func buildCompressPlugin(cfg *config.CompressConfig, store *localstate.Store) (*compress.CompressPlugin, *ccomp.Stats) {
 	bc := compress.BuiltinConfig{
 		ToolResultBudget: cfg.ToolResultBudget,
 		TotalBudget:      cfg.TotalBudget,
@@ -461,7 +477,14 @@ func buildCompressPlugin(cfg *config.CompressConfig) (*compress.CompressPlugin, 
 		CCR:              compress.NewMemCCRStore(), // bbolt: swap when CCRPath != ""
 	}
 	comp := compress.NewBuiltinCompressor(bc)
-	return compress.NewCompressPlugin(comp, cfg.Threshold), comp.Stats()
+	stats := comp.Stats()
+	if store != nil {
+		if persisted, ok := store.LoadCompressStats(); ok {
+			stats.Restore(persisted.TotalRequests, persisted.TotalOriginal, persisted.TotalCompressed,
+				compressModelsFromPersisted(persisted.Models))
+		}
+	}
+	return compress.NewCompressPlugin(comp, cfg.Threshold), stats
 }
 
 // buildWardenPlugin constructs a WardenPlugin from the config block. A
@@ -550,6 +573,110 @@ func flushWardenStats(ws *intwarden.Stats, store *localstate.Store) {
 	}
 }
 
+// tokenStatsFromPersisted converts the on-disk shape to the argument list
+// Registry.Restore expects.
+func tokenStatsFromPersisted(p localstate.TokenStats) (totalIn, totalOut, totalReq int64, models []stats.ModelSnapshot) {
+	models = make([]stats.ModelSnapshot, 0, len(p.Models))
+	for _, m := range p.Models {
+		pools := make([]stats.PoolSnapshot, 0, len(m.Pools))
+		for _, pl := range m.Pools {
+			keys := make([]stats.KeySnapshot, 0, len(pl.Keys))
+			for _, k := range pl.Keys {
+				keys = append(keys, stats.KeySnapshot{Name: k.Name, Input: k.Input, Output: k.Output, Requests: k.Requests})
+			}
+			pools = append(pools, stats.PoolSnapshot{Name: pl.Name, Input: pl.Input, Output: pl.Output, Requests: pl.Requests, Keys: keys})
+		}
+		models = append(models, stats.ModelSnapshot{Name: m.Name, Input: m.Input, Output: m.Output, Requests: m.Requests, Pools: pools})
+	}
+	return p.TotalInput, p.TotalOutput, p.TotalRequests, models
+}
+
+// startTokenStatsFlushLoop persists reg's counters to store every
+// healthSnapshotInterval, plus once more when ctx is cancelled — same
+// cadence/shutdown contract as startWardenStatsFlushLoop. tokenStats is
+// always active (unconditional in newBase), so this loop's only gate is
+// local_state being enabled, not any feature flag.
+func startTokenStatsFlushLoop(ctx context.Context, reg *stats.Registry, store *localstate.Store) {
+	go func() {
+		ticker := time.NewTicker(healthSnapshotInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				flushTokenStats(reg, store)
+			case <-ctx.Done():
+				flushTokenStats(reg, store)
+				return
+			}
+		}
+	}()
+}
+
+func flushTokenStats(reg *stats.Registry, store *localstate.Store) {
+	totalIn, totalOut, totalReq, models := reg.Snapshot()
+	lsModels := make([]localstate.TokenModelStats, 0, len(models))
+	for _, m := range models {
+		pools := make([]localstate.TokenPoolStats, 0, len(m.Pools))
+		for _, p := range m.Pools {
+			keys := make([]localstate.TokenKeyStats, 0, len(p.Keys))
+			for _, k := range p.Keys {
+				keys = append(keys, localstate.TokenKeyStats{Name: k.Name, Input: k.Input, Output: k.Output, Requests: k.Requests})
+			}
+			pools = append(pools, localstate.TokenPoolStats{Name: p.Name, Input: p.Input, Output: p.Output, Requests: p.Requests, Keys: keys})
+		}
+		lsModels = append(lsModels, localstate.TokenModelStats{Name: m.Name, Input: m.Input, Output: m.Output, Requests: m.Requests, Pools: pools})
+	}
+	if err := store.SaveTokenStats(localstate.TokenStats{
+		TotalInput: totalIn, TotalOutput: totalOut, TotalRequests: totalReq, Models: lsModels,
+	}); err != nil {
+		slog.Warn("token stats: failed to flush to local_state", "error", err)
+	}
+}
+
+// compressModelsFromPersisted converts the on-disk per-model shape to the
+// argument list ccomp.Stats.Restore expects.
+func compressModelsFromPersisted(models []localstate.CompressModelStats) []ccomp.ModelSnapshot {
+	out := make([]ccomp.ModelSnapshot, 0, len(models))
+	for _, m := range models {
+		out = append(out, ccomp.ModelSnapshot{
+			Name: m.Name, Requests: m.Requests, OriginalTokens: m.OriginalTokens, CompressedTokens: m.CompressedTokens,
+		})
+	}
+	return out
+}
+
+// startCompressStatsFlushLoop mirrors startTokenStatsFlushLoop for cs.
+func startCompressStatsFlushLoop(ctx context.Context, cs *ccomp.Stats, store *localstate.Store) {
+	go func() {
+		ticker := time.NewTicker(healthSnapshotInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				flushCompressStats(cs, store)
+			case <-ctx.Done():
+				flushCompressStats(cs, store)
+				return
+			}
+		}
+	}()
+}
+
+func flushCompressStats(cs *ccomp.Stats, store *localstate.Store) {
+	snap := cs.Snapshot()
+	models := make([]localstate.CompressModelStats, 0, len(snap.Models))
+	for _, m := range snap.Models {
+		models = append(models, localstate.CompressModelStats{
+			Name: m.Name, Requests: m.Requests, OriginalTokens: m.OriginalTokens, CompressedTokens: m.CompressedTokens,
+		})
+	}
+	if err := store.SaveCompressStats(localstate.CompressStats{
+		TotalRequests: snap.Requests, TotalOriginal: snap.OriginalTokens, TotalCompressed: snap.CompressedTokens, Models: models,
+	}); err != nil {
+		slog.Warn("compress stats: failed to flush to local_state", "error", err)
+	}
+}
+
 // buildModelSelector creates the Selector for one model_routes entry.
 func buildModelSelector(m config.ModelEntry, namedPools map[string]*selector.CredPool, cfg *config.Config) selector.Selector {
 	if m.Routing != nil {
@@ -561,8 +688,9 @@ func buildModelSelector(m config.ModelEntry, namedPools map[string]*selector.Cre
 // buildSimpleSelector handles a simple (single-provider) model_routes entry.
 func buildSimpleSelector(m config.ModelEntry, namedPools map[string]*selector.CredPool, cfg *config.Config) selector.Selector {
 	proto := resolveProto(m)
-	trans := buildUpstreamAdapter(proto, m.UpstreamModel, m.APIBase)
-	rawAdapter := intup.NewPassthrough(m.APIBase, "")
+	trans := intup.Get(proto, m.UpstreamModel, m.APIBase)
+	rawEndpoint, rawStreamEndpoint := intup.PassthroughEndpoints(proto, m.UpstreamModel, m.APIBase)
+	rawAdapter := intup.NewPassthrough(rawEndpoint, rawStreamEndpoint, m.UpstreamModel)
 	forcePassthrough := m.Mode == "passthrough"
 
 	var pool *selector.CredPool
@@ -572,6 +700,7 @@ func buildSimpleSelector(m config.ModelEntry, namedPools map[string]*selector.Cr
 		// Inline credpool — backward-compatible path.
 		specs := buildCredSpecsFromPool(m.CredPool, m.AuthStyle, m.ModelName)
 		pool = selector.NewCredPool(selector.CredPoolConfig{
+			Name:                m.ModelName,
 			Keys:                specs,
 			Upstream:            trans, // kept for inline pools (prober compat)
 			UpstreamModel:       m.UpstreamModel,
@@ -584,6 +713,9 @@ func buildSimpleSelector(m config.ModelEntry, namedPools map[string]*selector.Cr
 			RateLimitRPM:        m.CredPool.RateLimitRPM,
 			RateSoftLimit:       m.CredPool.RateSoftLimit,
 			RateLimitTPM:        m.CredPool.RateLimitTPM,
+			Sticky:              m.CredPool.Sticky,
+			StickyTTL:           time.Duration(m.CredPool.StickyTTLSeconds) * time.Second,
+			RoundRobinBatch:     m.CredPool.RoundRobinBatchSize,
 		})
 		// Inline pool: translator is embedded in the pool, no TargetSelector needed.
 		return pool
@@ -603,8 +735,9 @@ func buildRoutingSelector(m config.ModelEntry, namedPools map[string]*selector.C
 				"model", m.ModelName, "credpool_ref", t.CredpoolRef)
 			continue
 		}
-		trans := buildUpstreamAdapter(t.Protocol, t.UpstreamModel, t.APIBase)
-		rawAdapter := intup.NewPassthrough(t.APIBase, "")
+		trans := intup.Get(t.Protocol, t.UpstreamModel, t.APIBase)
+		rawEndpoint, rawStreamEndpoint := intup.PassthroughEndpoints(t.Protocol, t.UpstreamModel, t.APIBase)
+		rawAdapter := intup.NewPassthrough(rawEndpoint, rawStreamEndpoint, t.UpstreamModel)
 		// Each target's real-vs-passthrough choice is made per request, per
 		// attempt, in dispatchFor — comparing the request's actual client
 		// protocol against t.Protocol. This is what gives a round-robin
@@ -613,7 +746,12 @@ func buildRoutingSelector(m config.ModelEntry, namedPools map[string]*selector.C
 		// client's protocol, raw passthrough for the one that matches.
 		inner = append(inner, selector.NewTargetSelector(pool, trans, t.UpstreamModel, t.Protocol, rawAdapter, forcePassthrough))
 	}
-	return selector.NewRoutingSelector(m.Routing.Strategy, inner)
+	return selector.NewRoutingSelector(selector.RoutingSelectorConfig{
+		Strategy:  m.Routing.Strategy,
+		Selectors: inner,
+		Sticky:    m.Routing.Sticky,
+		StickyTTL: time.Duration(m.Routing.StickyTTLSeconds) * time.Second,
+	})
 }
 
 // NewWithTranslators creates a Server with caller-supplied translators (integration tests).
@@ -624,15 +762,19 @@ func NewWithTranslators(cfg *config.Config, translators map[string]coreup.Upstre
 		trans := translators[m.ModelName]
 		specs := buildCredSpecsFromPool(m.CredPool, m.AuthStyle, m.ModelName)
 		pool := selector.NewCredPool(selector.CredPoolConfig{
-			Keys:          specs,
-			Upstream:      trans,
-			UpstreamModel: m.UpstreamModel,
-			Strategy:      m.CredPool.Strategy,
-			Threshold:     m.CredPool.CircuitBreakThreshold,
-			Cooldown:      time.Duration(m.CredPool.CooldownSeconds) * time.Second,
-			RateLimitRPM:  m.CredPool.RateLimitRPM,
-			RateSoftLimit: m.CredPool.RateSoftLimit,
-			RateLimitTPM:  m.CredPool.RateLimitTPM,
+			Name:            m.ModelName,
+			Keys:            specs,
+			Upstream:        trans,
+			UpstreamModel:   m.UpstreamModel,
+			Strategy:        m.CredPool.Strategy,
+			Threshold:       m.CredPool.CircuitBreakThreshold,
+			Cooldown:        time.Duration(m.CredPool.CooldownSeconds) * time.Second,
+			RateLimitRPM:    m.CredPool.RateLimitRPM,
+			RateSoftLimit:   m.CredPool.RateSoftLimit,
+			RateLimitTPM:    m.CredPool.RateLimitTPM,
+			Sticky:          m.CredPool.Sticky,
+			StickyTTL:       time.Duration(m.CredPool.StickyTTLSeconds) * time.Second,
+			RoundRobinBatch: m.CredPool.RoundRobinBatchSize,
 		})
 		sels[m.ModelName] = pool
 		timeouts[m.ModelName] = modelTimeout(m)
@@ -667,27 +809,17 @@ func newBase(cfg *config.Config, cfgPath string) *Server {
 	return s
 }
 
-// defaultAdapters returns the built-in downstream protocol adapters.
-// Adding a new client protocol = add one entry here (and write the adapter file).
-func defaultAdapters() []coredown.DownstreamAdapter {
-	return []coredown.DownstreamAdapter{
-		&intdown.AnthropicAdapter{},
-		&intdown.OpenAIAdapter{},    // POST /v1/chat/completions
-		&intdown.ResponsesAdapter{}, // POST /v1/responses — Codex CLI (wire_api=responses)
-	}
-}
-
 // registerRoutes wires HTTP endpoints.  Each DownstreamAdapter registers its
 // own path; adding a new client protocol requires no changes here.
 func (s *Server) registerRoutes(cfg *config.Config) {
 	authMW := auth.NewValidator(cfg.Auth.AllowedKeys).Middleware
 
-	for _, a := range defaultAdapters() {
+	for _, a := range intdown.DefaultAdapters() {
 		a := a // capture
-		s.mux.Handle("POST "+a.Path(), authMW(http.HandlerFunc(s.makeHandler(a))))
+		s.handleWithBareAlias(authMW, "POST", a.Path(), s.makeHandler(a))
 	}
 
-	s.mux.Handle("GET /v1/models", authMW(http.HandlerFunc(s.handleModels)))
+	s.handleWithBareAlias(authMW, "GET", "/v1/models", s.handleModels)
 	s.mux.HandleFunc("GET /health", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	})
@@ -700,6 +832,19 @@ func (s *Server) registerRoutes(cfg *config.Config) {
 			w.Header().Set("Content-Type", "text/plain")
 			fmt.Fprintln(w, "# metrics stub — Prometheus integration coming in metrics phase")
 		})
+	}
+}
+
+// handleWithBareAlias registers fn (wrapped by mw) at path, and — when path
+// starts with /v1 — also at the same path with that prefix stripped. Some
+// OpenAI-compatible clients/tools construct the URL as base_url+"/chat/
+// completions" without including /v1 in base_url; accepting both means a
+// client that gets this detail wrong still works instead of a bare 404.
+func (s *Server) handleWithBareAlias(mw func(http.Handler) http.Handler, method, path string, fn http.HandlerFunc) {
+	handler := mw(fn)
+	s.mux.Handle(method+" "+path, handler)
+	if bare, ok := strings.CutPrefix(path, "/v1"); ok && bare != "" {
+		s.mux.Handle(method+" "+bare, handler)
 	}
 }
 
@@ -716,35 +861,37 @@ func (s *Server) makeHandler(a coredown.DownstreamAdapter) http.HandlerFunc {
 		}
 		r.Body = io.NopCloser(bytes.NewReader(rawBody))
 
-		req, err := a.Decode(r)
+		req, model, err := a.Decode(r)
 		if err != nil {
 			slog.Debug("request decode/validate failed", "proto", a.Protocol(), "error", err)
 			a.WriteError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
 			return
 		}
 		slog.Debug("request decoded", "proto", a.Protocol(),
-			"model", req.Model, "stream", req.Stream, "messages", len(req.Messages))
+			"model", model, "stream", req.Stream, "messages", len(req.Messages))
 		// Dump raw_request (what the client sent, before pipeline processing).
 		if b, err2 := dumpRequest(req); err2 == nil {
 			dump.WriteIfEnabled(r.Context(), dump.Record{
 				Dir:      dump.DirRawRequest,
 				Protocol: a.Protocol(),
-				Model:    req.Model,
+				Model:    model,
 				Body:     b,
 			})
 		}
 
-		target, err := s.router.Route(r.Context(), req.Model)
+		target, err := s.router.Route(r.Context(), model)
 		if err != nil {
-			slog.Debug("model not found", "model", req.Model)
+			slog.Debug("model not found", "model", model)
 			a.WriteError(w, http.StatusBadRequest, "invalid_request_error",
-				fmt.Sprintf("unknown model %q — see GET /v1/models for available models", req.Model))
+				fmt.Sprintf("unknown model %q — see GET /v1/models for available models", model))
 			return
 		}
 
-		c := pipeline.NewContext(r.Context(), req, *target)
+		c := pipeline.NewContext(r.Context(), req, model, *target)
 		c.ClientProtocol = a.Protocol()
 		c.RawRequestBody = rawBody
+		c.RawRequestHeaders = r.Header.Clone()
+		c.EncodeRequest = func(req *ir.IRRequest) ([]byte, error) { return a.EncodeRequest(req, c.ClientModel) }
 
 		if err := s.pipe.Run(c); err != nil {
 			var pe *pipeline.PipelineError
@@ -771,42 +918,41 @@ func (s *Server) makeHandler(a coredown.DownstreamAdapter) http.HandlerFunc {
 
 		// Raw passthrough streaming attempt (client and upstream protocols
 		// matched) — relay upstream bytes verbatim, bypassing the canonical
-		// SSEEvent channel entirely; the downstream adapter never reframes.
+		// IR stream-event channel entirely; the downstream adapter never reframes.
 		if body, ct, status, ok := c.RawStream(); ok {
 			writeRawStream(w, body, ct, status)
 			c.ReleaseUpstream(nil)
 			return
 		}
 		if c.StreamSrc() != nil {
-			if err := a.WriteStream(r.Context(), w, req, c.StreamSrc()); err != nil {
+			if err := a.WriteStream(r.Context(), w, c.ClientModel, c.StreamSrc()); err != nil {
 				slog.Debug("stream delivery error", "proto", a.Protocol(), "error", err)
 			}
 			c.ReleaseUpstream(nil)
 			return
 		}
+		msgID := idgen.NewMsgID()
 		// Pipeline short-circuited with a sync response (e.g. CommandPlugin) but
 		// the client requested streaming — delegate format to the adapter.
 		if req.Stream {
-			a.WriteResponseAsStream(r.Context(), w, c.Response)
+			a.WriteResponseAsStream(r.Context(), w, c.Response, msgID, c.ClientModel)
 			return
 		}
 		// Raw passthrough non-streaming attempt — write the verbatim upstream
 		// body instead of re-encoding c.Response's other fields.
-		if c.Response != nil && c.Response.RawBody != nil {
-			ct := c.Response.RawContentType
+		if body, ct, status, ok := c.RawResponse(); ok {
 			if ct == "" {
 				ct = "application/json"
 			}
-			status := c.Response.RawStatus
 			if status == 0 {
 				status = http.StatusOK
 			}
 			w.Header().Set("Content-Type", ct)
 			w.WriteHeader(status)
-			_, _ = w.Write(c.Response.RawBody)
+			_, _ = w.Write(body)
 			return
 		}
-		a.WriteResponse(w, c.Response)
+		a.WriteResponse(w, c.Response, msgID, c.ClientModel)
 	}
 }
 
@@ -933,6 +1079,12 @@ func (s *Server) Close() {
 	}
 	if s.wardenFlushCancel != nil {
 		s.wardenFlushCancel()
+	}
+	if s.tokenFlushCancel != nil {
+		s.tokenFlushCancel()
+	}
+	if s.compressFlushCancel != nil {
+		s.compressFlushCancel()
 	}
 	// The health-snapshot/warden-stats loops' final flush (triggered by the
 	// cancels above) runs in its own goroutine and may not finish before
@@ -1111,6 +1263,6 @@ func (s *Server) ReloadText() (string, error) {
 }
 
 // dumpRequest serialises a MessageRequest to JSON for dump capture.
-func dumpRequest(req *types.MessageRequest) ([]byte, error) {
+func dumpRequest(req *ir.IRRequest) ([]byte, error) {
 	return json.Marshal(req)
 }

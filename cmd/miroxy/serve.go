@@ -27,8 +27,7 @@ admin port for management commands (miroxy stat, health, reload).
 
 Config is read from the path given by -c / --config. Env vars referenced
 as ${VAR} in the config file are expanded at load time.`,
-	Example: `  miroxy serve
-  miroxy serve -c /etc/miroxy/config.yaml
+	Example: `  miroxy serve -c config.yaml
   miroxy serve --port 9090 --admin-port 9091`,
 	RunE: runServe,
 }

@@ -14,6 +14,7 @@ const (
 	EvTextDelta         StreamEventKind = "text_delta"
 	EvToolCallStart     StreamEventKind = "tool_call_start"
 	EvToolCallDelta     StreamEventKind = "tool_call_delta"
+	EvReasoningDelta    StreamEventKind = "reasoning_delta"
 	EvContentBlockEnd   StreamEventKind = "content_block_end"
 	EvFinish            StreamEventKind = "finish"
 	EvUsage             StreamEventKind = "usage"
@@ -29,6 +30,7 @@ type StreamEvent struct {
 	TextDelta         *TextDelta
 	ToolCallStart     *ToolCallStart
 	ToolCallDelta     *ToolCallDelta
+	ReasoningDelta    *ReasoningDelta
 	ContentBlockEnd   *ContentBlockEnd
 	Finish            *Finish
 	Usage             *UsageEvent
@@ -42,7 +44,7 @@ type StreamStart struct {
 
 type ContentBlockStart struct {
 	Index     int
-	BlockType string // "text" | "tool_use"
+	BlockType string // "text" | "tool_use" | "reasoning"
 }
 
 type TextDelta struct {
@@ -61,13 +63,25 @@ type ToolCallDelta struct {
 	PartialJSON string
 }
 
+// ReasoningDelta carries an incremental reasoning update. Exactly one of
+// Text or Signature is set per event — Text for incremental visible
+// reasoning tokens, Signature delivered once when the provider finalizes
+// the block (mirrors Anthropic's thinking_delta vs signature_delta split).
+type ReasoningDelta struct {
+	Index     int
+	Text      string
+	Signature string
+}
+
 type ContentBlockEnd struct{ Index int }
 
 type Finish struct{ StopReason IRStopReason }
 
 type UsageEvent struct {
-	InputTokens  int
-	OutputTokens int
+	InputTokens              int
+	OutputTokens             int
+	CacheCreationInputTokens int
+	CacheReadInputTokens     int
 }
 
 type StreamEnd struct{}

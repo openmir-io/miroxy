@@ -122,3 +122,66 @@ func TestOpen_FallsBackToMemoryWhenPathUnwritable(t *testing.T) {
 	}
 	_ = s.Close()
 }
+
+func TestSaveAndLoadTokenStats_RoundTrip(t *testing.T) {
+	s := Open(filepath.Join(t.TempDir(), "state.db"))
+	defer s.Close()
+
+	want := TokenStats{
+		TotalInput: 1000, TotalOutput: 200, TotalRequests: 5,
+		Models: []TokenModelStats{
+			{
+				Name: "mistral-test", Input: 1000, Output: 200, Requests: 5,
+				Pools: []TokenPoolStats{
+					{
+						Name: "mistral-free", Input: 1000, Output: 200, Requests: 5,
+						Keys: []TokenKeyStats{{Name: "mistral_bytebyteops", Input: 1000, Output: 200, Requests: 5}},
+					},
+				},
+			},
+		},
+	}
+	if err := s.SaveTokenStats(want); err != nil {
+		t.Fatalf("SaveTokenStats: %v", err)
+	}
+	got, ok := s.LoadTokenStats()
+	if !ok {
+		t.Fatal("LoadTokenStats: expected ok=true")
+	}
+	if got.TotalInput != want.TotalInput || len(got.Models) != 1 ||
+		len(got.Models[0].Pools) != 1 || len(got.Models[0].Pools[0].Keys) != 1 ||
+		got.Models[0].Pools[0].Keys[0].Name != "mistral_bytebyteops" {
+		t.Fatalf("round-trip mismatch: got %+v, want %+v", got, want)
+	}
+}
+
+func TestLoadTokenStats_FalseWhenNothingSaved(t *testing.T) {
+	s := Open(filepath.Join(t.TempDir(), "state.db"))
+	defer s.Close()
+
+	if _, ok := s.LoadTokenStats(); ok {
+		t.Error("expected ok=false when nothing was ever saved")
+	}
+}
+
+func TestSaveAndLoadCompressStats_RoundTrip(t *testing.T) {
+	s := Open(filepath.Join(t.TempDir(), "state.db"))
+	defer s.Close()
+
+	want := CompressStats{
+		TotalRequests: 10, TotalOriginal: 50000, TotalCompressed: 30000,
+		Models: []CompressModelStats{
+			{Name: "miroxy-free-long", Requests: 10, OriginalTokens: 50000, CompressedTokens: 30000},
+		},
+	}
+	if err := s.SaveCompressStats(want); err != nil {
+		t.Fatalf("SaveCompressStats: %v", err)
+	}
+	got, ok := s.LoadCompressStats()
+	if !ok {
+		t.Fatal("LoadCompressStats: expected ok=true")
+	}
+	if got.TotalRequests != want.TotalRequests || len(got.Models) != 1 || got.Models[0].Name != "miroxy-free-long" {
+		t.Fatalf("round-trip mismatch: got %+v, want %+v", got, want)
+	}
+}

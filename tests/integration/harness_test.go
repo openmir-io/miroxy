@@ -116,6 +116,18 @@ func gemini429Handler(w http.ResponseWriter, _ *http.Request) {
 	w.Write([]byte(`{"error":{"code":429,"message":"quota exceeded","status":"RESOURCE_EXHAUSTED"}}`))
 }
 
+// gemini404Handler simulates a deprecated or unavailable model on this
+// specific target — not a credential problem. Body code 400 is deliberate:
+// geminiCodeToHTTP only preserves 400/401/403/429 as-is and maps everything
+// else (including a literal 404) to 502, which was already retryable via
+// the pre-existing >=500 branch — 400 is what actually reaches the
+// non-429/5xx "default" branch this test is meant to exercise.
+func gemini404Handler(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusNotFound)
+	w.Write([]byte(`{"error":{"code":400,"message":"model not found","status":"NOT_FOUND"}}`))
+}
+
 // gemini429LongCooldownHandler returns a 429 with a 60 s retryDelay.
 // Use when tests need the key to stay in cooldown across multiple requests
 // (i.e. the key should still be cooling when the next request arrives).

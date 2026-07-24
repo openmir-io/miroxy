@@ -36,20 +36,34 @@ func (v *Validator) Middleware(next http.Handler) http.Handler {
 	})
 }
 
+// requestKey extracts the client-supplied key, accepting either scheme a real
+// downstream client sends: OpenAI/Bearer's "Authorization: Bearer <key>" or
+// Anthropic's "x-api-key: <key>". Miroxy speaks both protocols, so it must
+// accept whichever auth convention that protocol's own clients actually use.
+func requestKey(r *http.Request) (key string, headerPresent bool) {
+	if auth := r.Header.Get("Authorization"); auth != "" {
+		key, _ = strings.CutPrefix(auth, "Bearer ")
+		return key, true
+	}
+	if key := r.Header.Get("x-api-key"); key != "" {
+		return key, true
+	}
+	return "", false
+}
+
 func (v *Validator) valid(r *http.Request) bool {
 	if len(v.allowed) == 0 {
 		return true // open mode
 	}
-	auth := r.Header.Get("Authorization")
-	key, ok := strings.CutPrefix(auth, "Bearer ")
-	if !ok || key == "" {
-		slog.Debug("auth: rejected — missing or malformed Authorization header",
-			"header_present", auth != "", "path", r.URL.Path)
+	key, headerPresent := requestKey(r)
+	if key == "" {
+		slog.Debug("auth: rejected — missing or malformed Authorization/x-api-key header",
+			"header_present", headerPresent, "path", r.URL.Path)
 		return false
 	}
 	_, found := v.allowed[key]
 	if !found {
-		slog.Debug("auth: rejected — bearer key not in allowlist", "path", r.URL.Path)
+		slog.Debug("auth: rejected — key not in allowlist", "path", r.URL.Path)
 	}
 	return found
 }

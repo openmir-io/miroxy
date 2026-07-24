@@ -1,6 +1,6 @@
 # miroxy
 
-Go proxy: Anthropic Messages API → upstream providers. v1 target: Gemini only.
+Go proxy: Anthropic Messages API → upstream providers.
 
 ## Memory Policy (claude-mem enabled)
 
@@ -31,20 +31,35 @@ This project uses claude-mem for persistent memory instead of manually maintaine
 core/           stable interfaces + pure-Go impls (future miroxy-core module)
   selector/       Selector interface, ExecutionPlan, CredPool, RateLimitError
   router/         Router interface, RouteTarget, ModelInfo
+  upstream/       UpstreamAdapter interface
+  downstream/     DownstreamAdapter interface
+  ir/             intermediate representation (stream conversion)
 internal/       IO-bound implementations (compiler-enforced: never extracted)
   server/         HTTP server, executor (retry loop), prober
-  translator/     Translator interface + Gemini implementation
+  upstream/       UpstreamAdapter impls (gemini/openai/deepseek/grok/glm/anthropic) + registry.go
+  downstream/     DownstreamAdapter impls (anthropic/openai/openai_responses) + registry.go
+  wireformat/     wire<->IR converters shared by upstream + downstream, one file per protocol dialect
   pipeline/       Plugin chain — LLMContext, Plugin, Pipeline
+  compress/       token-compression plugin
+  warden/         PII/secret-scrubbing plugin
   config/         ConfigStore + YAML loader
   types/          Anthropic + Gemini wire types
   auth/           bearer key validation
   idgen/          message/tool-call ID generation
-  ir/             intermediate representation (stream conversion)
+  cred/           credstone REST client (external credential-health sidecar)
+  stats/          in-process token usage counters
+  dump/           request/response capture for debugging
+  localstate/     optional buntdb-backed local cache (see Hard Constraints)
+  router/         BuiltinRouter (core/router.Router implementation)
+  api/            admin API types generated from admin-openapi.yaml
 cmd/miroxy/     main.go — wiring only, no logic
 tests/
-  unit/           credpool_test.go, translator_test.go, config_test.go
+  unit/           credpool_test.go, config_test.go, warden_test.go
   integration/    harness_test.go + messages/retry/stream tests
 ```
+
+Adding a new upstream provider = one new file in `internal/upstream/` + one line in its `registry.go`.
+Adding a new client-facing protocol = one new file in `internal/downstream/` + one line in its `registry.go`.
 
 New packages: `core/<domain>/` (stable) or `internal/<domain>/` (IO-bound).
 
@@ -80,6 +95,7 @@ Non-negotiable. Do not override without explicit discussion.
 - **Streaming and non-streaming are separate code paths.** Never buffer a stream through a non-streaming abstraction.
 - **429 never circuit-breaks a credential.** `RateLimitError` drives an escalating cooldown counter; it does not increment the circuit-break counter.
 - **Retry before first byte.** A 429 before any SSE byte is flushed → transparent retry on the next available credential.
+- **Doc comments ≤ 2 lines.** Comments above a function, method, interface, struct/class, or type declaration must not exceed 2 lines. If it needs more, the design belongs in `docs/dev/DESIGNLOG.md`, not the doc comment.
 
 ---
 
@@ -92,12 +108,13 @@ Read the source files for current signatures. Do not change without discussion.
 | `Selector`, `ExecutionPlan`, `ErrNoSelection` | `core/selector/selector.go` |
 | `RateLimitError`, `ErrRateLimit` | `core/selector/errors.go` |
 | `Router`, `RouteTarget`, `ModelInfo` | `core/router/router.go` |
-| `Translator` | `internal/translator/translator.go` |
+| `UpstreamAdapter` | `core/upstream/adapter.go` |
+| `DownstreamAdapter` | `core/downstream/adapter.go` |
 | `ConfigStore` | `internal/config/config.go` |
 
-**Adding a provider** = one new file implementing `Translator`. Zero changes to server or router core.
+**Adding an upstream provider** = one new file in `internal/upstream/` implementing `UpstreamAdapter`, plus one line in `internal/upstream/registry.go`. Zero changes to server or router core.
 
-**`UpstreamError`** (`internal/translator/upstream_error.go`) is the only coordination point between translator and the server retry loop.
+**`UpstreamError`** (`internal/wireformat/wireformat.go`) is the only coordination point between the wire-format converters and the server retry loop.
 
 ---
 
@@ -114,11 +131,11 @@ Load on demand. Do NOT pre-read docs unless the task explicitly requires it.
 
 | Task | Files to load |
 |------|---------------|
-| Add upstream provider | `internal/translator/translator.go`, `internal/translator/gemini.go` |
-| Change credential selection / retry | `core/selector/credpool.go`, `internal/server/executor.go` |
+| Add upstream provider | `core/upstream/adapter.go`, `internal/upstream/gemini.go`, `internal/upstream/registry.go` |
+| Change credential selection / retry | `core/selector/credpool.go`, `internal/server/upstream.go` |
 | Change routing / RouteTarget | `core/router/router.go`, `internal/server/server.go` |
 | Change config schema | `internal/config/config.go`, `config/config.yaml.example` |
-| Debug 429 / circuit-break | `core/selector/credpool.go`, `internal/server/executor.go` |
+| Debug 429 / circuit-break | `core/selector/credpool.go`, `internal/server/upstream.go` |
 | Pipeline / plugin work | `internal/pipeline/context.go`, `internal/pipeline/pipeline.go` |
 
 **Do NOT load** `docs/design/`, `docs/plan/`, or `discussions/` unless the user explicitly asks for architecture context.

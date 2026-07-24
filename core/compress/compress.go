@@ -32,6 +32,10 @@ type Compressor interface {
 
 // Request carries the message history and compression parameters.
 type Request struct {
+	// Model is the client-facing model route name — the deepest dimension
+	// Stats can attribute to, since compression runs before credential
+	// selection (see Stats' doc comment).
+	Model string
 	// System is the system prompt (always preserved, never compressed).
 	System string
 	// Messages is the conversation history to compress.

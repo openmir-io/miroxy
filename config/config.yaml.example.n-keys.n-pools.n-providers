@@ -17,6 +17,7 @@ providers:
 
 credpools:
   gemini-flash:
+    provider_ref: gemini
     strategy: least_requests
     rate_limit_rpm: 20
     keys:
@@ -25,6 +26,7 @@ credpools:
       - key_3: ${GEMINI_KEY_3}
 
   deepseek-pool:
+    provider_ref: deepseek
     strategy: round_robin
     keys:
       - main:   ${DEEPSEEK_KEY_1}
@@ -35,11 +37,9 @@ model_routes:
     routing:
       strategy: fallback           # try Gemini first; fall through to DeepSeek on failure
       targets:
-        - provider: gemini
-          provider_model: gemini-2.5-flash
+        - upstream_model: gemini-2.5-flash
           credpool_ref: gemini-flash
           timeout_seconds: 30
-        - provider: deepseek
-          provider_model: deepseek-chat
+        - upstream_model: deepseek-chat
           credpool_ref: deepseek-pool
           timeout_seconds: 30

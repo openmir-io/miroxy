@@ -48,9 +48,11 @@ type ContentBlockDeltaData struct {
 }
 
 type TextDelta struct {
-	Type        string `json:"type"` // "text_delta" | "input_json_delta"
+	Type        string `json:"type"` // "text_delta" | "input_json_delta" | "thinking_delta" | "signature_delta"
 	Text        string `json:"text,omitempty"`
 	PartialJSON string `json:"partial_json,omitempty"`
+	Thinking    string `json:"thinking,omitempty"`
+	Signature   string `json:"signature,omitempty"`
 }
 
 type ContentBlockStopData struct {
@@ -70,8 +72,10 @@ type MessageDelta struct {
 }
 
 type DeltaUsage struct {
-	OutputTokens int `json:"output_tokens"`
-	InputTokens  int `json:"input_tokens,omitempty"`
+	OutputTokens             int `json:"output_tokens"`
+	InputTokens              int `json:"input_tokens,omitempty"`
+	CacheCreationInputTokens int `json:"cache_creation_input_tokens,omitempty"`
+	CacheReadInputTokens     int `json:"cache_read_input_tokens,omitempty"`
 }
 
 type MessageStopData struct {

@@ -4,8 +4,8 @@ import (
 	"context"
 	"time"
 
+	"miroxy/core/ir"
 	"miroxy/core/upstream"
-	"miroxy/internal/types"
 )
 
 // TargetSelector wraps a CredPool with a specific Translator and UpstreamModel.
@@ -40,8 +40,8 @@ func NewTargetSelector(pool *CredPool, trans upstream.UpstreamAdapter, upstreamM
 	}
 }
 
-func (t *TargetSelector) Select(ctx context.Context, req *types.MessageRequest) (*ExecutionPlan, error) {
-	plan, err := t.pool.Select(ctx, req)
+func (t *TargetSelector) Select(ctx context.Context, req *ir.IRRequest, model string) (*ExecutionPlan, error) {
+	plan, err := t.pool.Select(ctx, req, model)
 	if err != nil {
 		return nil, err
 	}

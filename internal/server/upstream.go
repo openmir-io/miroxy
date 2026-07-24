@@ -12,14 +12,14 @@ import (
 	"strings"
 	"time"
 
+	"miroxy/core/ir"
 	"miroxy/core/selector"
 	coreup "miroxy/core/upstream"
 	intcred "miroxy/internal/cred"
 	"miroxy/internal/idgen"
-	"miroxy/internal/irc"
 	"miroxy/internal/pipeline"
 	"miroxy/internal/stats"
-	"miroxy/internal/types"
+	"miroxy/internal/wireformat"
 )
 
 // --- UpstreamExecutor (pipeline plugin) ---
@@ -56,6 +56,32 @@ func allKeysFailed(modelName, upstreamModel string, attempts []keyAttempt, invis
 // maxRetries caps the retry loop. ErrNoSelection terminates early when all keys are exhausted.
 const maxRetries = 10
 
+// DispatchMode names, for one retry attempt, which adapter dispatchFor chose.
+// It exists so the choice is observable (logging, future stats) instead of
+// living only as an anonymous bool inside dispatchFor — and so a future third
+// mode (e.g. same protocol family but a provider-dialect shim still needs to
+// run) has a place to go without re-deriving the decision by pointer
+// comparison at every call site.
+type DispatchMode int
+
+const (
+	// DispatchIR routes through the target's real IR-transform adapter —
+	// full protocol translation (e.g. Anthropic client → Gemini upstream).
+	DispatchIR DispatchMode = iota
+	// DispatchRaw forwards this attempt's original request/response bytes
+	// verbatim through PassthroughUpstream — no protocol translation, either
+	// because the client's protocol already matches this target's, or
+	// ForcePassthrough was set.
+	DispatchRaw
+)
+
+func (m DispatchMode) String() string {
+	if m == DispatchRaw {
+		return "raw"
+	}
+	return "ir"
+}
+
 // dispatchFor decides, for one retry attempt, whether to dispatch through the
 // target's real IR-transform adapter or its raw-bytes passthrough adapter —
 // comparing the request's actual client protocol (which DownstreamAdapter
@@ -63,17 +89,25 @@ const maxRetries = 10
 // Protocol. Passthrough only fires when PassthroughUpstream was actually
 // built for this target; ctx carries the original request bytes so
 // PassthroughAdapter can forward them verbatim instead of re-marshaling req.
-func dispatchFor(ctx context.Context, plan *selector.ExecutionPlan, clientProtocol string, rawBody []byte) (context.Context, coreup.UpstreamAdapter) {
+//
+// This runs fresh on every retry attempt against that attempt's own plan, so
+// a single model_routes fallback chain spanning providers on different
+// protocols dispatches each attempt independently — one attempt can go raw
+// while the next, having fallen through to a different provider, goes IR.
+func dispatchFor(ctx context.Context, plan *selector.ExecutionPlan, clientProtocol string, rawBody []byte, rawHeaders http.Header) (context.Context, coreup.UpstreamAdapter, DispatchMode) {
 	rawEligible := plan.ForcePassthrough || (clientProtocol != "" && clientProtocol == plan.Protocol)
 	if rawEligible && plan.PassthroughUpstream != nil {
-		return coreup.WithRawBody(ctx, rawBody), plan.PassthroughUpstream
+		ctx = coreup.WithRawBody(ctx, rawBody)
+		ctx = coreup.WithRawHeaders(ctx, rawHeaders)
+		return ctx, plan.PassthroughUpstream, DispatchRaw
 	}
-	return ctx, plan.Upstream
+	return ctx, plan.Upstream, DispatchIR
 }
 
 // UpstreamExecutor is the terminal pipeline plugin. It owns the retry loops for
 // both streaming and non-streaming upstream calls, using c.Target.Dispatcher for
-// physical transport (HTTPDispatcher by default; future: SDKDispatcher for AWS Bedrock).
+// physical transport (HTTPDispatcher — one net/http-based implementation covers
+// every upstream, including AWS Bedrock, since auth is applied by the Credential).
 type UpstreamExecutor struct {
 	probers map[string]*keyProber
 	stats   *stats.Registry
@@ -105,9 +139,10 @@ func (e *UpstreamExecutor) executeNonStream(c *pipeline.LLMContext) error {
 
 	sel := c.Target.Selector
 	req := c.Request
-	if req.MaxTokens <= 0 {
-		req.MaxTokens = 1024
+	if req.Gen.MaxTokens <= 0 {
+		req.Gen.MaxTokens = 1024
 	}
+	c.RefreshRawBodyIfRewritten()
 	model := c.Target.Model
 	invisible := c.Target.Invisible
 
@@ -116,7 +151,7 @@ func (e *UpstreamExecutor) executeNonStream(c *pipeline.LLMContext) error {
 	for attempt := range maxRetries {
 		slog.Debug("upstream attempt", "attempt", attempt+1, "max", maxRetries, "model", model.Name)
 
-		plan, err := sel.Select(ctx, req)
+		plan, err := sel.Select(ctx, req, model.Name)
 		if errors.Is(err, selector.ErrNoSelection) {
 			slog.Debug("upstream: no healthy credential available",
 				"attempt", attempt+1, "model", model.Name, "past_attempts", len(attempts))
@@ -125,9 +160,8 @@ func (e *UpstreamExecutor) executeNonStream(c *pipeline.LLMContext) error {
 			}
 			return allKeysFailed(model.Name, model.UpstreamModel, attempts, invisible)
 		}
-		slog.Debug("upstream key selected", "attempt", attempt+1, "key_id", plan.SelectionID, "model", model.Name)
-
-		attemptCtx, dispatch := dispatchFor(ctx, plan, c.ClientProtocol, c.RawRequestBody)
+		attemptCtx, dispatch, mode := dispatchFor(ctx, plan, c.ClientProtocol, c.RawRequestBody, c.RawRequestHeaders)
+		slog.Debug("upstream key selected", "attempt", attempt+1, "key_id", plan.SelectionID, "model", model.Name, "dispatch_mode", mode)
 
 		upstreamReq, err := dispatch.ToUpstream(attemptCtx, req, plan.Credential)
 		if err != nil {
@@ -137,6 +171,15 @@ func (e *UpstreamExecutor) executeNonStream(c *pipeline.LLMContext) error {
 
 		resp, err := c.Target.Dispatcher.Do(attemptCtx, upstreamReq)
 		if err != nil {
+			if ctx.Err() != nil {
+				// The retry loop's shared deadline is exhausted, not this
+				// credential's fault — every remaining attempt would fail the
+				// same way, so stop instead of racing through the rest of the
+				// pool and crediting each with a bogus failure.
+				sel.Release(plan, &selector.DeadlineExhaustedError{Err: err})
+				attempts = append(attempts, keyAttempt{keyID: plan.SelectionID, status: http.StatusGatewayTimeout, msg: err.Error()})
+				break
+			}
 			sel.Release(plan, err)
 			attempts = append(attempts, keyAttempt{keyID: plan.SelectionID, status: http.StatusBadGateway, msg: err.Error()})
 			slog.Warn("upstream request failed, retrying", "attempt", attempt+1, "error", err)
@@ -159,9 +202,36 @@ func (e *UpstreamExecutor) executeNonStream(c *pipeline.LLMContext) error {
 			continue
 		}
 
+		if mode == DispatchRaw {
+			body, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+				ct := resp.Header.Get("Content-Type")
+				if ct == "" {
+					ct = "application/json"
+				}
+				c.SetRawResponse(body, ct, resp.StatusCode)
+				sel.Release(plan, nil)
+				return nil
+			}
+			// Non-2xx, non-429/5xx: almost always target-specific (a
+			// deprecated model slug, a request shape this one provider
+			// rejects) rather than a credential problem — don't
+			// circuit-break the key, but don't give up either. Record it
+			// and let Select() try the next target/key; allKeysFailed's
+			// invisible passthrough already returns the LAST such
+			// response verbatim once every target/key is exhausted.
+			trimmed := string(bytes.TrimSpace(body))
+			attempts = append(attempts, keyAttempt{keyID: plan.SelectionID, status: resp.StatusCode, msg: trimmed, body: body})
+			sel.Release(plan, nil)
+			slog.Warn("upstream non-2xx (raw), trying next target/key",
+				"attempt", attempt+1, "status", resp.StatusCode, "key_id", plan.SelectionID, "model", model.Name)
+			continue
+		}
+
 		anthropicResp, err := dispatch.FromUpstream(resp)
 		if err != nil {
-			var upstreamErr *irc.UpstreamError
+			var upstreamErr *wireformat.UpstreamError
 			if errors.As(err, &upstreamErr) {
 				switch {
 				case upstreamErr.HTTPStatus == 429:
@@ -174,8 +244,13 @@ func (e *UpstreamExecutor) executeNonStream(c *pipeline.LLMContext) error {
 					slog.Warn("upstream body 5xx (relay pattern), parking key and retrying with next",
 						"attempt", attempt+1, "status", upstreamErr.HTTPStatus, "key_id", plan.SelectionID, "model", model.Name)
 				default:
+					// Same reasoning as the raw-mode non-2xx branch above:
+					// target-specific, not a credential problem — try the
+					// next target/key instead of giving up immediately.
+					attempts = append(attempts, keyAttempt{keyID: plan.SelectionID, status: upstreamErr.HTTPStatus, msg: upstreamErr.Message})
 					sel.Release(plan, nil)
-					return &pipeline.PipelineError{Status: http.StatusBadRequest, ErrType: "api_error", Msg: upstreamErr.Message}
+					slog.Warn("upstream body non-2xx (relay pattern), trying next target/key",
+						"attempt", attempt+1, "status", upstreamErr.HTTPStatus, "key_id", plan.SelectionID, "model", model.Name)
 				}
 				continue
 			}
@@ -187,15 +262,14 @@ func (e *UpstreamExecutor) executeNonStream(c *pipeline.LLMContext) error {
 		}
 
 		sel.Release(plan, nil)
-		anthropicResp.Model = req.Model
 		slog.Debug("non-stream response",
-			"model", req.Model,
+			"model", c.ClientModel,
 			"stop_reason", anthropicResp.StopReason,
 			"input_tokens", anthropicResp.Usage.InputTokens,
 			"output_tokens", anthropicResp.Usage.OutputTokens,
 		)
 		if e.stats != nil {
-			e.stats.Record(req.Model, plan.SelectionID,
+			e.stats.Record(c.ClientModel, plan.PoolName, plan.SelectionID,
 				int64(anthropicResp.Usage.InputTokens),
 				int64(anthropicResp.Usage.OutputTokens))
 		}
@@ -228,15 +302,17 @@ func (e *UpstreamExecutor) executeStream(c *pipeline.LLMContext) error {
 
 	sel := c.Target.Selector
 	req := c.Request
-	if req.MaxTokens <= 0 {
-		req.MaxTokens = 1024
+	if req.Gen.MaxTokens <= 0 {
+		req.Gen.MaxTokens = 1024
 	}
+	c.RefreshRawBodyIfRewritten()
 	model := c.Target.Model
 	invisible := c.Target.Invisible
 
 	var (
 		plan     *selector.ExecutionPlan
 		dispatch coreup.UpstreamAdapter
+		mode     DispatchMode
 		resp     *http.Response
 		attempts []keyAttempt
 	)
@@ -244,7 +320,7 @@ func (e *UpstreamExecutor) executeStream(c *pipeline.LLMContext) error {
 	for attempt := range maxRetries {
 		slog.Debug("stream upstream attempt", "attempt", attempt+1, "max", maxRetries, "model", model.Name)
 
-		p, err := sel.Select(ctx, req)
+		p, err := sel.Select(ctx, req, model.Name)
 		if errors.Is(err, selector.ErrNoSelection) {
 			slog.Debug("stream: no healthy credential available",
 				"attempt", attempt+1, "model", model.Name, "past_attempts", len(attempts))
@@ -254,9 +330,8 @@ func (e *UpstreamExecutor) executeStream(c *pipeline.LLMContext) error {
 			cancel()
 			return allKeysFailed(model.Name, model.UpstreamModel, attempts, invisible)
 		}
-		slog.Debug("stream key selected", "attempt", attempt+1, "key_id", p.SelectionID, "model", model.Name)
-
-		attemptCtx, d := dispatchFor(ctx, p, c.ClientProtocol, c.RawRequestBody)
+		attemptCtx, d, m := dispatchFor(ctx, p, c.ClientProtocol, c.RawRequestBody, c.RawRequestHeaders)
+		slog.Debug("stream key selected", "attempt", attempt+1, "key_id", p.SelectionID, "model", model.Name, "dispatch_mode", m)
 
 		upstreamReq, err := d.ToUpstreamStream(attemptCtx, req, p.Credential)
 		if err != nil {
@@ -267,6 +342,15 @@ func (e *UpstreamExecutor) executeStream(c *pipeline.LLMContext) error {
 
 		upstreamResp, err := c.Target.Dispatcher.Do(attemptCtx, upstreamReq)
 		if err != nil {
+			if ctx.Err() != nil {
+				// The retry loop's shared deadline is exhausted, not this
+				// credential's fault — every remaining attempt would fail the
+				// same way, so stop instead of racing through the rest of the
+				// pool and crediting each with a bogus failure.
+				sel.Release(p, &selector.DeadlineExhaustedError{Err: err})
+				attempts = append(attempts, keyAttempt{keyID: p.SelectionID, status: http.StatusGatewayTimeout, msg: err.Error()})
+				break
+			}
 			sel.Release(p, err)
 			attempts = append(attempts, keyAttempt{keyID: p.SelectionID, status: http.StatusBadGateway, msg: err.Error()})
 			slog.Warn("stream upstream request failed, retrying", "attempt", attempt+1, "error", err)
@@ -293,21 +377,28 @@ func (e *UpstreamExecutor) executeStream(c *pipeline.LLMContext) error {
 			continue
 		}
 		if upstreamResp.StatusCode >= 400 {
+			// Almost always target-specific (a deprecated model slug, a
+			// request shape this one provider rejects) rather than a
+			// credential problem — don't circuit-break the key, but don't
+			// give up either. Record it and let Select() try the next
+			// target/key; allKeysFailed's invisible passthrough already
+			// returns the LAST such response verbatim once every
+			// target/key is exhausted. Do NOT call cancel() here — ctx is
+			// reused by the next attempt, unlike the terminal exit paths
+			// above.
 			body, _ := io.ReadAll(io.LimitReader(upstreamResp.Body, 4096))
 			upstreamResp.Body.Close()
-			slog.Debug("stream upstream 4xx (non-retryable)",
-				"attempt", attempt+1, "status", upstreamResp.StatusCode, "key_id", p.SelectionID, "model", model.Name)
+			trimmed := string(bytes.TrimSpace(body))
+			attempts = append(attempts, keyAttempt{keyID: p.SelectionID, status: upstreamResp.StatusCode, msg: trimmed, body: body})
 			sel.Release(p, nil)
-			cancel()
-			return &pipeline.PipelineError{
-				Status:  http.StatusBadRequest,
-				ErrType: "api_error",
-				Msg:     fmt.Sprintf("upstream error %d: %s", upstreamResp.StatusCode, bytes.TrimSpace(body)),
-			}
+			slog.Warn("stream upstream non-2xx, trying next target/key",
+				"attempt", attempt+1, "status", upstreamResp.StatusCode, "key_id", p.SelectionID, "model", model.Name)
+			continue
 		}
 
 		plan = p
 		dispatch = d
+		mode = m
 		resp = upstreamResp
 		break
 	}
@@ -318,11 +409,11 @@ func (e *UpstreamExecutor) executeStream(c *pipeline.LLMContext) error {
 	}
 
 	msgID := idgen.NewMsgID()
-	slog.Debug("stream starting", "model", req.Model, "key_id", plan.SelectionID, "msg_id", msgID)
+	slog.Debug("stream starting", "model", c.ClientModel, "key_id", plan.SelectionID, "msg_id", msgID)
 
 	// Raw passthrough attempt: relay upstream stream bytes verbatim instead of
 	// decoding into the canonical SSEEvent channel — see dispatchFor.
-	if plan.PassthroughUpstream != nil && dispatch == plan.PassthroughUpstream {
+	if mode == DispatchRaw {
 		c.SetRawStream(resp.Body, resp.Header.Get("Content-Type"), resp.StatusCode, func(streamErr error) {
 			sel.Release(plan, streamErr)
 			cancel()
@@ -330,13 +421,13 @@ func (e *UpstreamExecutor) executeStream(c *pipeline.LLMContext) error {
 		return nil
 	}
 
-	events, _ := dispatch.StreamFromUpstream(ctx, resp, msgID, req.Model)
+	events, _ := dispatch.StreamFromUpstream(ctx, resp, msgID, c.ClientModel)
 	if e.stats != nil {
 		var tr tokenRecorder
 		if r, ok := sel.(tokenRecorder); ok {
 			tr = r
 		}
-		events = trackUsageStream(events, e.stats, req.Model, plan.SelectionID, e.usageAcc[plan.SelectionID], tr)
+		events = trackUsageStream(events, e.stats, c.ClientModel, plan.PoolName, plan.SelectionID, e.usageAcc[plan.SelectionID], tr)
 	}
 
 	c.SetStream(events, func(streamErr error) {
@@ -349,26 +440,20 @@ func (e *UpstreamExecutor) executeStream(c *pipeline.LLMContext) error {
 // trackUsageStream wraps a SSE event channel, accumulates token usage from
 // message_start (input) and message_delta (output) events, and records the
 // totals to reg (and, when non-nil, ua/tr) when the channel closes.
-func trackUsageStream(src <-chan types.SSEEvent, reg *stats.Registry, model, keyID string, ua *intcred.UsageAccumulator, tr tokenRecorder) <-chan types.SSEEvent {
-	out := make(chan types.SSEEvent, 64)
+func trackUsageStream(src <-chan ir.StreamEvent, reg *stats.Registry, model, poolName, keyID string, ua *intcred.UsageAccumulator, tr tokenRecorder) <-chan ir.StreamEvent {
+	out := make(chan ir.StreamEvent, 64)
 	go func() {
 		defer close(out)
 		var totalIn, totalOut int64
 		for ev := range src {
-			switch ev.Event {
-			case "message_start":
-				if ms, ok := ev.Data.(types.MessageStartData); ok {
-					totalIn += int64(ms.Message.Usage.InputTokens)
-				}
-			case "message_delta":
-				if md, ok := ev.Data.(types.MessageDeltaData); ok {
-					totalOut += int64(md.Usage.OutputTokens)
-				}
+			if ev.Kind == ir.EvUsage && ev.Usage != nil {
+				totalIn += int64(ev.Usage.InputTokens)
+				totalOut += int64(ev.Usage.OutputTokens)
 			}
 			out <- ev
 		}
 		if totalIn > 0 || totalOut > 0 {
-			reg.Record(model, keyID, totalIn, totalOut)
+			reg.Record(model, poolName, keyID, totalIn, totalOut)
 			if ua != nil {
 				ua.AddTokens(totalIn, totalOut)
 			}

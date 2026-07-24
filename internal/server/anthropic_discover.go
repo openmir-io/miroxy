@@ -34,6 +34,7 @@ func tryInjectAnthropicModels(cfg *config.Config) {
 		configured[m.ModelName] = true
 	}
 
+	pool := cfg.CredPools[poolName]
 	injected := 0
 	for _, m := range models {
 		if configured[m.ID] {
@@ -42,7 +43,10 @@ func tryInjectAnthropicModels(cfg *config.Config) {
 		cfg.ModelRoutes = append(cfg.ModelRoutes, config.ModelEntry{
 			ModelName:     m.ID,
 			DisplayName:   m.DisplayName,
-			ProviderRef:   "anthropic",
+			ProviderRef:   pool.ProviderRef,
+			Protocol:      pool.Protocol,
+			APIBase:       pool.APIBase,
+			AuthStyle:     pool.AuthStyle,
 			UpstreamModel: m.ID,
 			CredpoolRef:   poolName,
 		})
@@ -52,27 +56,16 @@ func tryInjectAnthropicModels(cfg *config.Config) {
 	slog.Info("model_discovery: injected Anthropic models", "count", injected, "pool", poolName)
 }
 
-// findAnthropicPoolKey returns the first credpool configured for Anthropic.
-// Checks in order:
-//  1. Credpools with upstream_model_type: "anthropic" tag (explicit)
-//  2. Model routes with provider_ref: "anthropic" referencing a named credpool (legacy)
+// findAnthropicPoolKey returns the first credpool that opted into
+// native_passthrough for the anthropic protocol — the same signal that
+// marks a pool as genuinely holding Anthropic's own keys (see
+// CredPoolCfg.NativePassthrough), since discovery calls the real
+// api.anthropic.com/v1/models endpoint with this pool's key.
 func findAnthropicPoolKey(cfg *config.Config) (poolName, key string) {
-	// 1. Explicit credpool tag.
 	for name, pool := range cfg.CredPools {
-		if pool.UpstreamModelType == "anthropic" && len(pool.Keys) > 0 {
+		if pool.NativePassthrough && pool.Protocol == "anthropic" && len(pool.Keys) > 0 {
 			return name, pool.Keys[0].Key
 		}
-	}
-	// 2. Infer from model_routes (backward compat).
-	for _, m := range cfg.ModelRoutes {
-		if m.ProviderRef != "anthropic" || m.CredpoolRef == "" {
-			continue
-		}
-		pool, ok := cfg.CredPools[m.CredpoolRef]
-		if !ok || len(pool.Keys) == 0 {
-			continue
-		}
-		return m.CredpoolRef, pool.Keys[0].Key
 	}
 	return "", ""
 }

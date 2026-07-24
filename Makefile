@@ -1,6 +1,6 @@
 # ── variables ──────────────────────────────────────────────────────────────────
 BINARY     := build/miroxy
-IMAGE      := forrestisagoodman/miroxy
+IMAGE      := openmir/miroxy
 VERSION    ?= dev
 CONTAINER  := miroxy
 CONFIG     := config/config.yaml

@@ -1,6 +1,6 @@
 # miroxy Architecture v3
 
-Status: current as of 2026-07-11. Supersedes the extension-model sections of
+Status: current as of 2026-07-18 (§5 revised). Supersedes the extension-model sections of
 `architecture.md` and `architecture-v2-three-layer-ward.md` (their
 native/WASM/sidecar three-tier plan) and the credential-handling sections of
 `Introduction.md`. Those documents also cover early routing/translator
@@ -175,25 +175,56 @@ Two independent layers, deliberately not conflated:
 
 `internal/pipeline.Plugin` — `Name()`, `Priority()`, `Execute(c, next)`.
 Priority order (`internal/pipeline/pipeline.go`): `CommandPlugin` (5, before
-everything) → `CompressPlugin` (when enabled) → `UpstreamExecutor`
-(`PriorityTerminal`, 1000). All wired directly in `internal/server/server.go`
-via plain constructor calls — no config-driven loader.
+everything) → `WardenPlugin` (`PriorityWarden`, 300) → `CompressPlugin`
+(350, when enabled) → `UpstreamExecutor` (`PriorityTerminal`, 1000). All
+wired directly in `internal/server/server.go` via plain constructor calls —
+no config-driven loader.
 
 `UpstreamExecutor` (`internal/server/upstream.go`) owns the retry loop:
-`Select` → dispatch → on 429/5xx `Release(err)` and retry the next candidate
-→ on success `Release(nil)`, record stats/usage/TPM. Streaming and
-non-streaming are separate code paths (never buffer a stream through the
-non-streaming path). `keyProber` (`internal/server/prober.go`) probes
-rate-limited credentials on an escalating schedule when a whole pool goes
-dark, so recovery doesn't depend on live traffic alone.
+`Select` → `dispatchFor` → dispatch → on 429/5xx `Release(err)` and retry the
+next candidate → on success `Release(nil)`, record stats/usage/TPM.
+Streaming and non-streaming are separate code paths (never buffer a stream
+through the non-streaming path). `keyProber` (`internal/server/prober.go`)
+probes rate-limited credentials on an escalating schedule when a whole pool
+goes dark, so recovery doesn't depend on live traffic alone.
+
+### Real-transform vs. raw-passthrough dispatch
+
+Decided per retry attempt, not per route (2026-07-12, refined 2026-07-18 in
+DESIGNLOG). `dispatchFor` compares the request's dynamically-detected
+`ClientProtocol` against that attempt's `ExecutionPlan.Protocol` and returns
+a `DispatchMode` (`DispatchRaw`/`DispatchIR`) alongside the chosen adapter —
+an explicit, observable value rather than an anonymous bool, leaving room
+for a future third mode (protocol matches, but a provider-dialect shim still
+needs to run). `Select()` runs fresh every attempt, so a single
+fallback/round-robin route spanning providers on different protocols
+dispatches each attempt independently.
+
+Passthrough forwards `RawRequestBody` — the client's original bytes,
+captured before decode — verbatim. Warden's redactions patch it in place
+(exact substring replace); Compress's structural rewrites can't be expressed
+that way, so `CompressPlugin` sets `LLMContext.RequestRewritten` and
+`RefreshRawBodyIfRewritten()` re-marshals the current `Request` into
+`RawRequestBody` once — after `MaxTokens` defaulting, before the retry loop
+starts — so a passthrough-eligible attempt ships what the pipeline actually
+produced, not the client's untouched original bytes.
 
 ## 6. What's explicitly not built
 
 - **WASM.** Dropped from the roadmap, not deferred — zero progress, no
   concrete plugin driving it, `wazero` never added as a dependency.
-- **Compression/security sidecars.** `core/compress.Compressor` is builtin
-  only today. No `SecurityScanner`/redaction capability exists yet in any
-  form.
+- **Compression/security sidecars.** `core/compress.Compressor` and Warden's
+  content-defense engine (`core/warden`/`internal/warden`, secrets/PII/
+  injection/jailbreak detection + redaction/tokenization — see 2026-07-12
+  DESIGNLOG) are both builtin only today; no external sidecar backend for
+  either exists yet.
+- **Provider-agnostic superset IR.** `core/ir` and the internal canonical
+  `types.MessageRequest` are Anthropic-shaped, not a true union of every
+  supported wire protocol's fields (no `seed`/`logprobs`/`n`/penalty/
+  reasoning-effort superset, no bidirectional per-provider extension bag).
+  Evaluated and deferred 2026-07-18 (see that DESIGNLOG entry) — a real,
+  current gap for OpenAI-protocol clients (fields silently dropped at
+  decode today), not a hypothetical concern tied to any specific future provider.
 - **credstone-side rpd/tpd enforcement + `ReportUsage` endpoint.** miroxy's
   `UsageAccumulator`/`CredstoneClient.ReportUsage` define the wire shape;
   credstone doesn't yet have a receiving endpoint or limit enforcement.

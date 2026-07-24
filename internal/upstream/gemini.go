@@ -8,31 +8,29 @@ import (
 	"log/slog"
 	"net/http"
 
-	coreup "miroxy/core/upstream"
 	"miroxy/core/cred"
-	"miroxy/internal/idgen"
-	"miroxy/internal/irc"
-	"miroxy/internal/types"
+	"miroxy/core/ir"
+	coreup "miroxy/core/upstream"
+	"miroxy/internal/wireformat"
 )
-
 
 const defaultGeminiBase = "https://generativelanguage.googleapis.com"
 
 // GeminiTranslator implements the Translator port for Google AI Studio and
-// compatible relay providers. It owns transport (endpoint URL + auth) and composes
-// a Native Anthropic frontend with a pluggable provider upstream (in-process Gemini
-// today). Request, response, and stream all flow through the neutral IR:
+// compatible relay providers. It owns transport (endpoint URL + auth) and
+// wraps a pluggable provider upstream (in-process Gemini today). Request,
+// response, and stream all flow through the neutral IR — LLMContext.Request/
+// Response are already IR-typed by the time they reach this adapter:
 //
-//	ToUpstream:         Anthropic → [downstream.RequestToIR] → IR → [upstream.RequestToProvider] → Gemini
-//	FromUpstream:       Gemini    → [upstream.ResponseToIR] → IR → [downstream.ResponseFromIR] → Anthropic
-//	StreamFromUpstream: Gemini SSE → [upstream.StreamToIR] → IR events → [downstream.StreamFromIR] → Anthropic SSE
+//	ToUpstream:         IR → [upstream.RequestToProvider] → Gemini
+//	FromUpstream:       Gemini → [upstream.ResponseToIR] → IR
+//	StreamFromUpstream: Gemini SSE → [upstream.StreamToIR] → IR events (client-protocol framing happens at the DownstreamAdapter, not here)
 type GeminiAdapter struct {
 	upstreamModel string
 	baseURL       string
 	// authStyle removed: credential type now encodes how auth is applied (Apply method).
 
-	downstream   irc.DownstreamConverter
-	upstream irc.UpstreamBackend
+	upstream wireformat.UpstreamBackend
 }
 
 var _ coreup.UpstreamAdapter = (*GeminiAdapter)(nil)
@@ -41,8 +39,7 @@ func newGeminiTranslator(upstreamModel, baseURL string) *GeminiAdapter {
 	return &GeminiAdapter{
 		upstreamModel: upstreamModel,
 		baseURL:       baseURL,
-		downstream:         irc.AnthropicConverter{},
-		upstream:       irc.NewBuiltinBackend(&irc.GeminiConverter{}),
+		upstream:      wireformat.NewBuiltinBackend(&wireformat.GeminiConverter{}),
 	}
 }
 
@@ -75,27 +72,23 @@ func (t *GeminiAdapter) streamEndpointURL() string {
 	return fmt.Sprintf("%s/v1beta/models/%s:streamGenerateContent?alt=sse", t.baseURL, t.upstreamModel)
 }
 
-func (t *GeminiAdapter) ToUpstream(ctx context.Context, req *types.MessageRequest, credential cred.Credential) (*http.Request, error) {
+func (t *GeminiAdapter) ToUpstream(ctx context.Context, req *ir.IRRequest, credential cred.Credential) (*http.Request, error) {
 	return t.buildHTTPRequest(ctx, req, t.endpointURL(), credential)
 }
 
-func (t *GeminiAdapter) ToUpstreamStream(ctx context.Context, req *types.MessageRequest, credential cred.Credential) (*http.Request, error) {
+func (t *GeminiAdapter) ToUpstreamStream(ctx context.Context, req *ir.IRRequest, credential cred.Credential) (*http.Request, error) {
 	return t.buildHTTPRequest(ctx, req, t.streamEndpointURL(), credential)
 }
 
-func (t *GeminiAdapter) buildHTTPRequest(ctx context.Context, req *types.MessageRequest, url string, credential cred.Credential) (*http.Request, error) {
+func (t *GeminiAdapter) buildHTTPRequest(ctx context.Context, req *ir.IRRequest, url string, credential cred.Credential) (*http.Request, error) {
 	slog.Debug("building upstream request",
 		"upstream_model", t.upstreamModel,
 		"messages", len(req.Messages),
-		"max_tokens", req.MaxTokens,
+		"max_tokens", req.Gen.MaxTokens,
 		"has_system", len(req.System) > 0,
 		"tools", len(req.Tools),
 	)
-	irReq, err := t.downstream.RequestToIR(req)
-	if err != nil {
-		return nil, fmt.Errorf("IR conversion: %w", err)
-	}
-	body, err := t.upstream.RequestToProvider(irReq)
+	body, err := t.upstream.RequestToProvider(req)
 	if err != nil {
 		return nil, err
 	}
@@ -110,7 +103,7 @@ func (t *GeminiAdapter) buildHTTPRequest(ctx context.Context, req *types.Message
 	return httpReq, nil
 }
 
-func (t *GeminiAdapter) FromUpstream(resp *http.Response) (*types.MessageResponse, error) {
+func (t *GeminiAdapter) FromUpstream(resp *http.Response) (*ir.IRResponse, error) {
 	defer resp.Body.Close()
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
@@ -120,20 +113,25 @@ func (t *GeminiAdapter) FromUpstream(resp *http.Response) (*types.MessageRespons
 	if err != nil {
 		return nil, err // includes *UpstreamError for body-level provider errors (G-05)
 	}
-	return t.downstream.ResponseFromIR(irResp, idgen.NewMsgID(), ""), nil
+	return irResp, nil
 }
 
-func (t *GeminiAdapter) StreamFromUpstream(ctx context.Context, resp *http.Response, msgID, modelAlias string) (<-chan types.SSEEvent, error) {
+func (t *GeminiAdapter) StreamFromUpstream(ctx context.Context, resp *http.Response, msgID, modelAlias string) (<-chan ir.StreamEvent, error) {
 	slog.Debug("stream started", "upstream_model", t.upstreamModel, "msg_id", msgID, "model_alias", modelAlias)
-	out := make(chan types.SSEEvent, 32)
+	// Gemini SSE → neutral IR stream events — framing into the client's own
+	// wire dialect happens at the DownstreamAdapter, not here.
+	irEvents := t.upstream.StreamToIR(ctx, resp.Body)
+	out := make(chan ir.StreamEvent, 32)
 	go func() {
 		defer resp.Body.Close()
 		defer close(out)
-		go func() { <-ctx.Done(); resp.Body.Close() }()
-		// Gemini SSE → neutral IR stream events → Anthropic SSE. StreamToIR spawns
-		// its own reader goroutine; StreamFromIR drains it synchronously into out.
-		irEvents := t.upstream.StreamToIR(ctx, resp.Body)
-		t.downstream.StreamFromIR(ctx, irEvents, out, msgID, modelAlias)
+		for ev := range irEvents {
+			select {
+			case <-ctx.Done():
+				return
+			case out <- ev:
+			}
+		}
 	}()
 	return out, nil
 }

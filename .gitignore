@@ -5,3 +5,6 @@ config/secrets.env
 # Go build output
 /miroxy
 build/
+
+achive/
+CLAUDE.md

@@ -2,22 +2,25 @@
 // Handles POST /v1/responses (Codex CLI wire_api = "responses").
 //
 // Mapping:
-//   instructions          → Anthropic system (top-level)
-//   input[type=message]   → messages[]
-//   input[type=function_call]        → assistant message, tool_use block
-//   input[type=function_call_output] → user message, tool_result block
-//   input[type=reasoning]            → skipped (provider-managed)
+//
+//	instructions          → Anthropic system (top-level)
+//	input[type=message]   → messages[]
+//	input[type=function_call]        → assistant message, tool_use block
+//	input[type=function_call_output] → user message, tool_result block
+//	input[type=reasoning]            → assistant message, thinking/redacted_thinking block
 //
 // SSE (Anthropic → Responses):
-//   message_start          → response.created
-//   content_block_start    → response.output_item.added
-//   content_block_delta    → response.output_text.delta / response.function_call_arguments.delta
-//   content_block_stop     → response.output_item.done
-//   message_delta/stop     → response.completed
+//
+//	message_start          → response.created
+//	content_block_start    → response.output_item.added
+//	content_block_delta    → response.output_text.delta / response.function_call_arguments.delta
+//	content_block_stop     → response.output_item.done
+//	message_delta/stop     → response.completed
 package downstream
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -25,8 +28,10 @@ import (
 	"strings"
 
 	coredown "miroxy/core/downstream"
+	"miroxy/core/ir"
 	"miroxy/internal/idgen"
 	"miroxy/internal/types"
+	"miroxy/internal/wireformat"
 )
 
 var _ coredown.DownstreamAdapter = (*ResponsesAdapter)(nil)
@@ -51,7 +56,7 @@ type responsesRequest struct {
 }
 
 type inputItem struct {
-	Type      string            `json:"type"`
+	Type string `json:"type"`
 	// message fields
 	Role    string            `json:"role,omitempty"`
 	Content []json.RawMessage `json:"content,omitempty"`
@@ -62,6 +67,9 @@ type inputItem struct {
 	ID        string `json:"id,omitempty"`
 	// function_call_output fields
 	Output json.RawMessage `json:"output,omitempty"`
+	// reasoning fields
+	Summary          []json.RawMessage `json:"summary,omitempty"`
+	EncryptedContent string            `json:"encrypted_content,omitempty"`
 }
 
 type inputContent struct {
@@ -72,14 +80,18 @@ type inputContent struct {
 
 // ── Decode ────────────────────────────────────────────────────────────────────
 
-func (a *ResponsesAdapter) Decode(r *http.Request) (*types.MessageRequest, error) {
+// Decode parses a Responses API request into the canonical IR. The
+// Anthropic-shaped intermediate here is an internal implementation detail
+// of this one parsing step (reusing NormalizeSystem/Validate), not a
+// pipeline-wide privilege — see docs/dev/DESIGNLOG.md, 2026-07-19.
+func (a *ResponsesAdapter) Decode(r *http.Request) (*ir.IRRequest, string, error) {
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
-		return nil, fmt.Errorf("read body: %w", err)
+		return nil, "", fmt.Errorf("read body: %w", err)
 	}
 	var rreq responsesRequest
 	if err := json.Unmarshal(body, &rreq); err != nil {
-		return nil, fmt.Errorf("parse responses request: %w", err)
+		return nil, "", fmt.Errorf("parse responses request: %w", err)
 	}
 
 	req := &types.MessageRequest{
@@ -112,9 +124,13 @@ func (a *ResponsesAdapter) Decode(r *http.Request) (*types.MessageRequest, error
 	req.Messages = msgs
 	req.NormalizeSystem()
 	if err := req.Validate(); err != nil {
-		return nil, err
+		return nil, "", err
 	}
-	return req, nil
+	irReq, err := (wireformat.AnthropicConverter{}).RequestToIR(req)
+	if err != nil {
+		return nil, "", fmt.Errorf("request to IR: %w", err)
+	}
+	return irReq, req.Model, nil
 }
 
 // splitDeveloperRole separates developer-role messages from regular input items.
@@ -186,10 +202,64 @@ func convertInputItems(raw []json.RawMessage) []types.Message {
 			msgs = appendOrMerge(msgs, "user", blockJSON)
 
 		case "reasoning":
-			// Skip — managed by the provider.
+			text := reasoningSummaryText(item.Summary)
+			var sig string
+			if item.EncryptedContent != "" {
+				sig = reasoningEnvelope(item)
+			}
+			if text == "" && sig == "" {
+				continue
+			}
+			var block types.ContentBlock
+			if text != "" {
+				block = types.ContentBlock{Type: "thinking", Thinking: text, Signature: sig}
+			} else {
+				block = types.ContentBlock{Type: "redacted_thinking", Data: sig}
+			}
+			blockJSON, _ := json.Marshal([]types.ContentBlock{block})
+			msgs = appendOrMerge(msgs, "assistant", blockJSON)
 		}
 	}
 	return msgs
+}
+
+// reasoningSummaryText joins the visible text of a reasoning item's summary
+// array (parts of type "summary_text"); other summary part types are skipped.
+func reasoningSummaryText(summary []json.RawMessage) string {
+	var parts []string
+	for _, s := range summary {
+		var c inputContent
+		if json.Unmarshal(s, &c) == nil && c.Text != "" {
+			parts = append(parts, c.Text)
+		}
+	}
+	return strings.Join(parts, "\n")
+}
+
+// reasoningEnvelope base64-encodes the original reasoning item's JSON so it
+// can be reconstructed verbatim if this request round-trips back out through
+// EncodeRequest — the Responses API requires reasoning items to be replayed
+// exactly as issued, including their opaque encrypted_content.
+func reasoningEnvelope(item inputItem) string {
+	b, _ := json.Marshal(item)
+	return base64.StdEncoding.EncodeToString(b)
+}
+
+// reasoningFromEnvelope reverses reasoningEnvelope. ok is false when raw is
+// empty or not a valid envelope — e.g. a Reasoning part that originated from
+// a different provider, carrying only visible text and no opaque blob.
+func reasoningFromEnvelope(raw string) (item inputItem, ok bool) {
+	if raw == "" {
+		return inputItem{}, false
+	}
+	b, err := base64.StdEncoding.DecodeString(raw)
+	if err != nil {
+		return inputItem{}, false
+	}
+	if err := json.Unmarshal(b, &item); err != nil {
+		return inputItem{}, false
+	}
+	return item, true
 }
 
 // convertMessage converts a Responses message item to an Anthropic message.
@@ -231,13 +301,174 @@ func appendOrMerge(msgs []types.Message, role string, contentBlocks json.RawMess
 	return append(msgs, types.Message{Role: role, Content: contentBlocks})
 }
 
+// EncodeRequest converts the canonical IR back into a Responses API request
+// body — the reverse of Decode.
+func (a *ResponsesAdapter) EncodeRequest(req *ir.IRRequest, model string) ([]byte, error) {
+	rreq := responsesRequest{
+		Model:           model,
+		Instructions:    req.System,
+		Input:           messagesToInputItems(req.Messages),
+		Stream:          req.Stream,
+		MaxOutputTokens: req.Gen.MaxTokens,
+		Tools:           toolsToResponsesTools(req.Tools),
+		ToolChoice:      toolChoiceToResponses(req.ToolChoice),
+	}
+	return json.Marshal(rreq)
+}
+
+// messagesToInputItems converts IR messages back into Responses input items
+// — the reverse of convertInputItems/convertMessage. tool_use/tool_result/
+// reasoning parts become separate top-level items (mirroring how Decode
+// received them); text/image parts stay nested inside a message item.
+func messagesToInputItems(msgs []ir.IRMessage) []json.RawMessage {
+	var items []json.RawMessage
+	for _, m := range msgs {
+		var contents []inputContent
+		flush := func() {
+			if len(contents) == 0 {
+				return
+			}
+			items = append(items, marshalItem(inputItem{Type: "message", Role: m.Role, Content: marshalContents(contents)}))
+			contents = nil
+		}
+		for _, p := range m.Parts {
+			switch {
+			case p.Text != nil:
+				textType := "input_text"
+				if m.Role == "assistant" {
+					textType = "output_text"
+				}
+				contents = append(contents, inputContent{Type: textType, Text: p.Text.Text})
+
+			case p.Image != nil:
+				contents = append(contents, inputContent{Type: "input_image", ImageURL: p.Image.Data})
+
+			case p.ToolUse != nil:
+				flush()
+				items = append(items, marshalItem(inputItem{
+					Type: "function_call", Name: p.ToolUse.Name,
+					Arguments: string(p.ToolUse.InputJSON), CallID: p.ToolUse.ID, ID: p.ToolUse.ID,
+				}))
+
+			case p.ToolResult != nil:
+				flush()
+				items = append(items, marshalItem(inputItem{
+					Type: "function_call_output", CallID: p.ToolResult.ToolUseID,
+					Output: toolResultOutputJSON(p.ToolResult.Content),
+				}))
+
+			case p.Reasoning != nil:
+				flush()
+				items = append(items, marshalReasoningItem(p.Reasoning))
+			}
+		}
+		flush()
+	}
+	return items
+}
+
+func marshalItem(item inputItem) json.RawMessage {
+	b, _ := json.Marshal(item)
+	return b
+}
+
+func marshalContents(contents []inputContent) []json.RawMessage {
+	out := make([]json.RawMessage, len(contents))
+	for i, c := range contents {
+		b, _ := json.Marshal(c)
+		out[i] = b
+	}
+	return out
+}
+
+// toolResultOutputJSON flattens a tool result's text content parts into the
+// plain string Responses expects for function_call_output.output.
+func toolResultOutputJSON(content []ir.IRContentPart) json.RawMessage {
+	var sb strings.Builder
+	for _, p := range content {
+		if p.Text != nil {
+			sb.WriteString(p.Text.Text)
+		}
+	}
+	b, _ := json.Marshal(sb.String())
+	return b
+}
+
+// marshalReasoningItem renders an IR reasoning part back to a Responses
+// input item. When Signature decodes as a valid envelope (the reasoning
+// originated from a prior Responses request/response), the original item
+// is reconstructed verbatim; otherwise a fresh item is synthesized from Text.
+func marshalReasoningItem(r *ir.IRReasoningPart) json.RawMessage {
+	if item, ok := reasoningFromEnvelope(r.Signature); ok {
+		return marshalItem(item)
+	}
+	item := inputItem{Type: "reasoning", ID: "rs_" + idgen.NewMsgID()}
+	if r.Text != "" {
+		summaryBlock, _ := json.Marshal(inputContent{Type: "summary_text", Text: r.Text})
+		item.Summary = []json.RawMessage{summaryBlock}
+	}
+	return marshalItem(item)
+}
+
+func toolsToResponsesTools(tools []ir.IRTool) []json.RawMessage {
+	if len(tools) == 0 {
+		return nil
+	}
+	out := make([]json.RawMessage, 0, len(tools))
+	for _, t := range tools {
+		b, _ := json.Marshal(map[string]any{
+			"type":        "function",
+			"name":        t.Name,
+			"description": t.Description,
+			"parameters":  json.RawMessage(t.InputSchemaJSON),
+		})
+		out = append(out, b)
+	}
+	return out
+}
+
+func toolChoiceToResponses(tc *ir.IRToolChoice) any {
+	if tc == nil {
+		return nil
+	}
+	switch tc.Type {
+	case "tool":
+		return map[string]any{"type": "function", "name": tc.Name}
+	case "any":
+		return "required"
+	case "none":
+		return "none"
+	default:
+		return "auto"
+	}
+}
+
+// reasoningOutputItem renders an IR reasoning block to a Responses output
+// item. When Signature decodes as a valid envelope, the original item's id/
+// encrypted_content/summary are reconstructed verbatim; otherwise a fresh
+// item is synthesized from Text alone.
+func reasoningOutputItem(r *ir.IRReasoningPart) map[string]any {
+	if envelope, ok := reasoningFromEnvelope(r.Signature); ok {
+		item := map[string]any{"type": "reasoning", "id": envelope.ID, "summary": envelope.Summary}
+		if envelope.EncryptedContent != "" {
+			item["encrypted_content"] = envelope.EncryptedContent
+		}
+		return item
+	}
+	item := map[string]any{"type": "reasoning", "id": "rs_" + idgen.NewMsgID(), "summary": []map[string]any{}}
+	if r.Text != "" {
+		item["summary"] = []map[string]any{{"type": "summary_text", "text": r.Text}}
+	}
+	return item
+}
+
 // ── WriteError ────────────────────────────────────────────────────────────────
 
 func (a *ResponsesAdapter) WriteError(w http.ResponseWriter, status int, errType, msg string) {
 	type respErr struct {
-		Type  string `json:"type"`
-		Code  string `json:"code"`
-		Msg   string `json:"message"`
+		Type string `json:"type"`
+		Code string `json:"code"`
+		Msg  string `json:"message"`
 	}
 	type envelope struct {
 		Error respErr `json:"error"`
@@ -247,25 +478,28 @@ func (a *ResponsesAdapter) WriteError(w http.ResponseWriter, status int, errType
 
 // ── WriteResponse (non-streaming) ─────────────────────────────────────────────
 
-func (a *ResponsesAdapter) WriteResponse(w http.ResponseWriter, resp *types.MessageResponse) {
+func (a *ResponsesAdapter) WriteResponse(w http.ResponseWriter, resp *ir.IRResponse, msgID, model string) {
 	var textSB strings.Builder
+	var output []map[string]any
 	for _, block := range resp.Content {
-		if block.Type == "text" {
-			textSB.WriteString(block.Text)
+		if block.Text != nil {
+			textSB.WriteString(block.Text.Text)
+		}
+		if block.Reasoning != nil {
+			output = append(output, reasoningOutputItem(block.Reasoning))
 		}
 	}
+	output = append(output, map[string]any{
+		"type":    "message",
+		"role":    "assistant",
+		"content": []map[string]any{{"type": "output_text", "text": textSB.String()}},
+	})
 	out := map[string]any{
-		"id":     "resp_" + resp.ID,
+		"id":     "resp_" + msgID,
 		"object": "response",
-		"model":  resp.Model,
+		"model":  model,
 		"status": "completed",
-		"output": []map[string]any{
-			{
-				"type":    "message",
-				"role":    "assistant",
-				"content": []map[string]any{{"type": "output_text", "text": textSB.String()}},
-			},
-		},
+		"output": output,
 		"usage": map[string]any{
 			"input_tokens":  resp.Usage.InputTokens,
 			"output_tokens": resp.Usage.OutputTokens,
@@ -277,10 +511,10 @@ func (a *ResponsesAdapter) WriteResponse(w http.ResponseWriter, resp *types.Mess
 
 // WriteResponseAsStream emits a Responses API SSE sequence directly from a
 // canonical response — no Anthropic SSE intermediate format involved.
-func (a *ResponsesAdapter) WriteResponseAsStream(ctx context.Context, w http.ResponseWriter, resp *types.MessageResponse) {
+func (a *ResponsesAdapter) WriteResponseAsStream(ctx context.Context, w http.ResponseWriter, resp *ir.IRResponse, msgID, model string) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
-		a.WriteResponse(w, resp)
+		a.WriteResponse(w, resp, msgID, model)
 		return
 	}
 	w.Header().Set("Content-Type", "text/event-stream")
@@ -289,8 +523,8 @@ func (a *ResponsesAdapter) WriteResponseAsStream(ctx context.Context, w http.Res
 	w.Header().Set("X-Accel-Buffering", "no")
 	w.WriteHeader(http.StatusOK)
 
-	respID := "resp_" + resp.ID
-	msgItemID := "msg_" + resp.ID
+	respID := "resp_" + msgID
+	msgItemID := "msg_" + msgID
 
 	send := func(event string, data any) {
 		b, _ := json.Marshal(data)
@@ -302,28 +536,40 @@ func (a *ResponsesAdapter) WriteResponseAsStream(ctx context.Context, w http.Res
 		"type":     "response.created",
 		"response": map[string]any{"id": respID, "object": "response", "status": "in_progress"},
 	})
+
+	outputIndex := 0
+	for _, block := range resp.Content {
+		if block.Reasoning == nil {
+			continue
+		}
+		item := reasoningOutputItem(block.Reasoning)
+		send("response.output_item.added", map[string]any{"type": "response.output_item.added", "output_index": outputIndex, "item": item})
+		send("response.output_item.done", map[string]any{"type": "response.output_item.done", "output_index": outputIndex, "item": item})
+		outputIndex++
+	}
+
 	send("response.output_item.added", map[string]any{
 		"type":         "response.output_item.added",
-		"output_index": 0,
+		"output_index": outputIndex,
 		"item":         map[string]any{"id": msgItemID, "type": "message", "role": "assistant"},
 	})
 
 	var fullText strings.Builder
 	for _, block := range resp.Content {
-		if block.Type == "text" {
-			fullText.WriteString(block.Text)
+		if block.Text != nil {
+			fullText.WriteString(block.Text.Text)
 			send("response.output_text.delta", map[string]any{
 				"type":          "response.output_text.delta",
 				"item_id":       msgItemID,
-				"output_index":  0,
+				"output_index":  outputIndex,
 				"content_index": 0,
-				"delta":         block.Text,
+				"delta":         block.Text.Text,
 			})
 		}
 	}
 	send("response.output_item.done", map[string]any{
 		"type":         "response.output_item.done",
-		"output_index": 0,
+		"output_index": outputIndex,
 		"item": map[string]any{
 			"id":      msgItemID,
 			"type":    "message",
@@ -352,14 +598,16 @@ func (a *ResponsesAdapter) WriteResponseAsStream(ctx context.Context, w http.Res
 type responseBlockState struct {
 	outputIndex int
 	itemID      string
-	blockType   string // "text" or "tool_use"
+	blockType   string // "text", "tool_use", or "reasoning"
 	toolName    string
 	toolID      string
-	// accumulated text for output_item.done content field
+	// accumulated text for output_item.done content field (also reasoning summary text)
 	textBuf strings.Builder
+	// accumulated signature for a reasoning block (delivered once, non-incremental)
+	reasoningSig string
 }
 
-func (a *ResponsesAdapter) WriteStream(ctx context.Context, w http.ResponseWriter, req *types.MessageRequest, src <-chan types.SSEEvent) error {
+func (a *ResponsesAdapter) WriteStream(ctx context.Context, w http.ResponseWriter, model string, src <-chan ir.StreamEvent) error {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		return fmt.Errorf("streaming not supported")
@@ -407,8 +655,11 @@ func (a *ResponsesAdapter) WriteStream(ctx context.Context, w http.ResponseWrite
 	}
 }
 
+// translateEvent converts one neutral IR stream event directly into
+// Responses-API SSE — no Anthropic-shaped intermediate (see
+// docs/dev/DESIGNLOG.md, 2026-07-19).
 func (a *ResponsesAdapter) translateEvent(
-	ev types.SSEEvent,
+	ev ir.StreamEvent,
 	send func(string, any) error,
 	cur **responseBlockState,
 	outputIndex *int,
@@ -416,103 +667,90 @@ func (a *ResponsesAdapter) translateEvent(
 	inputTokens, outputTokens *int,
 	respID string,
 ) error {
-	raw := jsonRawOf(ev.Data)
+	switch ev.Kind {
+	case ir.EvStreamStart:
+		// response.created already emitted before the loop; nothing IR-side
+		// carries usage at stream start (see EvUsage, emitted near the end).
 
-	switch ev.Event {
-	case "message_start":
-		// Already emitted response.created above.
-		var ms struct {
-			Message struct {
-				Usage struct {
-					InputTokens int `json:"input_tokens"`
-				} `json:"usage"`
-			} `json:"message"`
-		}
-		_ = json.Unmarshal(raw, &ms)
-		*inputTokens = ms.Message.Usage.InputTokens
-
-	case "content_block_start":
-		var cbs struct {
-			Index        int `json:"index"`
-			ContentBlock struct {
-				Type string `json:"type"`
-				ID   string `json:"id"`
-				Name string `json:"name"`
-			} `json:"content_block"`
-		}
-		_ = json.Unmarshal(raw, &cbs)
-
+	case ir.EvContentBlockStart:
+		s := ev.ContentBlockStart
 		itemID := "item_" + idgen.NewMsgID()
-		*cur = &responseBlockState{
-			outputIndex: *outputIndex,
-			itemID:      itemID,
-			blockType:   cbs.ContentBlock.Type,
-			toolName:    cbs.ContentBlock.Name,
-			toolID:      cbs.ContentBlock.ID,
+		*cur = &responseBlockState{outputIndex: *outputIndex, itemID: itemID, blockType: s.BlockType}
+		item := map[string]any{"id": msgItemID, "type": "message", "role": "assistant"}
+		if s.BlockType == "reasoning" {
+			item = map[string]any{"id": itemID, "type": "reasoning", "summary": []map[string]any{}}
 		}
+		return send("response.output_item.added", map[string]any{
+			"type":         "response.output_item.added",
+			"output_index": *outputIndex,
+			"item":         item,
+		})
 
-		if cbs.ContentBlock.Type == "text" {
-			// First text block: emit the message item wrapper.
-			return send("response.output_item.added", map[string]any{
-				"type":         "response.output_item.added",
-				"output_index": *outputIndex,
-				"item": map[string]any{
-					"id":   msgItemID,
-					"type": "message",
-					"role": "assistant",
-				},
-			})
-		} else if cbs.ContentBlock.Type == "tool_use" {
-			return send("response.output_item.added", map[string]any{
-				"type":         "response.output_item.added",
-				"output_index": *outputIndex,
-				"item": map[string]any{
-					"id":        cbs.ContentBlock.ID,
-					"type":      "function_call",
-					"name":      cbs.ContentBlock.Name,
-					"arguments": "",
-					"call_id":   cbs.ContentBlock.ID,
-				},
-			})
-		}
-
-	case "content_block_delta":
+	case ir.EvReasoningDelta:
 		if *cur == nil {
 			return nil
 		}
-		var cbd struct {
-			Delta struct {
-				Type      string `json:"type"`
-				Text      string `json:"text"`
-				PartialJSON string `json:"partial_json"`
-			} `json:"delta"`
-		}
-		_ = json.Unmarshal(raw, &cbd)
-
-		if (*cur).blockType == "text" && cbd.Delta.Text != "" {
-			(*cur).textBuf.WriteString(cbd.Delta.Text)
-			return send("response.output_text.delta", map[string]any{
-				"type":          "response.output_text.delta",
-				"item_id":       msgItemID,
-				"output_index":  (*cur).outputIndex,
-				"content_index": 0,
-				"delta":         cbd.Delta.Text,
-			})
-		} else if (*cur).blockType == "tool_use" && cbd.Delta.PartialJSON != "" {
-			return send("response.function_call_arguments.delta", map[string]any{
-				"type":         "response.function_call_arguments.delta",
-				"item_id":      (*cur).toolID,
+		d := ev.ReasoningDelta
+		if d.Text != "" {
+			(*cur).textBuf.WriteString(d.Text)
+			return send("response.reasoning_summary_text.delta", map[string]any{
+				"type":         "response.reasoning_summary_text.delta",
+				"item_id":      (*cur).itemID,
 				"output_index": (*cur).outputIndex,
-				"delta":        cbd.Delta.PartialJSON,
+				"delta":        d.Text,
 			})
 		}
+		if d.Signature != "" {
+			(*cur).reasoningSig = d.Signature
+		}
+		return nil
 
-	case "content_block_stop":
+	case ir.EvToolCallStart:
+		s := ev.ToolCallStart
+		*cur = &responseBlockState{outputIndex: *outputIndex, blockType: "tool_use", toolName: s.Name, toolID: s.ID}
+		return send("response.output_item.added", map[string]any{
+			"type":         "response.output_item.added",
+			"output_index": *outputIndex,
+			"item": map[string]any{
+				"id":        s.ID,
+				"type":      "function_call",
+				"name":      s.Name,
+				"arguments": "",
+				"call_id":   s.ID,
+			},
+		})
+
+	case ir.EvTextDelta:
+		if *cur == nil || ev.TextDelta.Text == "" {
+			return nil
+		}
+		(*cur).textBuf.WriteString(ev.TextDelta.Text)
+		return send("response.output_text.delta", map[string]any{
+			"type":          "response.output_text.delta",
+			"item_id":       msgItemID,
+			"output_index":  (*cur).outputIndex,
+			"content_index": 0,
+			"delta":         ev.TextDelta.Text,
+		})
+
+	case ir.EvToolCallDelta:
+		if *cur == nil || ev.ToolCallDelta.PartialJSON == "" {
+			return nil
+		}
+		return send("response.function_call_arguments.delta", map[string]any{
+			"type":         "response.function_call_arguments.delta",
+			"item_id":      (*cur).toolID,
+			"output_index": (*cur).outputIndex,
+			"delta":        ev.ToolCallDelta.PartialJSON,
+		})
+
+	case ir.EvContentBlockEnd:
 		if *cur == nil {
 			return nil
 		}
 		var doneItem map[string]any
-		if (*cur).blockType == "text" {
+		switch (*cur).blockType {
+		case "text":
 			doneItem = map[string]any{
 				"id":   msgItemID,
 				"type": "message",
@@ -521,12 +759,14 @@ func (a *ResponsesAdapter) translateEvent(
 					{"type": "output_text", "text": (*cur).textBuf.String()},
 				},
 			}
-		} else {
+		case "reasoning":
+			doneItem = reasoningOutputItem(&ir.IRReasoningPart{Text: (*cur).textBuf.String(), Signature: (*cur).reasoningSig})
+		default:
 			doneItem = map[string]any{
-				"id":        (*cur).toolID,
-				"type":      "function_call",
-				"name":      (*cur).toolName,
-				"call_id":   (*cur).toolID,
+				"id":      (*cur).toolID,
+				"type":    "function_call",
+				"name":    (*cur).toolName,
+				"call_id": (*cur).toolID,
 			}
 		}
 		err := send("response.output_item.done", map[string]any{
@@ -538,16 +778,11 @@ func (a *ResponsesAdapter) translateEvent(
 		*cur = nil
 		return err
 
-	case "message_delta":
-		var md struct {
-			Usage struct {
-				OutputTokens int `json:"output_tokens"`
-			} `json:"usage"`
-		}
-		_ = json.Unmarshal(raw, &md)
-		*outputTokens = md.Usage.OutputTokens
+	case ir.EvUsage:
+		*inputTokens = ev.Usage.InputTokens
+		*outputTokens = ev.Usage.OutputTokens
 
-	case "message_stop":
+	case ir.EvStreamEnd:
 		return send("response.completed", map[string]any{
 			"type": "response.completed",
 			"response": map[string]any{

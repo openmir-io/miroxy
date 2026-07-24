@@ -7,46 +7,45 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 
 	"miroxy/core/cred"
+	"miroxy/core/ir"
 	"miroxy/internal/types"
+	"miroxy/internal/wireformat"
 )
 
 // AnthropicUpstream dispatches to a genuinely Anthropic-protocol upstream
 // (the real Anthropic API, or an Anthropic-compatible backend) when the
 // request's client protocol does NOT match — so it isn't eligible for the
 // byte-for-byte PassthroughUpstream — but the target still is Anthropic
-// wire-shaped. Because the canonical types.MessageRequest/MessageResponse
-// were themselves modeled on Anthropic's Messages API, this transform is
-// near-identity: set the upstream's own model name, marshal, send.
+// wire-shaped. Converts IR↔Anthropic-wire via AnthropicConverter, same as
+// every other upstream adapter converts IR↔its own wire format.
 type AnthropicUpstream struct {
 	upstreamModel  string
 	endpoint       string
 	streamEndpoint string
 }
 
-// NewAnthropicUpstream creates an AnthropicUpstream pointed at apiBase
-// (expected to already include the full messages path, matching how
-// api_base is used by every other adapter in this package).
+// NewAnthropicUpstream creates an AnthropicUpstream pointed at apiBase, a
+// bare host (e.g. https://api.anthropic.com) — the /v1/messages path is
+// appended here, matching how every other adapter owns its own path suffix.
 func NewAnthropicUpstream(upstreamModel, apiBase string) *AnthropicUpstream {
-	return &AnthropicUpstream{upstreamModel: upstreamModel, endpoint: apiBase, streamEndpoint: apiBase}
+	endpoint := strings.TrimRight(apiBase, "/") + "/v1/messages"
+	return &AnthropicUpstream{upstreamModel: upstreamModel, endpoint: endpoint, streamEndpoint: endpoint}
 }
 
-func (a *AnthropicUpstream) ToUpstream(ctx context.Context, req *types.MessageRequest, credential cred.Credential) (*http.Request, error) {
+func (a *AnthropicUpstream) ToUpstream(ctx context.Context, req *ir.IRRequest, credential cred.Credential) (*http.Request, error) {
 	return a.build(ctx, req, a.endpoint, credential)
 }
 
-func (a *AnthropicUpstream) ToUpstreamStream(ctx context.Context, req *types.MessageRequest, credential cred.Credential) (*http.Request, error) {
+func (a *AnthropicUpstream) ToUpstreamStream(ctx context.Context, req *ir.IRRequest, credential cred.Credential) (*http.Request, error) {
 	return a.build(ctx, req, a.streamEndpoint, credential)
 }
 
-func (a *AnthropicUpstream) build(ctx context.Context, req *types.MessageRequest, url string, credential cred.Credential) (*http.Request, error) {
-	// Shallow-copy before overwriting Model — req is the shared pipeline
-	// request; other retry attempts (possibly against a different target)
-	// must not see this target's provider model name.
-	outReq := *req
-	outReq.Model = a.upstreamModel
-	body, err := json.Marshal(&outReq)
+func (a *AnthropicUpstream) build(ctx context.Context, req *ir.IRRequest, url string, credential cred.Credential) (*http.Request, error) {
+	wireReq := (wireformat.AnthropicConverter{}).RequestFromIR(req, a.upstreamModel)
+	body, err := json.Marshal(wireReq)
 	if err != nil {
 		return nil, fmt.Errorf("anthropic upstream: marshal request: %w", err)
 	}
@@ -62,7 +61,7 @@ func (a *AnthropicUpstream) build(ctx context.Context, req *types.MessageRequest
 	return httpReq, nil
 }
 
-func (a *AnthropicUpstream) FromUpstream(resp *http.Response) (*types.MessageResponse, error) {
+func (a *AnthropicUpstream) FromUpstream(resp *http.Response) (*ir.IRResponse, error) {
 	defer resp.Body.Close()
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
@@ -70,11 +69,22 @@ func (a *AnthropicUpstream) FromUpstream(resp *http.Response) (*types.MessageRes
 	}
 	var msgResp types.MessageResponse
 	if err := json.Unmarshal(body, &msgResp); err != nil {
-		return nil, fmt.Errorf("anthropic upstream: parse response: %w", err)
+		return nil, fmt.Errorf("anthropic upstream: parse response: status=%d body=%q: %w", resp.StatusCode, truncate(body, 500), err)
 	}
-	return &msgResp, nil
+	return (wireformat.AnthropicConverter{}).ResponseToIR(&msgResp), nil
 }
 
-func (a *AnthropicUpstream) StreamFromUpstream(ctx context.Context, resp *http.Response, msgID, modelAlias string) (<-chan types.SSEEvent, error) {
-	return parseAnthropicSSE(ctx, resp)
+func truncate(b []byte, n int) []byte {
+	if len(b) <= n {
+		return b
+	}
+	return b[:n]
+}
+
+func (a *AnthropicUpstream) StreamFromUpstream(ctx context.Context, resp *http.Response, msgID, modelAlias string) (<-chan ir.StreamEvent, error) {
+	wire, err := parseAnthropicSSE(ctx, resp)
+	if err != nil {
+		return nil, err
+	}
+	return anthropicSSEToIR(ctx, wire), nil
 }

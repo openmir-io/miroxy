@@ -3,12 +3,11 @@ package warden
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
 
+	"miroxy/core/ir"
 	corewarden "miroxy/core/warden"
 	"miroxy/internal/pipeline"
-	"miroxy/internal/types"
 )
 
 // WardenPlugin wires BuiltinWarden into the pipeline at PriorityWarden —
@@ -127,14 +126,18 @@ func (p *WardenPlugin) sanitizeRequest(ctx context.Context, c *pipeline.LLMConte
 // path this attempt took.
 func (p *WardenPlugin) resolveResponse(c *pipeline.LLMContext, vault *BuiltinVault) {
 	if c.Response != nil {
-		if c.Response.RawBody != nil {
-			c.Response.RawBody = []byte(vault.Resolve(string(c.Response.RawBody)))
-		}
 		for i := range c.Response.Content {
-			if c.Response.Content[i].Text != "" {
-				c.Response.Content[i].Text = vault.Resolve(c.Response.Content[i].Text)
+			if t := c.Response.Content[i].Text; t != nil && t.Text != "" {
+				t.Text = vault.Resolve(t.Text)
+			}
+			if r := c.Response.Content[i].Reasoning; r != nil && r.Text != "" {
+				r.Text = vault.Resolve(r.Text)
 			}
 		}
+	}
+
+	if body, contentType, status, ok := c.RawResponse(); ok {
+		c.SetRawResponse([]byte(vault.Resolve(string(body))), contentType, status)
 	}
 
 	if src := c.StreamSrc(); src != nil {
@@ -146,58 +149,40 @@ func (p *WardenPlugin) resolveResponse(c *pipeline.LLMContext, vault *BuiltinVau
 	}
 }
 
-// textField is one scannable/rewritable text location within a
-// MessageRequest: the system prompt, a plain-string message body, or one
-// text-type content block within a structured message body. tool_use/
-// tool_result block payloads are not scanned in v1 — a documented scope
-// limit, not an oversight.
+// textField is one scannable/rewritable text location within an IRRequest:
+// the system prompt, a text-type content part, or a reasoning part's visible
+// text. tool_use/tool_result payloads are not scanned in v1 — a documented
+// scope limit, not an oversight.
 type textField struct {
 	text string
 	set  func(string)
 }
 
-func collectTextFields(req *types.MessageRequest) []textField {
+func collectTextFields(req *ir.IRRequest) []textField {
 	var fields []textField
 
-	if sys := req.SystemText(); sys != "" {
+	if req.System != "" {
 		fields = append(fields, textField{
-			text: sys,
-			set: func(s string) {
-				b, _ := json.Marshal(s)
-				req.System = b
-			},
+			text: req.System,
+			set:  func(s string) { req.System = s },
 		})
 	}
 
 	for i := range req.Messages {
-		m := &req.Messages[i]
-
-		if text, ok := m.TextContent(); ok {
-			if text == "" {
-				continue
+		parts := req.Messages[i].Parts
+		for j := range parts {
+			if part := parts[j].Text; part != nil && part.Text != "" {
+				fields = append(fields, textField{
+					text: part.Text,
+					set:  func(s string) { part.Text = s },
+				})
 			}
-			fields = append(fields, textField{text: text, set: m.SetTextContent})
-			continue
-		}
-
-		blocks, ok := m.BlockContent()
-		if !ok {
-			continue
-		}
-		mm := m
-		for bi := range blocks {
-			if blocks[bi].Type != "text" || blocks[bi].Text == "" {
-				continue
+			if r := parts[j].Reasoning; r != nil && r.Text != "" {
+				fields = append(fields, textField{
+					text: r.Text,
+					set:  func(s string) { r.Text = s },
+				})
 			}
-			bi := bi
-			fields = append(fields, textField{
-				text: blocks[bi].Text,
-				set: func(s string) {
-					blocks[bi].Text = s
-					b, _ := json.Marshal(blocks)
-					mm.Content = b
-				},
-			})
 		}
 	}
 

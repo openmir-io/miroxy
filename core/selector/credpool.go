@@ -9,8 +9,8 @@ import (
 	"time"
 
 	"miroxy/core/cred"
+	"miroxy/core/ir"
 	"miroxy/core/upstream"
-	"miroxy/internal/types"
 )
 
 type credState int
@@ -94,10 +94,11 @@ type CredSpec struct {
 
 // CredPoolConfig configures a CredPool.
 type CredPoolConfig struct {
+	Name          string // named credpool this config builds — see ExecutionPlan.PoolName
 	Keys          []CredSpec
 	Upstream      upstream.UpstreamAdapter // embedded in each ExecutionPlan
 	UpstreamModel string                   // embedded in each ExecutionPlan
-	Strategy      string                   // "round_robin" | "least_requests" (default: round_robin)
+	Strategy      string                   // "round_robin" | "least_requests" | "fallback" (default: round_robin)
 	Threshold     int                      // consecutive failures before circuit-break (default: 5)
 	Cooldown      time.Duration            // circuit-break cooldown (default: 60s)
 
@@ -122,6 +123,15 @@ type CredPoolConfig struct {
 	// RateLimitTiers overrides the escalating 429 cooldown schedule.
 	// Leave nil to use the built-in schedule (10s → 30s → 60s → 120s → 300s).
 	RateLimitTiers []time.Duration
+
+	// Sticky keeps a conversation on the same credential (cache hit rate)
+	// instead of rotating every call. Orthogonal to Strategy.
+	Sticky    bool
+	StickyTTL time.Duration // idle expiry for a sticky binding; default 30m
+
+	// RoundRobinBatch: use each credential this many calls before advancing —
+	// a global counter, not per-session. Default 1.
+	RoundRobinBatch int
 }
 
 // CredPool holds a set of credentials (API keys or OAuth tokens), selects healthy
@@ -130,10 +140,12 @@ type CredPool struct {
 	mu    sync.Mutex
 	creds []*credEntry
 
-	strategy  string
-	threshold int
-	cooldown  time.Duration
-	counter   uint64
+	name            string
+	strategy        string
+	threshold       int
+	cooldown        time.Duration
+	counter         uint64
+	roundRobinBatch uint64
 
 	upstream      upstream.UpstreamAdapter
 	upstreamModel string
@@ -148,6 +160,8 @@ type CredPool struct {
 	tpmLimit      int
 
 	rateLimitTiers []time.Duration
+
+	affinity *affinityMap // nil when Sticky is disabled
 }
 
 func NewCredPool(cfg CredPoolConfig) *CredPool {
@@ -188,8 +202,23 @@ func NewCredPool(cfg CredPoolConfig) *CredPool {
 		tiers = defaultRateLimitTiers
 	}
 
+	var affinity *affinityMap
+	if cfg.Sticky {
+		ttl := cfg.StickyTTL
+		if ttl <= 0 {
+			ttl = 30 * time.Minute
+		}
+		affinity = newAffinityMap(ttl)
+	}
+
+	batch := uint64(cfg.RoundRobinBatch)
+	if batch == 0 {
+		batch = 1
+	}
+
 	return &CredPool{
 		creds:               entries,
+		name:                cfg.Name,
 		strategy:            strategy,
 		threshold:           threshold,
 		cooldown:            cooldown,
@@ -203,10 +232,12 @@ func NewCredPool(cfg CredPoolConfig) *CredPool {
 		rateWindow:          rateWindow,
 		tpmLimit:            cfg.RateLimitTPM,
 		rateLimitTiers:      tiers,
+		affinity:            affinity,
+		roundRobinBatch:     batch,
 	}
 }
 
-func (p *CredPool) Select(ctx context.Context, _ *types.MessageRequest) (*ExecutionPlan, error) {
+func (p *CredPool) Select(ctx context.Context, req *ir.IRRequest, model string) (*ExecutionPlan, error) {
 	p.mu.Lock()
 
 	now := time.Now()
@@ -233,15 +264,32 @@ func (p *CredPool) Select(ctx context.Context, _ *types.MessageRequest) (*Execut
 		}
 	}
 
+	eligible := func(e *credEntry) bool {
+		return e.available(now) &&
+			(p.rateLimit == 0 || len(e.recentRequests) < p.rateSoftLimit) &&
+			(p.tpmLimit == 0 || p.tokensInWindow(e) < int64(p.tpmLimit))
+	}
+
+	var sessionKey string
+	var selected *credEntry
+	if p.affinity != nil {
+		sessionKey = SessionKeyFromRequest(req, model)
+		if sessionKey != "" {
+			if id, ok := p.affinity.Get(sessionKey); ok {
+				if e := p.findByID(id); e != nil && eligible(e) {
+					selected = e
+				}
+			}
+		}
+	}
+
 	// First pass: healthy, under the soft RPM limit, and under the TPM cap.
 	// Cheapest check first — available() is a state/time comparison, the RPM
 	// length compare is next, the TPM sum-over-window is the priciest and
 	// only runs when the cheaper checks already passed (&& short-circuits).
-	selected := p.selectByCriteria(func(e *credEntry) bool {
-		return e.available(now) &&
-			(p.rateLimit == 0 || len(e.recentRequests) < p.rateSoftLimit) &&
-			(p.tpmLimit == 0 || p.tokensInWindow(e) < int64(p.tpmLimit))
-	})
+	if selected == nil {
+		selected = p.selectByCriteria(eligible)
+	}
 
 	// Second pass: all over the soft RPM limit and/or TPM cap — use best
 	// available as reactive backstop, ignoring both proactive limits.
@@ -264,6 +312,10 @@ func (p *CredPool) Select(ctx context.Context, _ *types.MessageRequest) (*Execut
 	if selected == nil {
 		p.mu.Unlock()
 		return nil, ErrNoSelection
+	}
+
+	if p.affinity != nil && sessionKey != "" {
+		p.affinity.Set(sessionKey, selected.id)
 	}
 
 	selected.inFlight++
@@ -297,6 +349,7 @@ func (p *CredPool) Select(ctx context.Context, _ *types.MessageRequest) (*Execut
 
 	return &ExecutionPlan{
 		SelectionID:         selected.id,
+		PoolName:            p.name,
 		Credential:          credential,
 		Model:               p.upstreamModel,
 		Upstream:            p.upstream,
@@ -306,17 +359,22 @@ func (p *CredPool) Select(ctx context.Context, _ *types.MessageRequest) (*Execut
 	}, nil
 }
 
+// findByID returns the credEntry with the given id, or nil. Caller must
+// already hold p.mu.
+func (p *CredPool) findByID(id string) *credEntry {
+	for _, e := range p.creds {
+		if e.id == id {
+			return e
+		}
+	}
+	return nil
+}
+
 func (p *CredPool) Release(plan *ExecutionPlan, err error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	var e *credEntry
-	for _, c := range p.creds {
-		if c.id == plan.SelectionID {
-			e = c
-			break
-		}
-	}
+	e := p.findByID(plan.SelectionID)
 	if e == nil {
 		return
 	}
@@ -327,7 +385,14 @@ func (p *CredPool) Release(plan *ExecutionPlan, err error) {
 
 	var rlErr *RateLimitError
 	var soErr *ServerOverloadError
+	var dlErr *DeadlineExhaustedError
 	switch {
+	case errors.As(err, &dlErr):
+		// The shared retry-loop deadline ran out, not this credential's
+		// fault — leave failure and rate-limit counters exactly as they were.
+		slog.Debug("credential released without penalty (retry budget exhausted)",
+			"key_id", e.id, "error", dlErr.Err)
+
 	case errors.As(err, &rlErr):
 		// 429: don't touch the circuit-break failure counter.
 		cooldown := p.rateLimitBackoff(e.rateLimitFailures)
@@ -442,6 +507,7 @@ func (p *CredPool) TakeRateLimited(ctx context.Context) []*ExecutionPlan {
 		}
 		plans = append(plans, &ExecutionPlan{
 			SelectionID:         c.entry.id,
+			PoolName:            p.name,
 			Credential:          cred,
 			Model:               p.upstreamModel,
 			Upstream:            p.upstream,
@@ -582,16 +648,35 @@ func (p *CredPool) selectByCriteria(eligible func(*credEntry) bool) *credEntry {
 	switch p.strategy {
 	case "least_requests":
 		return p.leastRequestsFiltered(eligible)
+	case "fallback":
+		return p.fallbackFiltered(eligible)
 	default:
 		return p.roundRobinFiltered(eligible)
 	}
 }
 
+// fallbackFiltered always prefers the earliest-listed eligible credential;
+// it never rotates away from an available key just because it was used.
+func (p *CredPool) fallbackFiltered(eligible func(*credEntry) bool) *credEntry {
+	for _, e := range p.creds {
+		if eligible(e) {
+			return e
+		}
+	}
+	return nil
+}
+
+// roundRobinFiltered picks creds[counter/roundRobinBatch % n]; skipping an
+// ineligible entry scans forward without touching the persisted counter.
 func (p *CredPool) roundRobinFiltered(eligible func(*credEntry) bool) *credEntry {
 	n := uint64(len(p.creds))
-	for range p.creds {
-		p.counter++
-		e := p.creds[p.counter%n]
+	if n == 0 {
+		return nil
+	}
+	base := (p.counter / p.roundRobinBatch) % n
+	p.counter++
+	for i := uint64(0); i < n; i++ {
+		e := p.creds[(base+i)%n]
 		if eligible(e) {
 			return e
 		}

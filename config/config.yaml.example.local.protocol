@@ -51,43 +51,43 @@ providers:
 
 credpools:
   ollama-local:
+    provider_ref: ollama
     keys:
       - local: "ollama"    # placeholder — ollama ignores the key value
 
   lmstudio-local:
+    provider_ref: lmstudio
     keys:
       - local: "lmstudio"
 
   vllm-local:
+    provider_ref: vllm
     keys:
       - local: ${VLLM_API_KEY}    # set to "none" or your configured key
 
   localai-local:
+    provider_ref: localai
     keys:
       - local: "localai"
 
 model_routes:
-  # Ollama: set provider_model to the name you pulled (e.g. llama3, mistral, phi3)
+  # Ollama: set upstream_model to the name you pulled (e.g. llama3, mistral, phi3)
   - model_name: local
-    provider: ollama
-    provider_model: llama3.2        # `ollama list` to see available models
+    upstream_model: llama3.2        # `ollama list` to see available models
     credpool_ref: ollama-local
     timeout_seconds: 120            # local models can be slow on first token
 
   - model_name: local-fast
-    provider: ollama
-    provider_model: phi3            # smaller, faster model
+    upstream_model: phi3            # smaller, faster model
     credpool_ref: ollama-local
     timeout_seconds: 60
 
   - model_name: local-lmstudio
-    provider: lmstudio
-    provider_model: local-model     # matches the model loaded in LM Studio
+    upstream_model: local-model     # matches the model loaded in LM Studio
     credpool_ref: lmstudio-local
     timeout_seconds: 120
 
   - model_name: local-vllm
-    provider: vllm
-    provider_model: meta-llama/Meta-Llama-3-8B-Instruct
+    upstream_model: meta-llama/Meta-Llama-3-8B-Instruct
     credpool_ref: vllm-local
     timeout_seconds: 60

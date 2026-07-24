@@ -13,14 +13,22 @@ type MessageRequest struct {
 	MaxTokens int       `json:"max_tokens"`
 	// System may be a plain JSON string or an array of content blocks —
 	// the Anthropic API accepts both. Use SystemText() to get a flat string.
-	System        json.RawMessage `json:"system,omitempty"`
-	Stream        bool            `json:"stream"`
-	Tools         []Tool          `json:"tools,omitempty"`
-	ToolChoice    *ToolChoice     `json:"tool_choice,omitempty"`
-	Temperature   *float64        `json:"temperature,omitempty"`
-	TopP          *float64        `json:"top_p,omitempty"`
-	TopK          *int            `json:"top_k,omitempty"`
-	StopSequences []string        `json:"stop_sequences,omitempty"`
+	System        json.RawMessage  `json:"system,omitempty"`
+	Stream        bool             `json:"stream"`
+	Tools         []Tool           `json:"tools,omitempty"`
+	ToolChoice    *ToolChoice      `json:"tool_choice,omitempty"`
+	Temperature   *float64         `json:"temperature,omitempty"`
+	TopP          *float64         `json:"top_p,omitempty"`
+	TopK          *int             `json:"top_k,omitempty"`
+	StopSequences []string         `json:"stop_sequences,omitempty"`
+	Metadata      *RequestMetadata `json:"metadata,omitempty"`
+}
+
+// RequestMetadata is the optional Anthropic "metadata" object. UserID, when
+// present, is used as an authoritative session-affinity key (see
+// selector.SessionKeyFromRequest) instead of a content-hash fallback.
+type RequestMetadata struct {
+	UserID string `json:"user_id,omitempty"`
 }
 
 // SystemText returns the system prompt as a plain string regardless of whether
@@ -123,6 +131,23 @@ type ContentBlock struct {
 	// tool_result block
 	ToolUseID string          `json:"tool_use_id,omitempty"`
 	Content   json.RawMessage `json:"content,omitempty"`
+	IsError   bool            `json:"is_error,omitempty"`
+	// image block
+	Source *ImageSource `json:"source,omitempty"`
+	// thinking block
+	Thinking  string `json:"thinking,omitempty"`
+	Signature string `json:"signature,omitempty"`
+	// redacted_thinking block
+	Data string `json:"data,omitempty"`
+}
+
+// ImageSource is an Anthropic image content block's source — either inline
+// base64 bytes or a URL.
+type ImageSource struct {
+	Type      string `json:"type"` // "base64" | "url"
+	MediaType string `json:"media_type,omitempty"`
+	Data      string `json:"data,omitempty"`
+	URL       string `json:"url,omitempty"`
 }
 
 // Tool is a function definition in the request.
@@ -158,9 +183,13 @@ type MessageResponse struct {
 	RawStatus      int    `json:"-"`
 }
 
+// Usage mirrors the real Anthropic Messages API usage object in full —
+// see docs/dev/DESIGNLOG.md, 2026-07-19, for why this must stay a superset.
 type Usage struct {
-	InputTokens  int `json:"input_tokens"`
-	OutputTokens int `json:"output_tokens"`
+	InputTokens              int `json:"input_tokens"`
+	CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
+	CacheReadInputTokens     int `json:"cache_read_input_tokens"`
+	OutputTokens             int `json:"output_tokens"`
 }
 
 // ErrorResponse is the Anthropic error envelope.
@@ -215,12 +244,29 @@ func (r *MessageRequest) NormalizeSystem() {
 		}
 		if t, ok := m.TextContent(); ok && t != "" {
 			extra = append(extra, t)
+			continue
+		}
+		// Content may be an array of content blocks rather than a plain
+		// string — same dual form SystemText() handles for the top-level field.
+		if blocks, ok := m.BlockContent(); ok {
+			var parts []string
+			for _, b := range blocks {
+				if b.Type == "text" && b.Text != "" {
+					parts = append(parts, b.Text)
+				}
+			}
+			if joined := strings.Join(parts, "\n"); joined != "" {
+				extra = append(extra, joined)
+			}
 		}
 	}
+	if len(keep) == len(r.Messages) {
+		return // no system-role messages found
+	}
+	r.Messages = keep
 	if len(extra) == 0 {
 		return
 	}
-	r.Messages = keep
 	combined := strings.Join(extra, "\n")
 	if len(r.System) == 0 {
 		b, _ := json.Marshal(combined)

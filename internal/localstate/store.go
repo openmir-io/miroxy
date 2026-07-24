@@ -161,3 +161,132 @@ func (s *Store) LoadWardenStats() (WardenStats, bool) {
 	})
 	return out, found
 }
+
+// TokenStats is a serializable snapshot of process-wide token usage
+// counters — model route → credpool → credential — same single-blob
+// approach as WardenStats. localstate has no dependency on internal/stats;
+// callers convert at the boundary (internal/server).
+type TokenStats struct {
+	TotalInput    int64             `json:"total_input"`
+	TotalOutput   int64             `json:"total_output"`
+	TotalRequests int64             `json:"total_requests"`
+	Models        []TokenModelStats `json:"models"`
+}
+
+type TokenModelStats struct {
+	Name     string           `json:"name"`
+	Input    int64            `json:"input"`
+	Output   int64            `json:"output"`
+	Requests int64            `json:"requests"`
+	Pools    []TokenPoolStats `json:"pools"`
+}
+
+type TokenPoolStats struct {
+	Name     string          `json:"name"`
+	Input    int64           `json:"input"`
+	Output   int64           `json:"output"`
+	Requests int64           `json:"requests"`
+	Keys     []TokenKeyStats `json:"keys"`
+}
+
+type TokenKeyStats struct {
+	Name     string `json:"name"`
+	Input    int64  `json:"input"`
+	Output   int64  `json:"output"`
+	Requests int64  `json:"requests"`
+}
+
+const tokenStatsKey = "token:stats"
+
+// SaveTokenStats persists stats as a single JSON blob, overwriting any
+// prior snapshot.
+func (s *Store) SaveTokenStats(stats TokenStats) error {
+	if s.db == nil {
+		return nil
+	}
+	data, err := json.Marshal(stats)
+	if err != nil {
+		return err
+	}
+	return s.db.Update(func(tx *buntdb.Tx) error {
+		_, _, err := tx.Set(tokenStatsKey, string(data), nil)
+		return err
+	})
+}
+
+// LoadTokenStats returns the persisted snapshot, or (zero, false) when none
+// exists yet or the store is a no-op (nil db).
+func (s *Store) LoadTokenStats() (TokenStats, bool) {
+	var out TokenStats
+	if s.db == nil {
+		return out, false
+	}
+	found := false
+	_ = s.db.View(func(tx *buntdb.Tx) error {
+		val, err := tx.Get(tokenStatsKey)
+		if err != nil {
+			return nil
+		}
+		if json.Unmarshal([]byte(val), &out) == nil {
+			found = true
+		}
+		return nil
+	})
+	return out, found
+}
+
+// CompressStats is a serializable snapshot of process-wide compression
+// counters — mirrors core/compress.Stats' billing-relevant totals, not its
+// strategy/latency history (session-scoped diagnostics, not worth persisting).
+type CompressStats struct {
+	TotalRequests   int64                `json:"total_requests"`
+	TotalOriginal   int64                `json:"total_original_tokens"`
+	TotalCompressed int64                `json:"total_compressed_tokens"`
+	Models          []CompressModelStats `json:"models"`
+}
+
+type CompressModelStats struct {
+	Name             string `json:"name"`
+	Requests         int64  `json:"requests"`
+	OriginalTokens   int64  `json:"original_tokens"`
+	CompressedTokens int64  `json:"compressed_tokens"`
+}
+
+const compressStatsKey = "compress:stats"
+
+// SaveCompressStats persists stats as a single JSON blob, overwriting any
+// prior snapshot.
+func (s *Store) SaveCompressStats(stats CompressStats) error {
+	if s.db == nil {
+		return nil
+	}
+	data, err := json.Marshal(stats)
+	if err != nil {
+		return err
+	}
+	return s.db.Update(func(tx *buntdb.Tx) error {
+		_, _, err := tx.Set(compressStatsKey, string(data), nil)
+		return err
+	})
+}
+
+// LoadCompressStats returns the persisted snapshot, or (zero, false) when
+// none exists yet or the store is a no-op (nil db).
+func (s *Store) LoadCompressStats() (CompressStats, bool) {
+	var out CompressStats
+	if s.db == nil {
+		return out, false
+	}
+	found := false
+	_ = s.db.View(func(tx *buntdb.Tx) error {
+		val, err := tx.Get(compressStatsKey)
+		if err != nil {
+			return nil
+		}
+		if json.Unmarshal([]byte(val), &out) == nil {
+			found = true
+		}
+		return nil
+	})
+	return out, found
+}

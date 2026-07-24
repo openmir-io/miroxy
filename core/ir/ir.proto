@@ -34,6 +34,7 @@ message IRContentPart {
         IRTextPart       text        = 1;
         IRToolUsePart    tool_use    = 2;
         IRToolResultPart tool_result = 3;
+        IRReasoningPart  reasoning   = 4;
     }
 }
 
@@ -52,6 +53,15 @@ message IRToolResultPart {
     string                 tool_use_id    = 1;
     repeated IRContentPart content        = 3;
     bool                   is_error       = 4;
+}
+
+// IRReasoningPart is a model-internal reasoning/thinking block. Signature is
+// an opaque, provider-issued token echoed back verbatim on a later turn —
+// e.g. Anthropic's thinking.signature/redacted_thinking.data, or a Responses
+// reasoning item's encrypted_content. Never generated/interpreted by miroxy.
+message IRReasoningPart {
+    string text      = 1; // visible reasoning text; empty when fully redacted
+    string signature = 2;
 }
 
 message IRTool {
@@ -84,8 +94,9 @@ message IRResponse {
 
 message IRResponseBlock {
     oneof block {
-        IRTextPart    text     = 1;
-        IRToolUsePart tool_use = 2;
+        IRTextPart      text      = 1;
+        IRToolUsePart   tool_use  = 2;
+        IRReasoningPart reasoning = 3;
     }
 }
 

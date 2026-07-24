@@ -5,8 +5,8 @@ import (
 	"log/slog"
 	"strings"
 
+	"miroxy/core/ir"
 	corewarden "miroxy/core/warden"
-	"miroxy/internal/types"
 )
 
 const (
@@ -180,18 +180,19 @@ func (r *ResolvingReader) Close() error { return r.src.Close() }
 // each content_block_delta's text before forwarding. The returned channel
 // closes once src closes; the caller's release callback (registered via
 // LLMContext.SetStream) is unaffected — this only wraps the data path.
-func ResolveEvents(src <-chan types.SSEEvent, vault corewarden.TokenVault) <-chan types.SSEEvent {
-	out := make(chan types.SSEEvent)
+func ResolveEvents(src <-chan ir.StreamEvent, vault corewarden.TokenVault) <-chan ir.StreamEvent {
+	out := make(chan ir.StreamEvent)
 	go func() {
 		defer close(out)
 		resolver := NewStreamResolver(vault)
 		for ev := range src {
-			// internal/irc constructs ContentBlockDeltaData by value (not a
-			// pointer) when building these events — match that here, and
-			// write the mutated copy back into ev.Data.
-			if delta, ok := ev.Data.(types.ContentBlockDeltaData); ok && delta.Delta.Text != "" {
-				delta.Delta.Text = resolver.Feed(delta.Delta.Text)
-				ev.Data = delta
+			if ev.Kind == ir.EvTextDelta && ev.TextDelta != nil && ev.TextDelta.Text != "" {
+				ev.TextDelta.Text = resolver.Feed(ev.TextDelta.Text)
+			}
+			// Signature is an opaque provider token, never rewritten — only
+			// the visible reasoning text is a vault-resolution candidate.
+			if ev.Kind == ir.EvReasoningDelta && ev.ReasoningDelta != nil && ev.ReasoningDelta.Text != "" {
+				ev.ReasoningDelta.Text = resolver.Feed(ev.ReasoningDelta.Text)
 			}
 			out <- ev
 		}

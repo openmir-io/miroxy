@@ -1,0 +1,842 @@
+# ══════════════════════════════════════════════════════════════════════════════
+# config.yaml.example — FULL REFERENCE
+#
+# This file documents every available configuration option with comments.
+# It is a reference, not a starting point — do not copy it as-is.
+#
+# Quickstart — copy one of these instead:
+#   config.yaml.example.min                           1 key, 1 pool, 1 route
+#   config.yaml.example.n-keys.1-pool                multiple keys, 1 pool
+#   config.yaml.example.n-keys.n-pools.1-provider    multiple pools, 1 provider
+#   config.yaml.example.n-keys.n-pools.n-providers   multi-provider fallback
+#   config.yaml.example.n-keys.n-pools.n-providers.n-routermodels  full setup
+#   config.yaml.example.compatible.protocol          DeepSeek/Grok/GLM/OpenRouter
+#   config.yaml.example.local.protocol               Ollama/LMStudio/vLLM
+# ══════════════════════════════════════════════════════════════════════════════
+
+server:
+  port: 9000
+  # When a client sends an unknown model name, route to this model_name.
+  # Set ANTHROPIC_MODEL=miroxy in your shell to always use this default route.
+  default_model: miroxy
+  commands:
+    disabled: false      # true = disable all :miroxy commands (also toggleable at runtime with :miroxy off)
+    allow_dump: false    # allow runtime toggle via ":miroxy dump on|off"
+                         # independent of dump.enabled below — set true to toggle without restart
+  # model_discovery controls what GET /v1/models returns to clients (e.g. Claude Code model picker).
+  #
+  #   auto   (default) — miroxy also fetches the live model list from any configured Anthropic
+  #                       credpool at startup and injects discovered models into the routing table
+  #                       in memory (config file is never modified). Models already present in
+  #                       model_routes are skipped, preserving all explicit mappings. Discovered
+  #                       models are shown with their exact Anthropic IDs (e.g.
+  #                       claude-sonnet-4-6-20250219) so you can copy them directly into
+  #                       model_routes when you want to override their routing.
+  #                       If no Anthropic credpool is configured, auto silently behaves as strict.
+  #
+  #   strict — /v1/models returns exactly the models listed in model_routes below, nothing more.
+  #            Use this when you want full control and no outbound calls at startup.
+  #
+  model_discovery: auto
+
+# native_passthrough_enable is the root safety switch for serving a model
+# name that is globally unique to one vendor (claude-*, gpt-*/o1*/o3*/o4*,
+# gemini-*) but has no matching model_routes entry — e.g. a client's default
+# model picker resolving to "claude-opus-4-8" with nothing configured for
+# it. False by default: without this, such a request is rejected rather than
+# silently reaching a real vendor credpool. Even when true, a request only
+# actually reaches a native pool if at least one credpool also sets
+# native_passthrough: true for the matching protocol (see credpools.anthropic
+# and credpools.openai-pool below) — this is belt-and-suspenders: one global
+# switch plus an explicit per-pool opt-in, not either alone.
+native_passthrough_enable: false
+
+# ── Admin server ──────────────────────────────────────────────────────────────
+# Separate listener for management APIs (stats, reload, key management).
+# Intentionally NOT the same port as the proxy — different security boundary:
+#   proxy port (8080) → public-facing, receives LLM traffic from agents/clients
+#   admin port (8090) → internal only, never expose to the public internet
+#
+# CLI commands that talk to this port:
+#   miroxy health        health check (exit 0 = ok)
+#   miroxy stat          per-pool key health + routing table
+#   miroxy reload        re-read config file, hot-swap routing
+#   miroxy key add/rm    dynamic key management (no config file write)
+#
+# Admin API proto: proto/miroxy/v1/admin.proto (in miroxy-rpc repo)
+# ─────────────────────────────────────────────────────────────────────────────
+admin:
+  enabled: true              # omit or set false to disable the admin server entirely
+  addr: "127.0.0.1:9001"    # localhost only; use 0.0.0.0:9001 inside containers/k8s
+
+log:
+  level: info    # trace | debug | info | warn | error | fatal
+                 # trace: shows full message bodies + SSE events — protocol debugging only
+                 # debug: request/response headers, model routing, retry decisions
+                 # info:  request summary lines (default)
+  file: ""       # optional file path; empty = stderr only (recommended for Docker)
+
+auth:
+  # Clients may present the key as either "Authorization: Bearer <key>"
+  # (OpenAI-style) or "x-api-key: <key>" (Anthropic-style) — miroxy accepts
+  # whichever header convention that client's own protocol actually uses.
+  allowed_keys:
+    - ${MIROXY_CLIENT_KEY_1}
+    # - ${MIROXY_CLIENT_KEY_2}
+
+# ── Protocol / auth_style reference ──────────────────────────────────────────
+#
+#  protocol   | default base_url                               | auth_style
+#  -----------|-----------------------------------------------|------------
+#  gemini     | https://generativelanguage.googleapis.com      | query_key
+#  openai     | https://api.openai.com/v1                      | bearer
+#  anthropic  | https://api.anthropic.com                      | api_key
+#  deepseek   | https://api.deepseek.com/v1                    | bearer
+#  glm        | https://api.z.ai/api/paas/v4                   | bearer
+#  grok       | https://api.x.ai/v1                            | bearer
+#
+# Built-in providers do not need to appear in the providers block unless you
+# want to override their defaults (e.g. point gemini at a relay URL).
+#
+# miroxy validates base_url against protocol at startup and refuses to start
+# on a known mismatch (e.g. generativelanguage.googleapis.com + protocol: openai).
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── Provider definitions ──────────────────────────────────────────────────────
+# Define once, reference by name in model_routes and credpools.
+# Only needed for custom / relay providers, or to override built-in defaults.
+#
+# Relay / intermediate proxy pattern:
+#   Your client → miroxy → relay proxy → actual LLM provider
+#   The relay may expose any URL and any protocol. Configure it here exactly
+#   as it presents itself — miroxy does not care what sits behind the relay.
+#   miroxy adds key management, rotation, and fallback on top of the relay.
+# ─────────────────────────────────────────────────────────────────────────────
+providers:
+  # ── Built-in providers ────────────────────────────────────────────────────
+  # Every provider a credpool references via its own provider_ref (below,
+  # under credpools:) MUST appear here.
+  # Fields left blank are filled from built-in defaults (see provider_defaults.go).
+  # Override only what you need to change (e.g. a relay URL or different auth).
+  #
+  # Default values (from provider_defaults.go constants):
+  #   gemini:    base_url=https://generativelanguage.googleapis.com  protocol=gemini     auth_style=query_key
+  #   openai:    base_url=https://api.openai.com/v1                  protocol=openai     auth_style=bearer
+  #   anthropic: base_url=https://api.anthropic.com                  protocol=anthropic  auth_style=api_key
+  #   deepseek:  base_url=https://api.deepseek.com/v1                protocol=deepseek   auth_style=bearer
+  #   glm:       base_url=https://api.z.ai/api/paas/v4               protocol=glm        auth_style=bearer
+  #   grok:      base_url=https://api.x.ai/v1                        protocol=grok       auth_style=bearer
+  # ─────────────────────────────────────────────────────────────────────────
+
+  gemini: {}        # uses all defaults above; override base_url to point at a relay
+
+  openai: {}        # uses all defaults above
+
+  anthropic: {}     # uses all defaults above
+
+  # deepseek: {}    # uncomment if you use deepseek in model_routes
+
+  # ── Custom / relay providers ──────────────────────────────────────────────
+  # DeepSeek via OpenAI-compatible endpoint
+  deepseek-openai:
+    base_url: https://api.deepseek.com/v1
+    protocol: openai
+    auth_style: bearer
+
+  # DeepSeek via Anthropic-compatible endpoint
+  deepseek-anthropic:
+    base_url: https://api.deepseek.com/anthropic
+    protocol: anthropic
+    auth_style: bearer
+
+  # AionLabs — OpenAI-compatible, has a free tier (15 rpm / 20k tpm / 20k tokens
+  # per day — the daily cap is not enforced by miroxy, only rpm/tpm; see the
+  # aionlabs-free credpool below). Models: aion-labs/aion-3.0(-mini), aion-2.5,
+  # aion-2.0, aion-rp-llama-3.1-8b. GET https://api.aionlabs.ai/v1/models for
+  # the live list (no key required).
+  aionlabs:
+    base_url: https://api.aionlabs.ai/v1
+    protocol: openai
+    auth_style: bearer
+
+  # Local Ollama (no auth)
+  ollama:
+    base_url: http://localhost:11434/v1
+    protocol: openai
+    auth_style: none
+
+  # GLM native API — used by the commented "GLM native" example further down.
+  glm: {}   # uses built-in defaults (see provider_defaults.go)
+
+  # ── Relay / intermediate proxy examples ──────────────────────────────────
+  #
+  # Case 1: Company-internal LLM gateway (speaks OpenAI, custom subdomain)
+  # Employees route through a corporate proxy that enforces policy / logging.
+  # my-corp-gateway:
+  #   base_url: https://llm-gateway.corp.internal/v1
+  #   protocol: openai
+  #   auth_style: bearer          # gateway issues its own tokens
+
+  # Case 2: Third-party aggregator relay (e.g. OpenRouter, PortKey, LiteLLM)
+  # These relays expose an OpenAI-compatible API but proxy multiple providers.
+  # The model name in upstream_model controls which upstream the relay picks.
+  # openrouter:
+  #   base_url: https://openrouter.ai/api/v1
+  #   protocol: openai
+  #   auth_style: bearer          # OpenRouter API key
+
+  # Case 3: Self-hosted LiteLLM proxy in front of Gemini / Bedrock
+  # LiteLLM translates OpenAI calls to native provider formats internally.
+  # miroxy only sees the LiteLLM OpenAI endpoint; LiteLLM handles the rest.
+  # litellm-internal:
+  #   base_url: http://litellm.infra.internal:4000
+  #   protocol: openai
+  #   auth_style: bearer
+
+  # Case 4: Relay that speaks Anthropic protocol (e.g. a caching proxy)
+  # Client sends Anthropic format → miroxy → Anthropic-speaking relay → Claude
+  # protocol: anthropic here matches an Anthropic-native client's actual wire
+  # protocol, so miroxy auto-passthroughs raw bytes for that request (no IR).
+  # anthropic-relay:
+  #   base_url: https://anthropic-cache.internal
+  #   protocol: anthropic
+  #   auth_style: bearer
+
+  # Case 5: Completely custom URL + custom auth header (proprietary LLM service)
+  # The service speaks OpenAI format but uses a non-standard auth header.
+  # my-custom-llm:
+  #   base_url: https://api.my-llm-service.com/inference/v2
+  #   protocol: openai
+  #   auth_style: api_key         # sends X-API-Key: <value>
+
+# ── CredPool definitions ───────────────────────────────────────────────────────
+# Define key pools once; reference with credpool_ref in model_routes.
+# Multiple model_routes entries sharing a credpool_ref share ONE pool instance —
+# in-flight counts and 429 cooldowns are accurate across all models using it.
+#
+# strategy options:
+#   least_requests  — pick the key with fewest active in-flight requests
+#   round_robin     — rotate keys in order regardless of load
+#   fallback        — always prefer the earliest-listed available key; only
+#                     move to the next once the current one is rate-limited/
+#                     circuit-broken. Drains keys in order instead of
+#                     spreading load — useful for a pile of free-tier
+#                     accounts you want to burn down one at a time (simpler
+#                     "which one is active" bookkeeping, and looks like one
+#                     real user's continuous usage per account instead of N
+#                     accounts firing in parallel, which is what tends to
+#                     trip anti-abuse detection).
+#
+# rate_soft_limit:
+#   miroxy switches to the next key at this RPM threshold, before the provider
+#   returns a 429. Defaults to rate_limit_rpm - 2 if omitted.
+#   Set to 0 to disable proactive rotation.
+#
+# rate_limit_tpm:
+#   Optional per-credential tokens-per-minute cap (input+output combined).
+#   0/omitted = disabled (the default — most credentials have no token quota
+#   worth tracking locally). Unlike rate_limit_rpm there is no soft-limit
+#   rotation: token counts are only known after the response, so a key already
+#   over its TPM budget is simply skipped on the next Select() until its
+#   window ages out.
+#
+# sticky / sticky_ttl_seconds:
+#   Orthogonal to strategy, not a replacement for it: strategy picks a *new*
+#   conversation's first key; sticky keeps reusing that same key for later
+#   turns of the same conversation (inferred from a hash of model + system
+#   prompt + first message — best-effort, not a real session id) instead of
+#   round-robining every call. Worth enabling for providers with prompt/
+#   context caching (Gemini, Anthropic, DeepSeek) where bouncing between
+#   keys/accounts on every turn defeats the cache. Automatically rebinds to
+#   another key once the sticky one is rate-limited/circuit-broken.
+#   sticky_ttl_seconds: how long an idle conversation's binding survives
+#   (default 1800 = 30m when sticky: true and this is omitted).
+#
+# round_robin_batch_size:
+#   With strategy: round_robin, use each key this many calls in a row before
+#   rotating to the next — a global counter, unrelated to which conversation
+#   is calling (unlike sticky, above). Default 1 (today's behavior: rotate
+#   every call). Rarely needed alongside sticky; the two solve different
+#   problems (per-conversation cache affinity vs. plain call distribution).
+#
+# Key name formats (names appear in 429/circuit-break log lines as key_id):
+#   - label: ${ENV_VAR}          ← recommended: named shorthand, easy to grep in logs
+#   - ${ENV_VAR}                 ← anonymous: auto-named key_0, key_1, ... in logs
+#   - name: label                ← verbose form (legacy, still supported)
+#     key:  ${ENV_VAR}
+#
+# Names must be unique within a pool. Duplicate names are a startup error.
+# ─────────────────────────────────────────────────────────────────────────────
+credpools:
+  gemini-flash:
+    provider_ref: gemini
+    strategy: least_requests
+    circuit_break_threshold: 5
+    cooldown_seconds: 60
+    rate_limit_rpm: 20                # Gemini free tier flash limit
+    rate_soft_limit: 18
+    sticky: true                      # keep a conversation on one key for context-cache hits
+    sticky_ttl_seconds: 1800
+    keys:
+      - personal_key: ${GEMINI_KEY_1}
+      - work_key:     ${GEMINI_KEY_2}
+      - backup_key:   ${GEMINI_KEY_3}
+
+  gemini-pro:
+    provider_ref: gemini
+    strategy: least_requests
+    circuit_break_threshold: 5
+    cooldown_seconds: 60
+    rate_limit_rpm: 10                # Gemini Pro has lower free-tier RPM
+    rate_soft_limit: 8
+    keys:
+      - personal_key: ${GEMINI_KEY_1}
+      - work_key:     ${GEMINI_KEY_2}
+
+  deepseek:
+    provider_ref: deepseek-openai
+    strategy: round_robin
+    circuit_break_threshold: 5
+    cooldown_seconds: 30
+    round_robin_batch_size: 2   # 2 calls per key before rotating, not per-conversation sticky
+    keys:
+      - main_key:   ${DEEPSEEK_KEY_1}
+      - backup_key: ${DEEPSEEK_KEY_2}
+
+  anthropic:
+    provider_ref: anthropic
+    # native_passthrough marks this pool as genuinely holding Anthropic's own
+    # keys — it's what triggers model auto-discovery (model_discovery: auto
+    # above) AND makes this pool eligible for native_passthrough_enable
+    # (root-level, above) to serve unconfigured claude-* model names.
+    native_passthrough: true
+    strategy: least_requests
+    circuit_break_threshold: 3
+    cooldown_seconds: 60
+    keys:
+      - main_key: ${ANTHROPIC_KEY_1}
+
+  openai-pool:
+    provider_ref: openai
+    native_passthrough: true   # same as credpools.anthropic above, for gpt-*/o1*/o3* names
+    strategy: least_requests
+    circuit_break_threshold: 3
+    cooldown_seconds: 60
+    keys:
+      - main_key: ${OPENAI_KEY_1}
+
+  # AionLabs free tier: 15 rpm / 20k tpm / 20k tokens per day (per their docs).
+  # miroxy enforces rate_limit_rpm and rate_limit_tpm below; there is no daily
+  # quota field, so the daily cap itself is not tracked — stop testing once
+  # you're near it, or pick a low-context/low-output model to stretch it further.
+  # rate_soft_limit is set to 0 because there's only one key: with nothing to
+  # rotate to, proactive soft-limiting would just add latency with no benefit.
+  aionlabs-free:
+    provider_ref: aionlabs
+    strategy: round_robin
+    circuit_break_threshold: 5
+    cooldown_seconds: 60
+    rate_limit_rpm: 15
+    rate_soft_limit: 0
+    rate_limit_tpm: 20000
+    keys:
+      - main_key: ${AIONLABS_KEY}
+
+  # A pile of free-tier accounts you want to drain one at a time rather than
+  # spread thin: fallback always prefers account_1 until it 429s enough to
+  # circuit-break (see circuit_break_threshold/cooldown_seconds), then moves
+  # to account_2, and so on — each account gets used up like a single real
+  # user would, instead of N accounts all firing concurrently.
+  aionlabs-free-fleet:
+    provider_ref: aionlabs
+    strategy: fallback
+    circuit_break_threshold: 5
+    cooldown_seconds: 60
+    rate_limit_rpm: 15
+    rate_limit_tpm: 20000
+    keys:
+      - account_1: ${AIONLABS_KEY_1}
+      - account_2: ${AIONLABS_KEY_2}
+      - account_3: ${AIONLABS_KEY_3}
+
+  # ── OAuth refresh_token credentials (auth_style: bearer + type: oauth_refresh) ──
+  # kind (auth_style) and lifecycle (type) are orthogonal: an oauth_refresh
+  # pool still attaches as a plain Bearer header, it just refreshes its own
+  # access token locally by exchanging client_id/client_secret + a per-key
+  # refresh_token — miroxy does this itself (credstone has no OAuth refresh
+  # support yet). Only use one oauth_refresh pool per replica if you're
+  # running more than one instance: there is no cross-replica coordination
+  # for the refresh_token exchange (miroxy logs a warning about this).
+  claude-oauth:
+    provider_ref: anthropic
+    type: oauth_refresh
+    auth_style: bearer
+    client_id:     ${OAUTH_CLIENT_ID}
+    client_secret: ${OAUTH_CLIENT_SECRET}
+    strategy: round_robin
+    keys:
+      - user1: ${OAUTH_REFRESH_TOKEN_1}       # each key's value is that user's refresh_token
+      - user2: ${OAUTH_REFRESH_TOKEN_2}
+
+  # ── AWS Bedrock SigV4 credentials (auth_style: sigv4) ──────────────────────
+  # sigv4 needs multiple fields per key instead of one string, plus
+  # region/service shared by every key in the pool. auth_style must be set
+  # on the pool itself (not just inferred from a model_routes entry) because
+  # sigv4 validation happens at pool-definition time.
+  bedrock-claude:
+    # protocol is "bedrock" (not "anthropic") — Bedrock's InvokeModel body is
+    # Anthropic-shaped but not byte-identical (model moves into the URL path;
+    # anthropic_version is a body field, not a header), so it gets its own
+    # UpstreamAdapter (internal/upstream/bedrock.go) that reuses the
+    # Anthropic wire converter with a small transform on top. api_base is set
+    # directly (no provider_ref) since Bedrock's endpoint is not the direct
+    # Anthropic API host.
+    protocol: bedrock
+    api_base: https://bedrock-runtime.us-east-1.amazonaws.com   # replace region to match yours
+    auth_style: sigv4
+    region: us-east-1
+    service: bedrock-runtime
+    strategy: round_robin
+    keys:
+      - prod:
+          access_key_id:     ${AWS_ACCESS_KEY_ID}
+          secret_access_key: ${AWS_SECRET_ACCESS_KEY}
+          session_token:     ${AWS_SESSION_TOKEN}   # optional — omit for long-term IAM creds
+      - backup:
+          access_key_id:     ${AWS_ACCESS_KEY_ID_2}
+          secret_access_key: ${AWS_SECRET_ACCESS_KEY_2}
+
+# ── Sidecars ─────────────────────────────────────────────────────────────────
+#
+# Every optional external-service integration lives under sidecar:, one block
+# per service, each independently on/off. miroxy runs with zero sidecars
+# configured by default — fully standalone, in-memory only. There is no
+# generic "sidecar" plugin framework: each sidecar is a normal Go interface
+# (e.g. cred.CredentialSource) with a builtin implementation and a
+# sidecar-backed one that happens to call out over whatever transport fits
+# (HTTP for credstone below; a future high-throughput compressor or security
+# scanner sidecar would likely use gRPC instead) — see
+# docs/design/architecture-v3.md for the pattern.
+#
+# credsource (credstone): when enabled, miroxy fetches API keys from a
+# credstone service instead of (or alongside) the credpools defined below.
+# credstone manages credential pools, lease lifecycle, and rate-limit state.
+# miroxy calls three credstone endpoints:
+#   Acquire:    borrow one key from a pool before each upstream request
+#   Release:    return the key with outcome flags after the request completes
+#   PoolStatus: poll pool health every sync_interval seconds
+#
+# Pool IDs: credpool names above (credpool_ref values) are used as pool IDs
+# when calling credstone. Ensure credstone has matching pool IDs.
+#
+# When disabled (default), miroxy uses credpools defined in this file only.
+# Both modes can coexist: for each named credpool above, credstone is tried
+# as one additional credential source alongside its local keys. A pool not
+# found in credstone (or temporarily exhausted there) falls back to that
+# credpool's local keys automatically — no extra config needed.
+#
+# Setup:
+#   1. Deploy credstone: docker run credstone/credstone:latest
+#   2. Create a pool in credstone: POST /v1/pools {"id": "gemini-flash"}
+#   3. Add credentials:  POST /v1/keys {"poolId":"gemini-flash",...}
+#   4. Set CREDSTONE_AUTH_TOKEN to match credstone's CREDSTONE_API_TOKEN
+#   5. Set enabled: true below
+# ───────────────────────────────────────────────────────────────────────────
+sidecar:
+  credsource:
+    enabled: false                        # set true to activate
+
+    base_url: "http://credstone:8000"     # credstone service URL
+                                           # no trailing slash
+                                           # supports http and https
+
+    auth_token: ${CREDSTONE_AUTH_TOKEN}   # bearer token for credstone auth
+                                           # must match credstone's
+                                           # CREDSTONE_API_TOKEN env var
+                                           # leave empty if credstone has no auth
+
+    sync_interval: 300                    # seconds between PoolStatus polls
+                                           # lower = faster health detection
+                                           # higher = less overhead
+                                           # default: 300 (5 minutes)
+
+# ── Local state cache (standalone mode only) ────────────────────────────────
+#
+# Optional on-disk cache of per-credential health (state/cooldown/failure
+# counters), backed by a small embedded buntdb store. Off by default — miroxy
+# is fully in-memory and forgets everything on restart unless this is on.
+#
+# Meaningless when sidecar.credsource.enabled is true above: credstone is
+# already the authoritative, cross-restart source of credential health in
+# that mode, so this is ignored (with a startup warning) rather than risking
+# two disagreeing sources of truth. Turn this on only in standalone mode, to
+# avoid immediately re-hammering a credential that was still cooling down
+# from a 429 right before a restart/redeploy.
+#
+# The file is a pure cache: if it's missing or corrupted, miroxy deletes and
+# recreates it rather than failing to start.
+# ───────────────────────────────────────────────────────────────────────────
+local_state:
+  enabled: false                          # set true to activate (standalone mode only)
+  path: ./miroxy-local-state.db           # buntdb file path; blank = this default
+
+# ── Model routing table ───────────────────────────────────────────────────────
+#
+# model_routes supports three configuration styles — mix freely:
+#
+# ┌─────────────────────────────────────────────────────────────────────────┐
+# │ Style 1 — miroxy named routes  (recommended starting point)            │
+# │                                                                         │
+# │ model_name starts with "miroxy". Multi-provider routing with           │
+# │ fallback / round_robin / least_requests. Use ANTHROPIC_MODEL=miroxy-*  │
+# │ in settings.json to select the policy.                                  │
+# │                                                                         │
+# │ "miroxy" is the default route — all unknown model names fall here      │
+# │ when server.default_model: miroxy is set.                               │
+# └─────────────────────────────────────────────────────────────────────────┘
+#
+# ┌─────────────────────────────────────────────────────────────────────────┐
+# │ Style 2 — Agent client model mapping  (optional, zero client changes)  │
+# │                                                                         │
+# │ model_name matches the model string your agent already sends           │
+# │ (e.g. claude-sonnet-4-6). miroxy silently routes it to a different     │
+# │ backend. Useful when you cannot change the agent's model setting but   │
+# │ want it served by Gemini, DeepSeek, or another provider.               │
+# └─────────────────────────────────────────────────────────────────────────┘
+#
+# ┌─────────────────────────────────────────────────────────────────────────┐
+# │ Style 3 — Native model passthrough  (what you configure is what runs)  │
+# │                                                                         │
+# │ model_name matches upstream_model exactly. The client picks the real   │
+# │ upstream model by name; miroxy adds key management and fallback on top. │
+# │ Example: model_name: gemini-2.5-flash → upstream_model: gemini-2.5-flash│
+# └─────────────────────────────────────────────────────────────────────────┘
+#
+# routing.strategy (Style 1 and multi-target Style 3):
+#   fallback       try targets in order; advance only when all keys in a
+#                  target are exhausted or circuit-broken.
+#                  Single-key 429 is handled inside the credpool and does
+#                  NOT trigger cross-provider fallback.
+#   round_robin    distribute requests evenly across all targets
+#   least_requests send to the target with fewest active in-flight requests
+#
+# Inline credpool (no credpool_ref):
+#   When a model needs its own isolated pool (e.g. Ollama with no keys).
+#   Same fields as credpools entries, written under credpool:.
+# ─────────────────────────────────────────────────────────────────────────────
+# ── Model routes ─────────────────────────────────────────────────────────────
+# model_name is both the routing key and the model ID returned by GET /v1/models.
+#
+# Claude Code model picker (gateway discovery):
+#   miroxy detects Claude Code via User-Agent: claude-code/* and automatically
+#   adds a "claude-" prefix to model IDs in the GET /v1/models response.
+#   This means model_name: my-gemini appears as "claude-my-gemini" in the picker
+#   without any naming convention required in config.
+#
+#   Also set in ~/.claude/settings.json to enable gateway discovery:
+#     "env": { "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY": "1" }
+#
+#   Routing: when Claude Code sends model: "claude-my-gemini", miroxy strips
+#   the auto-added prefix and routes to "my-gemini". Explicit claude-* names
+#   are matched first (exact), then stripped as fallback.
+#
+# ⚠ Do NOT configure both "modelA" and "claude-modelA" — they would expose the
+#   same gateway ID to Claude Code. Miroxy logs a WARN at startup if detected.
+#
+# ⚠ Do NOT configure both "modelA" and "claude-modelA" in the same model_routes.
+#   They would create routing ambiguity. Miroxy logs a warning at startup.
+# ─────────────────────────────────────────────────────────────────────────────
+model_routes:
+
+  # ════════════════════════════════════════════════════════════════════════
+  # Style 1 — miroxy named routes
+  # Set ANTHROPIC_MODEL=<model_name> in settings.json to use a route.
+  # The "miroxy" entry is the catch-all default (server.default_model above).
+  # ════════════════════════════════════════════════════════════════════════
+
+  # Default: balanced cost and quality
+  # Minimal settings.json: {"env":{"ANTHROPIC_BASE_URL":"http://localhost:8080","ANTHROPIC_AUTH_TOKEN":"sk-..."}}
+  # (default_model: miroxy catches all unrecognised model names automatically)
+  - model_name: miroxy
+    description: "Default — balanced cost and quality"
+    routing:
+      strategy: fallback
+      targets:
+        - upstream_model: gemini-2.5-flash
+          credpool_ref: gemini-flash
+          timeout_seconds: 30
+        - upstream_model: deepseek-chat
+          credpool_ref: deepseek
+          timeout_seconds: 30
+
+  # Reasoning / thinking: DeepSeek R1 first, Gemini Pro + Anthropic fallback
+  # Use: ANTHROPIC_MODEL=miroxy-thinking
+  - model_name: miroxy-thinking
+    description: "Reasoning — DeepSeek R1 first, Gemini Pro fallback"
+    routing:
+      strategy: fallback
+      targets:
+        - upstream_model: deepseek-reasoner
+          credpool_ref: deepseek
+          timeout_seconds: 120
+        - upstream_model: claude-sonnet-4-6
+          credpool_ref: anthropic
+          timeout_seconds: 60
+        - upstream_model: gemini-2.5-pro
+          credpool_ref: gemini-pro
+          timeout_seconds: 60
+
+  # Coding / agentic: Claude Sonnet first (best tool_use stability)
+  # Use: ANTHROPIC_MODEL=miroxy-code
+  - model_name: miroxy-code
+    description: "Coding — Claude Sonnet first, Gemini Pro fallback"
+    routing:
+      strategy: fallback
+      targets:
+        - upstream_model: claude-sonnet-4-6
+          credpool_ref: anthropic
+          timeout_seconds: 60
+        - upstream_model: gemini-2.5-pro
+          credpool_ref: gemini-pro
+          timeout_seconds: 60
+        - upstream_model: deepseek-chat
+          credpool_ref: deepseek
+          timeout_seconds: 30
+
+  # Documents: long-context, cheap, round-robin
+  # Use: ANTHROPIC_MODEL=miroxy-docs
+  - model_name: miroxy-docs
+    description: "Documents — long context, cheap, round-robin"
+    routing:
+      strategy: round_robin
+      sticky: true                    # keep a conversation on one provider, not bouncing gemini/deepseek per turn
+      sticky_ttl_seconds: 1800
+      targets:
+        - upstream_model: gemini-2.5-flash
+          credpool_ref: gemini-flash
+          timeout_seconds: 60
+        - upstream_model: deepseek-chat
+          credpool_ref: deepseek
+          timeout_seconds: 60
+
+  # Fast / background: cheapest, highest throughput
+  # Use: ANTHROPIC_MODEL=miroxy-fast
+  - model_name: miroxy-fast
+    description: "Fast — cheapest model, maximum throughput"
+    routing:
+      strategy: least_requests
+      targets:
+        - upstream_model: gemini-2.5-flash
+          credpool_ref: gemini-flash
+          timeout_seconds: 20
+        - upstream_model: deepseek-chat
+          credpool_ref: deepseek
+          timeout_seconds: 20
+
+  # Maximum quality: best models regardless of cost
+  # Use: ANTHROPIC_MODEL=miroxy-max
+  - model_name: miroxy-max
+    description: "Maximum — best models, cost no object"
+    routing:
+      strategy: fallback
+      targets:
+        - upstream_model: claude-opus-4-8
+          credpool_ref: anthropic
+          timeout_seconds: 120
+        - upstream_model: gemini-2.5-pro
+          credpool_ref: gemini-pro
+          timeout_seconds: 120
+
+  # ════════════════════════════════════════════════════════════════════════
+  # Style 2 — Agent client model mapping  (commented out — enable as needed)
+  #
+  # Use this when your agent's model name is hard-coded (e.g. in agent.md)
+  # and you cannot or do not want to change it.  miroxy intercepts the name
+  # and silently routes to a different provider.
+  #
+  # Note: if you can change the client config, just set ANTHROPIC_MODEL=miroxy
+  # and let the default route handle it — no mapping needed.
+  # ════════════════════════════════════════════════════════════════════════
+
+  # - model_name: claude-haiku-4-5-20251001   # exact ID from GET /v1/models (model_discovery: auto)
+  #   display_name: "Claude Haiku 4.5 → Gemini Flash"  # optional; shown in client model picker
+  #   upstream_model: gemini-2.5-flash
+  #   credpool_ref: gemini-flash    # provider/protocol resolved from this pool's provider_ref — in-flight counts stay accurate too
+  #   timeout_seconds: 30
+
+  # - model_name: claude-sonnet-4-6-20250219        # exact versioned ID overrides auto-discovery
+  #   display_name: "Claude Sonnet 4.6 → Gemini Pro"
+  #   upstream_model: gemini-2.5-pro
+  #   credpool_ref: gemini-pro
+  #   timeout_seconds: 30
+
+  # - model_name: claude-opus-4-8
+  #   upstream_model: gemini-2.5-pro
+  #   credpool_ref: gemini-pro
+  #   timeout_seconds: 60
+
+  # ════════════════════════════════════════════════════════════════════════
+  # Style 3 — Native model passthrough  (commented out — enable as needed)
+  #
+  # The client picks the real upstream model by name.  miroxy adds key
+  # management, 429 rotation, and optional fallback on top — nothing more.
+  # model_name == upstream_model: what you configure is what runs.
+  # ════════════════════════════════════════════════════════════════════════
+
+  # Single provider, multiple keys (rotation + 429 handling only):
+  # - model_name: gemini-2.5-flash
+  #   upstream_model: gemini-2.5-flash
+  #   credpool_ref: gemini-flash
+  #   timeout_seconds: 30
+
+  # - model_name: deepseek-chat
+  #   upstream_model: deepseek-chat
+  #   credpool_ref: deepseek
+  #   timeout_seconds: 30
+
+  # - model_name: deepseek-reasoner
+  #   upstream_model: deepseek-reasoner
+  #   credpool_ref: deepseek
+  #   timeout_seconds: 120
+
+  # Multi-provider fallback behind a native model name:
+  # - model_name: gemini-2.5-pro
+  #   description: "Gemini Pro with DeepSeek fallback"
+  #   routing:
+  #     strategy: fallback
+  #     targets:
+  #       - upstream_model: gemini-2.5-pro
+  #         credpool_ref: gemini-pro
+  #         timeout_seconds: 60
+  #       - upstream_model: deepseek-chat
+  #         credpool_ref: deepseek
+  #         timeout_seconds: 30
+
+  # Local Ollama — no API key needed, inline credpool:
+  # - model_name: llama3:8b
+  #   upstream_model: llama3:8b
+  #   credpool:
+  #     provider_ref: ollama
+  #     keys: []
+  #   timeout_seconds: 120
+
+  # GLM (智谱) native:
+  # - model_name: glm-4-flash
+  #   upstream_model: glm-4-flash
+  #   credpool:
+  #     provider_ref: glm
+  #     strategy: least_requests
+  #     keys:
+  #       - ${GLM_KEY_1}
+  #   timeout_seconds: 30
+
+  # AWS Bedrock — Claude via SigV4 (see the bedrock-claude credpool above):
+  # - model_name: claude-bedrock
+  #   routing:
+  #     strategy: fallback
+  #     targets:
+  #       - upstream_model: anthropic.claude-opus-4-5-20251101-v1:0
+  #         credpool_ref: bedrock-claude
+  #         timeout_seconds: 60
+
+  # AionLabs free tier — use the smallest general-purpose model (aion-3.0-mini)
+  # to stretch the 20k-tokens/day cap over more requests; avoid aion-rp-llama-3.1-8b
+  # here, it's roleplay-tuned and not representative for general testing.
+  # - model_name: aion-3.0-mini
+  #   upstream_model: aion-labs/aion-3.0-mini
+  #   credpool_ref: aionlabs-free
+  #   timeout_seconds: 30
+
+metrics:
+  enabled: false
+  path: /metrics
+
+# ── Content defense (builtin, pure Go — secrets/PII/injection/jailbreak) ──────
+# Runs first in the pipeline (PriorityWarden=300), before compress. Detects and
+# rewrites secrets, structured PII, and prompt-injection/jailbreak phrases in
+# the inbound request, then restores any vault tokens in the response.
+warden:
+  enabled: false             # set true to activate WardenPlugin
+
+  # How Redact/Block-verdict findings are rewritten:
+  #   redact     - destructive masking, e.g. j***@example.com (default)
+  #   tokenize   - reversible ⟦TYPE:NNN⟧ placeholders, restored in the response
+  #   block_only - never rewrite; a Block verdict still halts the request
+  mode: redact
+
+  # Each detector defaults to true once warden.enabled is true.
+  secrets: true
+  pii: true
+  injection: true
+  jailbreak: true
+
+  # If true, a detector error (e.g. a recovered panic) blocks the request
+  # instead of passing it through best-effort. Default false.
+  fail_closed: false
+
+# ── Context compression (builtin, no ML required) ─────────────────────────────
+compress:
+  enabled: false             # set true to activate CompressPlugin
+
+  # SmartCrusher: compress tool_result content that exceeds this token count.
+  # JSON arrays/objects and log output are compressed; plain text is skipped.
+  tool_result_budget: 500
+
+  # SlidingWindow: target token count for the whole message list.
+  # Oldest turns are dropped (scored) when this is exceeded.
+  total_budget: 80000
+
+  # Number of most-recent turns always preserved by the sliding window.
+  window_recent_keep: 6
+
+  # CacheAligner: replace UUIDs / timestamps / request-IDs with stable
+  # placeholders so the provider's KV-cache prefix hash stays consistent.
+  # Disabled by default because it mutates content.
+  align_dynamic: false
+
+  # CCR persistent store path (bbolt). Leave empty for in-memory (session-only).
+  # In Docker, mount /data and set:  ccr_path: /data/ccr.db
+  ccr_path: ""
+
+# ── Request/response dump (trace-level debugging) ─────────────────────────────
+# Captures every request and response as JSONL for protocol analysis.
+# All records share a trace_id so request and response can be correlated 1-to-1.
+#
+# Two record types depending on mode:
+#
+#   transparent mode:  raw_request + response          (no processing, wire data)
+#   proxy mode:        raw_request + miroxy_request + response
+#                      (shows before / after miroxy transformation)
+#
+# Use cases:
+#   - Debug Codex / Claude Code protocol issues by inspecting exact SSE events
+#   - Discover undocumented API formats from new clients
+#   - Verify miroxy translation is correct (raw_request vs miroxy_request diff)
+#
+# WARNING: captures full message content including user data. Never enable in
+# production. Rotate or delete dump files after debugging sessions.
+# ─────────────────────────────────────────────────────────────────────────────
+dump:
+  enabled: false
+  path: ./dump.jsonl    # JSONL output file; empty string = stdout
+  include_sse: false    # true: write each SSE event as a separate record (verbose)
+  # File rotation — keeps dump files from growing unboundedly.
+  # When the file exceeds max_size_mb, it is renamed to dump.jsonl.1
+  # (shifting older backups down) and a fresh dump.jsonl is started.
+  # Example with max_backups: 2 → dump.jsonl, dump.jsonl.1, dump.jsonl.2
+  max_size_mb: 10       # rotate at this size; 0 = unlimited (no rotation)
+  max_backups: 2        # number of rotated files to keep (0 = use default: 2)
+
+# ── Transparent proxy (pure passthrough, zero processing) ─────────────────────
+# Bypasses all pipeline processing: no auth plugin, no compress, no translation.
+# miroxy acts as a dumb reverse proxy — client request forwarded as-is, response
+# returned as-is. Only the upstream URL and auth header are rewritten.
+#
+# Combine with dump: true to capture raw wire data for protocol research.
+#
+# Client config stays unchanged (still points to localhost:PORT).
+# ─────────────────────────────────────────────────────────────────────────────
+transparent:
+  enabled: false
+  upstream: "https://api.anthropic.com"   # real API endpoint to forward to
+  api_key: ${ANTHROPIC_API_KEY}           # injected as Authorization + x-api-key

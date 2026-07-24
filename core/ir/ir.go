@@ -31,6 +31,9 @@ type IRRequest struct {
 	ToolChoice *IRToolChoice
 	Gen        IRGenerationConfig
 	Stream     bool
+	// UserID is an opaque end-user identifier, used only for session-affinity
+	// routing (core/selector/affinity.go) — never forwarded upstream.
+	UserID string
 }
 
 // IRMessage is a single conversation turn.
@@ -40,15 +43,24 @@ type IRMessage struct {
 }
 
 // IRContentPart is a discriminated union of content part types.
-// Exactly one of Text, ToolUse, or ToolResult is non-nil.
+// Exactly one of Text, ToolUse, ToolResult, Image, or Reasoning is non-nil.
 type IRContentPart struct {
 	Text       *IRTextPart
 	ToolUse    *IRToolUsePart
 	ToolResult *IRToolResultPart
+	Image      *IRImagePart
+	Reasoning  *IRReasoningPart
 }
 
 // IRTextPart is a plain text content block.
 type IRTextPart struct{ Text string }
+
+// IRImagePart is an inline or URL-referenced image content block.
+type IRImagePart struct {
+	SourceType string // "base64" | "url"
+	MediaType  string // MIME type (e.g. "image/png"); empty when SourceType is "url"
+	Data       string // base64-encoded bytes or a URL, per SourceType
+}
 
 // IRToolUsePart is a model-initiated function call block.
 type IRToolUsePart struct {
@@ -62,6 +74,17 @@ type IRToolResultPart struct {
 	ToolUseID string
 	Content   []IRContentPart
 	IsError   bool
+}
+
+// IRReasoningPart is a model-internal reasoning/thinking content block.
+// Text is the visible reasoning shown to the client (empty when fully
+// redacted). Signature is an opaque, provider-issued token that must be
+// echoed back verbatim on a later turn — e.g. Anthropic's thinking.signature
+// / redacted_thinking.data, or a Responses reasoning item's
+// encrypted_content. Never generated or interpreted by miroxy itself.
+type IRReasoningPart struct {
+	Text      string
+	Signature string
 }
 
 // IRTool is a function declaration available to the model.
@@ -96,12 +119,15 @@ type IRResponse struct {
 
 // IRResponseBlock is a discriminated union of response block types.
 type IRResponseBlock struct {
-	Text    *IRTextPart
-	ToolUse *IRToolUsePart
+	Text      *IRTextPart
+	ToolUse   *IRToolUsePart
+	Reasoning *IRReasoningPart
 }
 
 // IRUsage carries token count metadata.
 type IRUsage struct {
-	InputTokens  int
-	OutputTokens int
+	InputTokens              int
+	OutputTokens             int
+	CacheCreationInputTokens int
+	CacheReadInputTokens     int
 }

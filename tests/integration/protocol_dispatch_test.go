@@ -125,10 +125,18 @@ func TestRoundRobin_DynamicProtocolDispatch(t *testing.T) {
 	}
 
 	// openai leg: protocol matched the client's actual protocol (openai) ->
-	// raw passthrough. The original bytes, including reasoning_effort (which
-	// has no Anthropic-canonical equivalent), must survive verbatim.
-	if got := received["openai"]; got != body {
-		t.Errorf("openai leg: raw body mismatch.\n got:  %s\n want: %s", got, body)
+	// raw passthrough. reasoning_effort (no Anthropic-canonical equivalent)
+	// must survive verbatim — but "model" is not a protocol-shape concern,
+	// it's miroxy's own routing alias ("miroxy-code"), which this real
+	// upstream (unlike this test's permissive stub) would reject outright.
+	// Passthrough rewrites it to the target's upstream_model ("gpt-target"),
+	// same as every real transform adapter already does (see
+	// AnthropicUpstream.build's outReq.Model = a.upstreamModel) — the one
+	// field passthrough does not forward byte-for-byte. Key order shifts to
+	// alphabetical because the rewrite round-trips through a map.
+	const wantOpenAIBody = `{"messages":[{"role":"user","content":"hi"}],"model":"gpt-target","reasoning_effort":"xhigh"}`
+	if got := received["openai"]; got != wantOpenAIBody {
+		t.Errorf("openai leg: raw body mismatch.\n got:  %s\n want: %s", got, wantOpenAIBody)
 	}
 
 	// gemini leg: protocol mismatched -> real IR transform. reasoning_effort
@@ -151,5 +159,80 @@ func TestRoundRobin_DynamicProtocolDispatch(t *testing.T) {
 	}
 	if got := received["anthropic"]; !strings.Contains(got, `"messages"`) {
 		t.Errorf("anthropic leg: body doesn't look like Anthropic wire shape: %s", got)
+	}
+}
+
+// TestRetry_Raw_404OnFirstKey_RetriesToSecondKey is the literal reported
+// bug: in raw/passthrough dispatch mode (client protocol == target
+// protocol — the exact case here, an openai client hitting an openai
+// target), a non-429/5xx status (404 — e.g. a provider's free-tier model
+// deprecation) must still fail over to the next key, not terminate the
+// retry loop on the very first attempt.
+func TestRetry_Raw_404OnFirstKey_RetriesToSecondKey(t *testing.T) {
+	var mu sync.Mutex
+	calls := 0
+
+	openaiStub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		calls++
+		n := calls
+		mu.Unlock()
+
+		if n == 1 {
+			w.WriteHeader(http.StatusNotFound)
+			w.Write([]byte(`{"error":{"message":"model unavailable for free","code":404}}`))
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"id":"chatcmpl-raw","object":"chat.completion","choices":[{"message":{"role":"assistant","content":"hi"}}]}`))
+	}))
+	defer openaiStub.Close()
+
+	cfg := &config.Config{
+		Auth: config.AuthConfig{AllowedKeys: []string{testClientKey}},
+		CredPools: map[string]config.CredPoolCfg{
+			"pool-openai": {Keys: []config.CredEntry{
+				{Name: "bad", Key: "bad-key"},
+				{Name: "good", Key: "good-key"},
+			}},
+		},
+		ModelRoutes: []config.ModelEntry{{
+			ModelName: "miroxy-code",
+			Routing: &config.RoutingConfig{
+				Strategy: "round_robin",
+				Targets: []config.RoutingTarget{
+					{ProviderRef: "openai", UpstreamModel: "gpt-target", CredpoolRef: "pool-openai", Protocol: "openai", APIBase: openaiStub.URL},
+				},
+			},
+			TimeoutSeconds: 5,
+		}},
+	}
+
+	srv := server.New(cfg, "")
+	defer srv.Close()
+	miroxy := httptest.NewServer(srv.Handler())
+	defer miroxy.Close()
+
+	const body = `{"model":"miroxy-code","messages":[{"role":"user","content":"hi"}]}`
+	req, err := http.NewRequest(http.MethodPost, miroxy.URL+"/v1/chat/completions", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+testClientKey)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("request: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 after raw-mode failover past 404, got %d", resp.StatusCode)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if calls != 2 {
+		t.Errorf("expected exactly 2 upstream calls (1 failed + 1 succeeded), got %d", calls)
 	}
 }

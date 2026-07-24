@@ -22,6 +22,7 @@ providers:
 
 credpools:
   gemini-flash:
+    provider_ref: gemini
     strategy: least_requests
     rate_limit_rpm: 20
     keys:
@@ -30,18 +31,21 @@ credpools:
       - key_3: ${GEMINI_KEY_3}
 
   gemini-pro:
+    provider_ref: gemini
     strategy: least_requests
     rate_limit_rpm: 5
     keys:
       - pro_key: ${GEMINI_PRO_KEY}
 
   anthropic-pool:
+    provider_ref: anthropic
     strategy: least_requests
     keys:
       - main:   ${ANTHROPIC_KEY_1}
       - backup: ${ANTHROPIC_KEY_2}
 
   deepseek-pool:
+    provider_ref: deepseek
     strategy: round_robin
     keys:
       - ds_key_1: ${DEEPSEEK_KEY_1}
@@ -53,12 +57,10 @@ model_routes:
     routing:
       strategy: fallback
       targets:
-        - provider: gemini
-          provider_model: gemini-2.5-flash
+        - upstream_model: gemini-2.5-flash
           credpool_ref: gemini-flash
           timeout_seconds: 30
-        - provider: deepseek
-          provider_model: deepseek-chat
+        - upstream_model: deepseek-chat
           credpool_ref: deepseek-pool
           timeout_seconds: 30
 
@@ -67,12 +69,10 @@ model_routes:
     routing:
       strategy: fallback
       targets:
-        - provider: anthropic
-          provider_model: claude-sonnet-4-6
+        - upstream_model: claude-sonnet-4-6
           credpool_ref: anthropic-pool
           timeout_seconds: 60
-        - provider: gemini
-          provider_model: gemini-2.5-pro
+        - upstream_model: gemini-2.5-pro
           credpool_ref: gemini-pro
           timeout_seconds: 60
 
@@ -81,18 +81,15 @@ model_routes:
     routing:
       strategy: fallback
       targets:
-        - provider: deepseek
-          provider_model: deepseek-reasoner
+        - upstream_model: deepseek-reasoner
           credpool_ref: deepseek-pool
           timeout_seconds: 120
-        - provider: gemini
-          provider_model: gemini-2.5-pro
+        - upstream_model: gemini-2.5-pro
           credpool_ref: gemini-pro
           timeout_seconds: 120
 
   # Throughput: round-robin across Gemini Flash keys
   - model_name: miroxy-fast
-    provider: gemini
-    provider_model: gemini-2.5-flash
+    upstream_model: gemini-2.5-flash
     credpool_ref: gemini-flash
     timeout_seconds: 20

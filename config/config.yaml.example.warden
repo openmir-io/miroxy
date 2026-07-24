@@ -23,13 +23,13 @@ providers:
 
 credpools:
   my-pool:
+    provider_ref: gemini
     keys:
       - my_key: ${GEMINI_KEY}
 
 model_routes:
   - model_name: miroxy
-    provider: gemini
-    provider_model: gemini-2.5-flash
+    upstream_model: gemini-2.5-flash
     credpool_ref: my-pool
 
 # ── Content defense ────────────────────────────────────────────────────────

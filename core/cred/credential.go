@@ -1,9 +1,16 @@
 package cred
 
 import (
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
+	"slices"
+	"strings"
+	"time"
 )
 
 // Credential represents authentication material for an upstream provider.
@@ -66,9 +73,9 @@ func (c *QueryCredential) Redacted() string { return "?" + url.QueryEscape(c.Par
 
 // SigV4Credential holds AWS Signature Version 4 signing material.
 //
-// Apply is intentionally unimplemented for the v1 open-source release.
-// Route it to an SDKDispatcher (not HTTPDispatcher) when AWS Bedrock support
-// is added — the AWS SDK handles request signing internally.
+// Apply signs the request in place (Authorization + x-amz-* headers) using
+// the request's own body via GetBody — no AWS SDK dependency. Covers AWS
+// Bedrock and any other SigV4-authenticated service.
 type SigV4Credential struct {
 	AccessKeyID     string
 	SecretAccessKey string
@@ -77,8 +84,107 @@ type SigV4Credential struct {
 	Service         string // e.g. "bedrock-runtime"
 }
 
-func (c *SigV4Credential) Apply(_ *http.Request) error {
-	return fmt.Errorf("SigV4Credential.Apply: not implemented; use SDKDispatcher for AWS Bedrock")
+func (c *SigV4Credential) Apply(req *http.Request) error {
+	if req.GetBody == nil {
+		return fmt.Errorf("sigv4: request body must be re-readable (built from bytes.Reader)")
+	}
+	bodyReader, err := req.GetBody()
+	if err != nil {
+		return fmt.Errorf("sigv4: re-reading body: %w", err)
+	}
+	body, err := io.ReadAll(bodyReader)
+	if err != nil {
+		return fmt.Errorf("sigv4: reading body: %w", err)
+	}
+
+	now := time.Now().UTC()
+	dateStamp := now.Format("20060102")
+	amzDate := now.Format("20060102T150405Z")
+
+	req.Header.Set("x-amz-date", amzDate)
+	if c.SessionToken != "" {
+		req.Header.Set("x-amz-security-token", c.SessionToken)
+	}
+
+	payloadHash := sigV4SHA256Hex(body)
+	req.Header.Set("x-amz-content-sha256", payloadHash)
+
+	// Signed headers: content-type, host, and every x-amz-* header already
+	// set on the request (date, security-token, content-sha256, ...).
+	signedHeaders := []string{"content-type", "host"}
+	for h := range req.Header {
+		if lower := strings.ToLower(h); strings.HasPrefix(lower, "x-amz-") {
+			signedHeaders = append(signedHeaders, lower)
+		}
+	}
+	slices.Sort(signedHeaders)
+
+	var canonicalHeaders strings.Builder
+	for _, h := range signedHeaders {
+		val := req.Header.Get(h)
+		if h == "host" {
+			val = req.URL.Host
+		}
+		canonicalHeaders.WriteString(h + ":" + strings.TrimSpace(val) + "\n")
+	}
+
+	canonicalRequest := strings.Join([]string{
+		req.Method,
+		sigV4URIEncodePath(req.URL.Path),
+		req.URL.RawQuery,
+		canonicalHeaders.String(),
+		strings.Join(signedHeaders, ";"),
+		payloadHash,
+	}, "\n")
+
+	credentialScope := dateStamp + "/" + c.Region + "/" + c.Service + "/aws4_request"
+	stringToSign := "AWS4-HMAC-SHA256\n" + amzDate + "\n" + credentialScope + "\n" + sigV4SHA256Hex([]byte(canonicalRequest))
+
+	signingKey := sigV4HMACSHA256(sigV4HMACSHA256(sigV4HMACSHA256(sigV4HMACSHA256(
+		[]byte("AWS4"+c.SecretAccessKey), []byte(dateStamp)),
+		[]byte(c.Region)),
+		[]byte(c.Service)),
+		[]byte("aws4_request"))
+
+	signature := hex.EncodeToString(sigV4HMACSHA256(signingKey, []byte(stringToSign)))
+
+	req.Header.Set("Authorization", fmt.Sprintf(
+		"AWS4-HMAC-SHA256 Credential=%s/%s, SignedHeaders=%s, Signature=%s",
+		c.AccessKeyID, credentialScope, strings.Join(signedHeaders, ";"), signature,
+	))
+	return nil
+}
+
+// sigV4URIEncodePath URI-encodes each path segment per AWS SigV4 canonical
+// request rules (RFC 3986 unreserved characters only; slashes preserved).
+// Distinct from Go's own URL escaping, which permits a wider character set.
+func sigV4URIEncodePath(path string) string {
+	var buf strings.Builder
+	for i := 0; i < len(path); i++ {
+		c := path[i]
+		if c == '/' || sigV4IsUnreserved(c) {
+			buf.WriteByte(c)
+		} else {
+			fmt.Fprintf(&buf, "%%%02X", c)
+		}
+	}
+	return buf.String()
+}
+
+func sigV4IsUnreserved(c byte) bool {
+	return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+		(c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.' || c == '~'
+}
+
+func sigV4SHA256Hex(data []byte) string {
+	h := sha256.Sum256(data)
+	return hex.EncodeToString(h[:])
+}
+
+func sigV4HMACSHA256(key, data []byte) []byte {
+	h := hmac.New(sha256.New, key)
+	h.Write(data)
+	return h.Sum(nil)
 }
 
 func (c *SigV4Credential) Type() string { return "aws_sigv4" }

@@ -20,19 +20,22 @@ type Config struct {
 	Providers   map[string]ProviderDef `yaml:"providers"`
 	CredPools   map[string]CredPoolCfg `yaml:"credpools"`
 	ModelRoutes []ModelEntry           `yaml:"model_routes"`
-	// CredpoolFamilies maps each credpool name to its upstream provider
-	// family (anthropic/openai/gemini), resolved once at load time by
-	// resolveCredpoolFamilies — see that function's doc comment. Not a YAML
-	// field; populated after validateConfig has rejected any conflicting
-	// associations.
-	CredpoolFamilies map[string]string `yaml:"-"`
-	Metrics          MetricsConfig     `yaml:"metrics"`
-	Warden           WardenConfig      `yaml:"warden"`
-	Compress         CompressConfig    `yaml:"compress"`
-	Dump             DumpConfig        `yaml:"dump"`
-	Transparent      TransparentConfig `yaml:"transparent"`
-	Sidecar          SidecarConfig     `yaml:"sidecar"`
-	LocalState       LocalStateConfig  `yaml:"local_state"`
+	Metrics     MetricsConfig          `yaml:"metrics"`
+	Warden      WardenConfig           `yaml:"warden"`
+	Compress    CompressConfig         `yaml:"compress"`
+	Dump        DumpConfig             `yaml:"dump"`
+	Transparent TransparentConfig      `yaml:"transparent"`
+	Sidecar     SidecarConfig          `yaml:"sidecar"`
+	LocalState  LocalStateConfig       `yaml:"local_state"`
+
+	// NativePassthroughEnable is the root safety switch for LookupModel step
+	// 4 (see its doc comment) — a client's default model picker resolving to
+	// a native vendor name (e.g. Claude Code choosing "claude-opus-4-8")
+	// must not silently reach a real vendor credpool unless the operator
+	// explicitly opts in here. Default false. Even when true, a request only
+	// actually reaches a native pool if at least one credpool also sets
+	// native_passthrough: true for the matching protocol.
+	NativePassthroughEnable bool `yaml:"native_passthrough_enable"`
 }
 
 // SidecarConfig groups every optional external-service integration under one
@@ -141,10 +144,20 @@ type ProviderDef struct {
 // internal/server/upstream.go's dispatchFor) — mode: passthrough below
 // forces raw forwarding unconditionally regardless of that comparison.
 type ModelEntry struct {
-	ModelName      string         `yaml:"model_name"`
-	DisplayName    string         `yaml:"display_name,omitempty"` // human-readable label for /v1/models; defaults to ModelName
-	ProviderRef    string         `yaml:"provider_ref"`           // key into the top-level providers: block
-	Protocol       string         `yaml:"protocol"`
+	ModelName   string `yaml:"model_name"`
+	DisplayName string `yaml:"display_name,omitempty"` // human-readable label for /v1/models; defaults to ModelName
+
+	// ProviderRef/Protocol/APIBase/AuthStyle are resolved from this entry's
+	// credpool (CredpoolRef, or the inline CredPool below) by
+	// resolveProviders — not user-facing YAML fields. A credpool's keys
+	// always belong to a single upstream provider, so that binding is
+	// declared once, on the credpool (see CredPoolCfg.ProviderRef), never
+	// duplicated here.
+	ProviderRef string `yaml:"-"`
+	Protocol    string `yaml:"-"`
+	APIBase     string `yaml:"-"`
+	AuthStyle   string `yaml:"-"`
+
 	UpstreamModel  string         `yaml:"upstream_model"`
 	CredPool       CredPoolCfg    `yaml:"credpool"`
 	CredpoolRef    string         `yaml:"credpool_ref"`
@@ -152,8 +165,6 @@ type ModelEntry struct {
 	Description    string         `yaml:"description"`
 	TimeoutSeconds int            `yaml:"timeout_seconds"`
 	Mode           string         `yaml:"mode"`
-	APIBase        string         `yaml:"api_base"`
-	AuthStyle      string         `yaml:"auth_style"`
 	Invisible      bool           `yaml:"invisible"`
 }
 
@@ -161,20 +172,27 @@ type ModelEntry struct {
 type RoutingConfig struct {
 	Strategy string          `yaml:"strategy"` // fallback | round_robin | least_requests
 	Targets  []RoutingTarget `yaml:"targets"`
+
+	// Sticky keeps a conversation on the same target across requests instead
+	// of rotating every call; no effect on "fallback". See CredPoolCfg.Sticky.
+	Sticky           bool `yaml:"sticky"`
+	StickyTTLSeconds int  `yaml:"sticky_ttl_seconds"`
 }
 
 // RoutingTarget is one upstream provider within a routing entry.
-// Protocol, APIBase, and AuthStyle are resolved from the providers block
-// at config load time and not expected in YAML.
+// ProviderRef, Protocol, APIBase, and AuthStyle are resolved from
+// CredpoolRef's credpool at config load time and not expected in YAML —
+// see CredPoolCfg.ProviderRef.
 type RoutingTarget struct {
-	ProviderRef    string `yaml:"provider_ref"` // key into the top-level providers: block
 	UpstreamModel  string `yaml:"upstream_model"`
 	CredpoolRef    string `yaml:"credpool_ref"`
 	TimeoutSeconds int    `yaml:"timeout_seconds"`
-	// Resolved by resolveProviders — not user-facing YAML fields.
-	Protocol  string `yaml:"-"`
-	APIBase   string `yaml:"-"`
-	AuthStyle string `yaml:"-"`
+	// Resolved by resolveProviders from the credpool named by CredpoolRef —
+	// not user-facing YAML fields.
+	ProviderRef string `yaml:"-"`
+	Protocol    string `yaml:"-"`
+	APIBase     string `yaml:"-"`
+	AuthStyle   string `yaml:"-"`
 }
 
 // CredEntry is a single upstream credential with an optional display name.
@@ -190,6 +208,16 @@ type CredEntry struct {
 	AccessKeyID     string
 	SecretAccessKey string
 	SessionToken    string // optional — empty for long-term IAM credentials
+}
+
+// IsUsable reports whether e has real credential material for authStyle —
+// false for an empty value or an unexpanded ${ENV_VAR} placeholder.
+func (e CredEntry) IsUsable(authStyle string) bool {
+	if authStyle == "sigv4" {
+		return e.AccessKeyID != "" && e.SecretAccessKey != "" &&
+			!envVarRe.MatchString(e.AccessKeyID) && !envVarRe.MatchString(e.SecretAccessKey)
+	}
+	return e.Key != "" && !envVarRe.MatchString(e.Key)
 }
 
 func (e *CredEntry) UnmarshalYAML(value *yaml.Node) error {
@@ -254,28 +282,42 @@ type sigv4Fields struct {
 }
 
 type CredPoolCfg struct {
-	// UpstreamModelType tags this credpool with the upstream provider family
-	// its keys belong to: "anthropic", "openai", or "gemini". A credpool's
-	// keys always belong to a single family — this is not a per-model
-	// binding (see UpstreamModel on ModelEntry/RoutingTarget for that).
-	//
-	// Optional whenever this pool is already referenced by a model_routes
-	// entry/target — the family is derived automatically from that
-	// reference's provider_ref (see resolveCredpoolFamilies in yaml.go).
-	// Required (and used as an explicit override otherwise) for a pool held
-	// only for provider passthrough — see LookupModel step 4 — since there's
-	// no model_routes reference to derive it from. Also used for model
-	// auto-discovery: when model_discovery: auto is set, miroxy calls the
-	// provider's /v1/models endpoint at startup and injects discovered
-	// models (anthropic/openai only).
-	UpstreamModelType string `yaml:"upstream_model_type,omitempty"`
+	// ProviderRef is the key into the top-level providers: block that
+	// determines this pool's upstream wire protocol, base URL, and auth
+	// style — a credpool's keys always belong to a single upstream
+	// provider (never split across two protocols), so this is the one
+	// place that binding is declared; model_routes only ever says WHICH
+	// credpool to use, never which provider (see ModelEntry/RoutingTarget,
+	// whose own ProviderRef is resolved from here). Required unless
+	// Protocol and APIBase are both set directly below (a fully
+	// self-contained pool that needs no shared providers: entry).
+	ProviderRef string `yaml:"provider_ref,omitempty"`
 
-	// AuthStyle declares this pool's credential kind up front: "bearer",
-	// "api_key", "query_key", "sigv4", or "none". Optional for header/query
-	// pools (inferred from whatever model_routes entry references the pool,
-	// via namedPoolAuthStyle) but required for "sigv4" pools, since sigv4
-	// validation happens at pool-definition time, before any reference is
-	// resolved.
+	// NativePassthrough opts this pool into serving requests for a model
+	// name that is globally unique to one vendor (claude-*/gpt-*/gemini-* —
+	// see inferModelProvider) but matches no model_routes entry — see
+	// LookupModel step 4. Only valid when this pool's resolved Protocol is
+	// one of nativeVendorProtocols: its keys must genuinely be that
+	// vendor's own API, since the client's model name is forwarded upstream
+	// verbatim with no translation. Also gates model_discovery: auto (see
+	// openai_discover.go/anthropic_discover.go) for the same reason — only
+	// a pool holding real vendor keys can be safely queried against that
+	// vendor's global /v1/models endpoint. The root native_passthrough_enable
+	// switch must also be set for this to take effect. Default false.
+	NativePassthrough bool `yaml:"native_passthrough,omitempty"`
+
+	// Protocol/APIBase are resolved from ProviderRef (+ built-in defaults —
+	// see provider_defaults.go) by resolveProviders when left blank, or may
+	// be set directly here for a fully self-contained pool with no
+	// providers: entry. Every model_routes entry or routing target that
+	// references this pool inherits these values.
+	Protocol string `yaml:"protocol,omitempty"`
+	APIBase  string `yaml:"api_base,omitempty"`
+
+	// AuthStyle declares this pool's credential kind: "bearer", "api_key",
+	// "query_key", "sigv4", or "none". Resolved from ProviderRef when left
+	// blank; required explicitly for "sigv4" pools, since sigv4 validation
+	// happens at pool-definition time, before provider resolution runs.
 	AuthStyle string `yaml:"auth_style,omitempty"`
 
 	Type         string `yaml:"type"`
@@ -288,7 +330,7 @@ type CredPoolCfg struct {
 	Region  string `yaml:"region,omitempty"`
 	Service string `yaml:"service,omitempty"`
 
-	Strategy              string      `yaml:"strategy"`
+	Strategy              string      `yaml:"strategy"` // round_robin | least_requests | fallback
 	CircuitBreakThreshold int         `yaml:"circuit_break_threshold"`
 	CooldownSeconds       int         `yaml:"cooldown_seconds"`
 	Keys                  []CredEntry `yaml:"keys"`
@@ -298,6 +340,17 @@ type CredPoolCfg struct {
 	// minute; 0 = disabled (the default — most credentials have no
 	// provider-side token quota worth tracking locally).
 	RateLimitTPM int `yaml:"rate_limit_tpm"`
+
+	// Sticky keeps a conversation on the same credential (cache hit rate)
+	// instead of rotating every call. Orthogonal to Strategy. Default false.
+	Sticky bool `yaml:"sticky"`
+	// StickyTTLSeconds is how long an idle conversation's binding survives.
+	// Default 1800 (30m) when Sticky is true and this is left at 0.
+	StickyTTLSeconds int `yaml:"sticky_ttl_seconds"`
+
+	// RoundRobinBatchSize: use each credential this many calls before
+	// rotating — a global counter, not per-conversation. Default 1.
+	RoundRobinBatchSize int `yaml:"round_robin_batch_size"`
 }
 
 type MetricsConfig struct {
@@ -418,21 +471,23 @@ func (c *Config) LookupModel(name string) (ModelEntry, bool) {
 		return c.ModelRoutes[bestIdx], true
 	}
 
-	// 4. Provider passthrough: infer provider from model name pattern, find a
-	//    credpool whose family (explicit upstream_model_type, or derived from
-	//    its model_routes usage — see resolveCredpoolFamilies) matches.
-	//    Returns a synthetic ModelEntry so the executor can use the
-	//    passthroughSelectors built at startup.
-	if provider := inferModelProvider(name); provider != "" {
-		for poolName, pool := range c.CredPools {
-			if c.CredpoolFamilies[poolName] == provider && len(pool.Keys) > 0 {
-				return ModelEntry{
-					ModelName:     name,
-					ProviderRef:   provider,
-					UpstreamModel: name, // forward the original model name to the upstream
-					CredpoolRef:   poolName,
-				}, true
-			}
+	// 4. Native vendor passthrough: the model name is globally unique to one
+	//    vendor (claude-*/gpt-*/gemini-* — see inferModelProvider) but
+	//    matched no model_routes entry. Only engages when
+	//    native_passthrough_enable is set and at least one credpool opted
+	//    in via native_passthrough: true for that vendor's protocol.
+	//    Returns a synthetic ModelEntry with no CredpoolRef — actual
+	//    selection (and round-robin across multiple such pools) happens via
+	//    the PassthroughSelectors built in buildRoutingState, keyed by
+	//    protocol and looked up through this entry's ProviderRef (see
+	//    router.BuiltinRouter.Route).
+	if c.NativePassthroughEnable {
+		if provider := inferModelProvider(name); provider != "" && c.hasNativePassthroughPool(provider) {
+			return ModelEntry{
+				ModelName:     name,
+				ProviderRef:   provider,
+				UpstreamModel: name, // forward the original model name to the upstream
+			}, true
 		}
 	}
 
@@ -445,6 +500,19 @@ func (c *Config) LookupModel(name string) (ModelEntry, bool) {
 		}
 	}
 	return ModelEntry{}, false
+}
+
+// nativeVendorProtocols is the fixed set of protocols inferModelProvider can
+// return — the only protocols a credpool may set native_passthrough: true
+// for (see CredPoolCfg.NativePassthrough). Single source of truth for "these
+// three vendors have a globally unique model-naming convention"; extending
+// inferModelProvider to recognize a new vendor must add its protocol here
+// too, so both stay in lockstep rather than drifting into two subtly
+// different enums.
+var nativeVendorProtocols = map[string]bool{
+	"anthropic": true,
+	"openai":    true,
+	"gemini":    true,
 }
 
 // inferModelProvider maps a model name to its likely provider.
@@ -463,6 +531,18 @@ func inferModelProvider(name string) string {
 		return "gemini"
 	}
 	return ""
+}
+
+// hasNativePassthroughPool reports whether any credpool opted into
+// native_passthrough for protocol and has at least one usable key — see
+// LookupModel step 4.
+func (c *Config) hasNativePassthroughPool(protocol string) bool {
+	for _, kp := range c.CredPools {
+		if kp.NativePassthrough && kp.Protocol == protocol && len(kp.Keys) > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 // DumpConfig enables request/response capture for debugging (trace level).

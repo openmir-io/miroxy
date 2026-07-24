@@ -29,9 +29,9 @@ providers:
   gemini: {}
 model_routes:
   - model_name: claude-haiku
-    provider_ref: gemini
     upstream_model: gemini-2.5-flash
     credpool:
+      provider_ref: gemini
       strategy: round_robin
       keys:
         - test-api-key
@@ -60,9 +60,9 @@ providers:
   gemini: {}
 model_routes:
   - model_name: claude-haiku
-    provider_ref: gemini
     upstream_model: gemini-2.5-flash
     credpool:
+      provider_ref: gemini
       keys:
         - ${TEST_GEMINI_KEY}
 `)
@@ -82,7 +82,6 @@ func TestYAMLStore_Load_UnsetEnvVarFails(t *testing.T) {
 	path := writeTempConfig(t, `
 model_routes:
   - model_name: claude-haiku
-    provider_ref: gemini
     upstream_model: gemini-2.5-flash
     credpool:
       keys:
@@ -91,6 +90,95 @@ model_routes:
 	_, err := config.NewYAMLStore(path).Load()
 	if err == nil {
 		t.Fatal("expected error for unset env var, got nil")
+	}
+}
+
+// TestYAMLStore_Load_SomeEmptyKeysWarnButLoadSucceeds guards the policy that
+// an individual empty/unset credential key only warns — the pool (and the
+// whole config) still loads as long as at least one usable key exists
+// anywhere. Load failure is reserved for the case in
+// TestYAMLStore_Load_UnsetEnvVarFails, where that's the config's only key.
+func TestYAMLStore_Load_SomeEmptyKeysWarnButLoadSucceeds(t *testing.T) {
+	t.Setenv("TEST_MISTRAL_KEY_1", "real-value")
+	os.Unsetenv("TEST_MISTRAL_KEY_2_UNSET")
+
+	path := writeTempConfig(t, `
+providers:
+  mistral: {base_url: "https://api.mistral.ai/v1", protocol: openai, auth_style: bearer}
+model_routes:
+  - model_name: claude-mistral
+    upstream_model: mistral-large-latest
+    credpool:
+      provider_ref: mistral
+      keys:
+        - key_ok: ${TEST_MISTRAL_KEY_1}
+        - key_missing: ${TEST_MISTRAL_KEY_2_UNSET}
+`)
+	cfg, err := config.NewYAMLStore(path).Load()
+	if err != nil {
+		t.Fatalf("expected load to succeed when at least one key is usable, got: %v", err)
+	}
+	keys := cfg.ModelRoutes[0].CredPool.Keys
+	if keys[0].Key != "real-value" {
+		t.Errorf("key_ok: got %q, want %q", keys[0].Key, "real-value")
+	}
+	if keys[1].IsUsable("bearer") {
+		t.Errorf("key_missing: IsUsable should be false for an unexpanded placeholder, got Key=%q", keys[1].Key)
+	}
+}
+
+// TestYAMLStore_Load_AllKeysEmptyAcrossMultiplePoolsFails guards that the
+// zero-usable-keys check accumulates across every credpool in the config
+// (both the named credpools: block and inline model_routes credpools), not
+// just whichever pool validateKeys happens to see first.
+func TestYAMLStore_Load_AllKeysEmptyAcrossMultiplePoolsFails(t *testing.T) {
+	os.Unsetenv("TEST_UNSET_A")
+	os.Unsetenv("TEST_UNSET_B")
+
+	path := writeTempConfig(t, `
+providers:
+  gemini: {}
+  mistral: {base_url: "https://api.mistral.ai/v1", protocol: openai, auth_style: bearer}
+credpools:
+  gemini-pool:
+    provider_ref: gemini
+    keys:
+      - a: ${TEST_UNSET_A}
+model_routes:
+  - model_name: claude-a
+    upstream_model: gemini-2.5-flash
+    credpool_ref: gemini-pool
+  - model_name: claude-b
+    upstream_model: mistral-large-latest
+    credpool:
+      provider_ref: mistral
+      keys:
+        - b: ${TEST_UNSET_B}
+`)
+	_, err := config.NewYAMLStore(path).Load()
+	if err == nil {
+		t.Fatal("expected error when every key across every pool is unusable, got nil")
+	}
+}
+
+func TestCredEntry_IsUsable(t *testing.T) {
+	cases := []struct {
+		name      string
+		entry     config.CredEntry
+		authStyle string
+		want      bool
+	}{
+		{"bearer with value", config.CredEntry{Key: "sk-abc"}, "bearer", true},
+		{"bearer empty", config.CredEntry{Key: ""}, "bearer", false},
+		{"bearer unexpanded placeholder", config.CredEntry{Key: "${UNSET_XYZ}"}, "bearer", false},
+		{"sigv4 with both parts", config.CredEntry{AccessKeyID: "AKIA1", SecretAccessKey: "secret"}, "sigv4", true},
+		{"sigv4 missing secret", config.CredEntry{AccessKeyID: "AKIA1"}, "sigv4", false},
+		{"sigv4 unexpanded placeholder", config.CredEntry{AccessKeyID: "AKIA1", SecretAccessKey: "${UNSET_XYZ}"}, "sigv4", false},
+	}
+	for _, tc := range cases {
+		if got := tc.entry.IsUsable(tc.authStyle); got != tc.want {
+			t.Errorf("%s: IsUsable(%q) = %v, want %v", tc.name, tc.authStyle, got, tc.want)
+		}
 	}
 }
 
@@ -120,11 +208,11 @@ func TestYAMLStore_Load_APIBaseMismatch(t *testing.T) {
 			yaml: `
 model_routes:
   - model_name: m
-    protocol: openai
     upstream_model: some-model
-    api_base: https://generativelanguage.googleapis.com/v1
-    auth_style: bearer
     credpool:
+      protocol: openai
+      api_base: https://generativelanguage.googleapis.com/v1
+      auth_style: bearer
       keys: [test-key]
 `,
 			wantErr: true,
@@ -134,10 +222,10 @@ model_routes:
 			yaml: `
 model_routes:
   - model_name: m
-    protocol: gemini
     upstream_model: some-model
-    api_base: https://api.openai.com/v1
     credpool:
+      protocol: gemini
+      api_base: https://api.openai.com/v1
       keys: [test-key]
 `,
 			wantErr: true,
@@ -147,11 +235,11 @@ model_routes:
 			yaml: `
 model_routes:
   - model_name: m
-    protocol: openai
     upstream_model: deepseek-chat
-    api_base: https://api.deepseek.com/v1
-    auth_style: bearer
     credpool:
+      protocol: openai
+      api_base: https://api.deepseek.com/v1
+      auth_style: bearer
       keys: [test-key]
 `,
 			wantErr: false,
@@ -161,11 +249,11 @@ model_routes:
 			yaml: `
 model_routes:
   - model_name: m
-    protocol: openai
     upstream_model: some-model
-    api_base: https://my-proxy.internal/v1
-    auth_style: bearer
     credpool:
+      protocol: openai
+      api_base: https://my-proxy.internal/v1
+      auth_style: bearer
       keys: [test-key]
 `,
 			wantErr: false,
@@ -175,11 +263,11 @@ model_routes:
 			yaml: `
 model_routes:
   - model_name: m
-    protocol: openai
     upstream_model: some-model
-    api_base: "not a url"
-    auth_style: bearer
     credpool:
+      protocol: openai
+      api_base: "not a url"
+      auth_style: bearer
       keys: [test-key]
 `,
 			wantErr: true,
@@ -189,12 +277,12 @@ model_routes:
 			yaml: `
 model_routes:
   - model_name: m
-    protocol: anthropic
     mode: passthrough
     upstream_model: claude-haiku-4-5-20251001
-    api_base: https://generativelanguage.googleapis.com/any/path
-    auth_style: bearer
     credpool:
+      protocol: anthropic
+      api_base: https://generativelanguage.googleapis.com/any/path
+      auth_style: bearer
       keys: [test-key]
 `,
 			wantErr: false,
@@ -274,6 +362,43 @@ func TestConfig_LookupModel(t *testing.T) {
 	}
 }
 
+// TestConfig_LookupModel_NativePassthrough guards LookupModel step 4: a
+// model name globally unique to one vendor (claude-*) with no model_routes
+// entry only resolves through a credpool that opted in via
+// native_passthrough: true, and only when the root
+// native_passthrough_enable switch is also on.
+func TestConfig_LookupModel_NativePassthrough(t *testing.T) {
+	cfg := &config.Config{
+		NativePassthroughEnable: true,
+		CredPools: map[string]config.CredPoolCfg{
+			"real-anthropic": {
+				NativePassthrough: true,
+				Protocol:          "anthropic",
+				Keys:              []config.CredEntry{{Name: "k", Key: "sk-real"}},
+			},
+		},
+	}
+
+	entry, ok := cfg.LookupModel("claude-opus-4-8-not-configured")
+	if !ok {
+		t.Fatal("expected native passthrough match, got ok=false")
+	}
+	if entry.ProviderRef != "anthropic" || entry.UpstreamModel != "claude-opus-4-8-not-configured" {
+		t.Errorf("entry = %+v, want ProviderRef=anthropic UpstreamModel=claude-opus-4-8-not-configured", entry)
+	}
+
+	cfg.NativePassthroughEnable = false
+	if _, ok := cfg.LookupModel("claude-opus-4-8-not-configured"); ok {
+		t.Error("expected no match when native_passthrough_enable is false")
+	}
+
+	cfg.NativePassthroughEnable = true
+	cfg.CredPools["real-anthropic"] = config.CredPoolCfg{NativePassthrough: false, Protocol: "anthropic", Keys: []config.CredEntry{{Name: "k", Key: "sk-real"}}}
+	if _, ok := cfg.LookupModel("claude-opus-4-8-not-configured"); ok {
+		t.Error("expected no match when no credpool has native_passthrough: true")
+	}
+}
+
 // --- sigv4 (AWS Bedrock-style) credpool entries ---
 
 func TestYAMLStore_Load_Sigv4StructuredShorthand(t *testing.T) {
@@ -286,6 +411,7 @@ providers:
   anthropic: {}
 credpools:
   bedrock-claude:
+    provider_ref: anthropic
     auth_style: sigv4
     region: us-east-1
     service: bedrock-runtime
@@ -300,10 +426,8 @@ credpools:
           secret_access_key: ${TEST_AWS_SECRET_KEY}
 model_routes:
   - model_name: claude-bedrock
-    provider_ref: anthropic
     upstream_model: claude-3
     credpool_ref: bedrock-claude
-    auth_style: sigv4
 `)
 	cfg, err := config.NewYAMLStore(path).Load()
 	if err != nil {
@@ -338,6 +462,7 @@ providers:
   anthropic: {}
 credpools:
   bedrock-claude:
+    provider_ref: anthropic
     auth_style: sigv4
     region: us-east-1
     service: bedrock-runtime
@@ -347,10 +472,8 @@ credpools:
         secret_access_key: ${TEST_AWS_SECRET_KEY}
 model_routes:
   - model_name: claude-bedrock
-    provider_ref: anthropic
     upstream_model: claude-3
     credpool_ref: bedrock-claude
-    auth_style: sigv4
 `)
 	cfg, err := config.NewYAMLStore(path).Load()
 	if err != nil {
@@ -368,6 +491,7 @@ providers:
   anthropic: {}
 credpools:
   bedrock-claude:
+    provider_ref: anthropic
     auth_style: sigv4
     region: us-east-1
     keys:
@@ -375,10 +499,8 @@ credpools:
           access_key_id: AKIA-only
 model_routes:
   - model_name: claude-bedrock
-    provider_ref: anthropic
     upstream_model: claude-3
     credpool_ref: bedrock-claude
-    auth_style: sigv4
 `)
 	if _, err := config.NewYAMLStore(path).Load(); err == nil {
 		t.Fatal("expected error for sigv4 entry missing secret_access_key")
@@ -402,94 +524,80 @@ credpools:
 	}
 }
 
-func TestYAMLStore_Load_CredpoolFamilyDerivedFromModelRoutes(t *testing.T) {
+// TestYAMLStore_Load_CredpoolProviderRefIsSingleSourceOfTruth guards the
+// core of the native_passthrough redesign: provider_ref lives only on the
+// credpool now, so two model_routes entries sharing one credpool_ref always
+// get the exact same protocol — the "conflicting provider_ref" family of
+// config mistakes this replaces is now impossible by construction, not
+// something that needs a separate consistency check.
+func TestYAMLStore_Load_CredpoolProviderRefIsSingleSourceOfTruth(t *testing.T) {
 	path := writeTempConfig(t, `
 providers:
   gemini: {}
 credpools:
   shared-keys:
+    provider_ref: gemini
     keys:
       - main: test-key
 model_routes:
   - model_name: claude-haiku
-    provider_ref: gemini
     upstream_model: gemini-2.5-flash
+    credpool_ref: shared-keys
+  - model_name: claude-haiku-2
+    upstream_model: gemini-2.5-pro
     credpool_ref: shared-keys
 `)
 	cfg, err := config.NewYAMLStore(path).Load()
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if got := cfg.CredpoolFamilies["shared-keys"]; got != "gemini" {
-		t.Errorf("CredpoolFamilies[shared-keys] = %q, want %q (derived from model_routes, no explicit upstream_model_type tag)", got, "gemini")
+	for _, m := range cfg.ModelRoutes {
+		if m.ProviderRef != "gemini" || m.Protocol != "gemini" {
+			t.Errorf("%s: provider_ref/protocol = %q/%q, want gemini/gemini (resolved from credpools.shared-keys)", m.ModelName, m.ProviderRef, m.Protocol)
+		}
 	}
 }
 
-func TestYAMLStore_Load_CredpoolFamilyExplicitTagWins(t *testing.T) {
+func TestYAMLStore_Load_NativePassthroughRequiresNativeProtocol(t *testing.T) {
 	path := writeTempConfig(t, `
 providers:
-  gemini: {}
+  grok: {}
 credpools:
-  tagged:
-    upstream_model_type: gemini
+  grok-native-attempt:
+    provider_ref: grok
+    native_passthrough: true
     keys:
       - main: test-key
 model_routes:
-  - model_name: claude-haiku
-    provider_ref: gemini
-    upstream_model: gemini-2.5-flash
-    credpool_ref: tagged
+  - model_name: m
+    upstream_model: grok-beta
+    credpool_ref: grok-native-attempt
 `)
-	cfg, err := config.NewYAMLStore(path).Load()
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if got := cfg.CredpoolFamilies["tagged"]; got != "gemini" {
-		t.Errorf("CredpoolFamilies[tagged] = %q, want %q", got, "gemini")
+	if _, err := config.NewYAMLStore(path).Load(); err == nil {
+		t.Fatal("expected error: native_passthrough on a non-native (grok) protocol")
 	}
 }
 
-func TestYAMLStore_Load_CredpoolFamilyConflictFails(t *testing.T) {
+func TestYAMLStore_Load_NativePassthroughValidProtocolSucceeds(t *testing.T) {
 	path := writeTempConfig(t, `
 providers:
-  gemini: {}
   anthropic: {}
 credpools:
-  shared-keys:
-    keys:
-      - main: test-key
-model_routes:
-  - model_name: claude-haiku
-    provider_ref: gemini
-    upstream_model: gemini-2.5-flash
-    credpool_ref: shared-keys
-  - model_name: claude-sonnet
+  real-anthropic:
     provider_ref: anthropic
-    upstream_model: claude-sonnet-real
-    credpool_ref: shared-keys
-`)
-	if _, err := config.NewYAMLStore(path).Load(); err == nil {
-		t.Fatal("expected error: same credpool_ref referenced with conflicting provider_ref values")
-	}
-}
-
-func TestYAMLStore_Load_CredpoolFamilyConflictWithExplicitTagFails(t *testing.T) {
-	path := writeTempConfig(t, `
-providers:
-  gemini: {}
-  anthropic: {}
-credpools:
-  tagged:
-    upstream_model_type: anthropic
+    native_passthrough: true
     keys:
       - main: test-key
 model_routes:
-  - model_name: claude-haiku
-    provider_ref: gemini
-    upstream_model: gemini-2.5-flash
-    credpool_ref: tagged
+  - model_name: m
+    upstream_model: claude-haiku-4-5-20251001
+    credpool_ref: real-anthropic
 `)
-	if _, err := config.NewYAMLStore(path).Load(); err == nil {
-		t.Fatal("expected error: model_routes provider_ref contradicts the pool's explicit upstream_model_type")
+	cfg, err := config.NewYAMLStore(path).Load()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !cfg.CredPools["real-anthropic"].NativePassthrough {
+		t.Error("expected native_passthrough to be preserved as true")
 	}
 }

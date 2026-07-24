@@ -4,13 +4,16 @@ import (
 	"context"
 	"net/http/httptest"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
+	ccomp "miroxy/core/compress"
 	"miroxy/core/cred"
 	corewarden "miroxy/core/warden"
 	"miroxy/internal/config"
 	"miroxy/internal/localstate"
+	"miroxy/internal/stats"
 )
 
 func TestParseRetryDelay_EmptyBody(t *testing.T) {
@@ -192,6 +195,28 @@ func TestBuildCredSpecsFromPool_Sigv4(t *testing.T) {
 	}
 }
 
+// TestBuildCredSpecsFromPool_SkipsUnusableKeys guards the fix where a config
+// key with an empty/unexpanded value only warns at validation time (see
+// validateKeys) instead of failing config load — the runtime pool must still
+// never receive that entry, or Select() could hand out a credential with an
+// empty Authorization value.
+func TestBuildCredSpecsFromPool_SkipsUnusableKeys(t *testing.T) {
+	kp := config.CredPoolCfg{
+		Keys: []config.CredEntry{
+			{Name: "real", Key: "sk-real"},
+			{Name: "unset", Key: ""},
+		},
+	}
+
+	specs := buildCredSpecsFromPool(kp, "bearer", "mistral-free")
+	if len(specs) != 1 {
+		t.Fatalf("got %d specs, want 1 (the unusable key must be skipped)", len(specs))
+	}
+	if specs[0].Name != "real" {
+		t.Errorf("specs[0].Name = %q, want %q", specs[0].Name, "real")
+	}
+}
+
 // TestOpenLocalStateStore_CredsourceTakesPrecedence verifies local_state is
 // ignored (returns nil, no file created) whenever sidecar.credsource is
 // enabled, regardless of local_state.enabled — credstone is already the
@@ -302,5 +327,132 @@ func TestWardenStats_PersistsAcrossRestart(t *testing.T) {
 	}
 	if snap2.PIIFound != 1 {
 		t.Errorf("PIIFound = %d, want 1", snap2.PIIFound)
+	}
+}
+
+// TestTokenStats_PersistsAcrossRestart mirrors TestWardenStats_PersistsAcrossRestart
+// for token usage: a flush from one Registry must be readable by a second,
+// independent Registry restored from the same local_state file, including
+// the model → credpool → credential hierarchy.
+func TestTokenStats_PersistsAcrossRestart(t *testing.T) {
+	path := t.TempDir() + "/token-state.db"
+	cfg := &config.Config{LocalState: config.LocalStateConfig{Enabled: true, Path: path}}
+
+	store1 := openLocalStateStore(cfg)
+	if store1 == nil {
+		t.Fatal("expected a non-nil store in standalone mode with local_state enabled")
+	}
+	reg1 := &stats.Registry{}
+	reg1.Record("mistral-test", "mistral-free", "mistral_bytebyteops", 1000, 200)
+	flushTokenStats(reg1, store1)
+	if err := store1.Close(); err != nil {
+		t.Fatalf("store1.Close: %v", err)
+	}
+
+	store2 := openLocalStateStore(cfg)
+	if store2 == nil {
+		t.Fatal("expected a non-nil store on reopen")
+	}
+	defer store2.Close()
+
+	reg2 := &stats.Registry{}
+	if persisted, ok := store2.LoadTokenStats(); ok {
+		reg2.Restore(tokenStatsFromPersisted(persisted))
+	} else {
+		t.Fatal("expected a persisted token stats snapshot")
+	}
+
+	totalIn, totalOut, totalReq, models := reg2.Snapshot()
+	if totalIn != 1000 || totalOut != 200 || totalReq != 1 {
+		t.Fatalf("restored totals = (%d, %d, %d), want (1000, 200, 1)", totalIn, totalOut, totalReq)
+	}
+	if len(models) != 1 || models[0].Name != "mistral-test" {
+		t.Fatalf("restored models = %+v", models)
+	}
+	if len(models[0].Pools) != 1 || models[0].Pools[0].Name != "mistral-free" {
+		t.Fatalf("restored pools = %+v", models[0].Pools)
+	}
+	if keys := models[0].Pools[0].Keys; len(keys) != 1 || keys[0].Name != "mistral_bytebyteops" || keys[0].Input != 1000 {
+		t.Fatalf("restored keys = %+v", keys)
+	}
+
+	// A live increment after restore builds on the restored baseline.
+	reg2.Record("mistral-test", "mistral-free", "mistral_bytebyteops", 50, 10)
+	totalIn2, _, totalReq2, _ := reg2.Snapshot()
+	if totalIn2 != 1050 || totalReq2 != 2 {
+		t.Errorf("after live increment: totalIn=%d totalReq=%d, want 1050/2", totalIn2, totalReq2)
+	}
+}
+
+// TestCompressStats_PersistsAcrossRestart mirrors the same contract for
+// compression's per-model counters.
+func TestCompressStats_PersistsAcrossRestart(t *testing.T) {
+	path := t.TempDir() + "/compress-state.db"
+	cfg := &config.Config{LocalState: config.LocalStateConfig{Enabled: true, Path: path}}
+	compressCfg := &config.CompressConfig{Enabled: true, Threshold: 4000}
+
+	store1 := openLocalStateStore(cfg)
+	if store1 == nil {
+		t.Fatal("expected a non-nil store in standalone mode with local_state enabled")
+	}
+	_, cs1 := buildCompressPlugin(compressCfg, store1)
+	cs1.Record("mistral-test", &ccomp.Result{OriginalTokens: 5000, CompressedTokens: 3000}, 100)
+	flushCompressStats(cs1, store1)
+	if err := store1.Close(); err != nil {
+		t.Fatalf("store1.Close: %v", err)
+	}
+
+	store2 := openLocalStateStore(cfg)
+	if store2 == nil {
+		t.Fatal("expected a non-nil store on reopen")
+	}
+	defer store2.Close()
+
+	_, cs2 := buildCompressPlugin(compressCfg, store2)
+	snap := cs2.Snapshot()
+	if snap.Requests != 1 || snap.OriginalTokens != 5000 || snap.CompressedTokens != 3000 {
+		t.Fatalf("restored snapshot = %+v", snap)
+	}
+	if len(snap.Models) != 1 || snap.Models[0].Name != "mistral-test" {
+		t.Fatalf("restored models = %+v", snap.Models)
+	}
+
+	cs2.Record("mistral-test", &ccomp.Result{OriginalTokens: 1000, CompressedTokens: 900}, 50)
+	snap2 := cs2.Snapshot()
+	if snap2.Requests != 2 || snap2.OriginalTokens != 6000 {
+		t.Fatalf("after live record: %+v, want Requests=2 OriginalTokens=6000", snap2)
+	}
+}
+
+// TestStatsText_ShowsFullHierarchyAndCompressionNote guards the report
+// rewrite: model -> credpool(provider) -> credential must all be visible,
+// and a compression note must appear whenever compressStats has real data.
+func TestStatsText_ShowsFullHierarchyAndCompressionNote(t *testing.T) {
+	cfg := &config.Config{
+		CredPools: map[string]config.CredPoolCfg{
+			"mistral-free": {ProviderRef: "mistral", Keys: []config.CredEntry{{Name: "mistral_bytebyteops", Key: "test-key"}}},
+		},
+		ModelRoutes: []config.ModelEntry{
+			{ModelName: "mistral-test", ProviderRef: "mistral", UpstreamModel: "mistral-code-agent-latest", CredpoolRef: "mistral-free"},
+		},
+	}
+	srv := New(cfg, "")
+	defer srv.Close()
+
+	srv.tokenStats.Record("mistral-test", "mistral-free", "mistral_bytebyteops", 1000, 200)
+	srv.compressStats = ccomp.NewStats()
+	srv.compressStats.Record("mistral-test", &ccomp.Result{OriginalTokens: 5000, CompressedTokens: 3000}, 100)
+
+	out := srv.StatsText()
+	for _, want := range []string{
+		"miroxy Performance Report",
+		"mistral-test",
+		"mistral-free (mistral)",
+		"mistral_bytebyteops",
+		"Totals above already reflect compression",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("StatsText() missing %q, got:\n%s", want, out)
+		}
 	}
 }

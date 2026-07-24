@@ -46,8 +46,6 @@ func (s *YAMLStore) Load() (*Config, error) {
 		return nil, fmt.Errorf("invalid config: %w", err)
 	}
 
-	cfg.CredpoolFamilies = resolveCredpoolFamilies(&cfg)
-
 	return &cfg, nil
 }
 
@@ -76,7 +74,6 @@ func LoadFromBytesWithEnv(data []byte, extraEnv map[string]string) (*Config, err
 	if err := validateConfig(&cfg); err != nil {
 		return nil, fmt.Errorf("invalid config: %w", err)
 	}
-	cfg.CredpoolFamilies = resolveCredpoolFamilies(&cfg)
 	return &cfg, nil
 }
 
@@ -95,13 +92,13 @@ func expandEnvVarsWithMap(data []byte, extra map[string]string) []byte {
 	})
 }
 
-// resolveProviders fills Protocol, APIBase, and AuthStyle on model entries and
-// routing targets from the providers block. Built-in defaults from
-// provider_defaults.go fill any fields the operator left blank.
-//
-// Every provider referenced in model_routes MUST appear in the providers block —
-// relying on implicit built-in defaults is not permitted. An entry with all
-// fields empty is valid (defaults fill them in), but the key must be present.
+// resolveProviders resolves each credpool's Protocol/APIBase/AuthStyle from
+// its ProviderRef (via the providers: block + built-in defaults from
+// provider_defaults.go), then propagates those resolved values onto every
+// model_routes entry/routing target that references the pool. A credpool's
+// keys always belong to a single upstream provider, so this is the one
+// place that binding is decided — model_routes only ever says WHICH
+// credpool to use, never which provider.
 func resolveProviders(cfg *Config) error {
 	// lookupProvider checks only cfg.Providers — built-in defaults are applied
 	// after a successful lookup via fillProviderDefaults, not as a fallback.
@@ -115,136 +112,86 @@ func resolveProviders(cfg *Config) error {
 		return ProviderDef{}, false
 	}
 
+	// resolvePool fills kp.Protocol/APIBase/AuthStyle from kp.ProviderRef.
+	// Having no ProviderRef is allowed only when Protocol and APIBase are
+	// both set directly (a fully self-contained pool needing no shared
+	// providers: entry).
+	resolvePool := func(context string, kp *CredPoolCfg) error {
+		if kp.ProviderRef == "" {
+			if kp.Protocol == "" && kp.APIBase == "" {
+				return fmt.Errorf("%s: provider_ref is required — "+
+					"add a providers.<name> entry and set provider_ref to it (fields can be empty to use built-in defaults), "+
+					"or set protocol and api_base directly on this credpool", context)
+			}
+			return nil
+		}
+		pd, ok := lookupProvider(kp.ProviderRef)
+		if !ok {
+			return fmt.Errorf("%s: provider_ref %q is not declared in the providers block — "+
+				"add a providers.%s entry (fields can be empty to use built-in defaults), "+
+				"or set protocol and api_base directly on this credpool",
+				context, kp.ProviderRef, kp.ProviderRef)
+		}
+		if kp.Protocol == "" {
+			kp.Protocol = pd.Protocol
+		}
+		if kp.APIBase == "" {
+			kp.APIBase = pd.BaseURL
+		}
+		if kp.AuthStyle == "" {
+			kp.AuthStyle = pd.AuthStyle
+		}
+		return nil
+	}
+
+	for name, kp := range cfg.CredPools {
+		if err := resolvePool(fmt.Sprintf("credpools.%s", name), &kp); err != nil {
+			return err
+		}
+		cfg.CredPools[name] = kp
+	}
+
 	for i := range cfg.ModelRoutes {
 		m := &cfg.ModelRoutes[i]
 
 		if m.Routing != nil {
-			// Routing entry: resolve each target.
+			// Routing entry: propagate each target's own credpool.
 			for j := range m.Routing.Targets {
 				t := &m.Routing.Targets[j]
-				if t.ProviderRef == "" {
-					continue
-				}
-				pd, ok := lookupProvider(t.ProviderRef)
+				kp, ok := cfg.CredPools[t.CredpoolRef]
 				if !ok {
-					return fmt.Errorf("model_routes[%d] %q: routing target[%d] references unknown provider_ref %q", i, m.ModelName, j, t.ProviderRef)
+					continue // validateRoutingEntry reports the unknown credpool_ref
 				}
-				if t.Protocol == "" {
-					t.Protocol = pd.Protocol
-				}
-				if t.APIBase == "" {
-					t.APIBase = pd.BaseURL
-				}
-				if t.AuthStyle == "" {
-					t.AuthStyle = pd.AuthStyle
-				}
+				t.ProviderRef = kp.ProviderRef
+				t.Protocol = kp.Protocol
+				t.APIBase = kp.APIBase
+				t.AuthStyle = kp.AuthStyle
 			}
 			continue
 		}
 
-		// Simple or inline-credpool entry.
-		if m.ProviderRef == "" {
-			continue
-		}
-		pd, ok := lookupProvider(m.ProviderRef)
-		if !ok {
-			// Provider not declared in providers block.
-			// Allowed only when api_base + protocol are set directly on the entry
-			// (fully self-contained route that needs no provider definition).
-			if m.Protocol == "" && m.APIBase == "" {
-				return fmt.Errorf("model_routes[%d] %q: provider_ref %q is not declared in the providers block — "+
-					"add a providers.%s entry (fields can be empty to use built-in defaults), "+
-					"or set api_base and protocol directly on this model_routes entry",
-					i, m.ModelName, m.ProviderRef, m.ProviderRef)
+		if m.CredpoolRef != "" {
+			kp, ok := cfg.CredPools[m.CredpoolRef]
+			if !ok {
+				continue // validateConfig reports the unknown credpool_ref
 			}
+			m.ProviderRef = kp.ProviderRef
+			m.Protocol = kp.Protocol
+			m.APIBase = kp.APIBase
+			m.AuthStyle = kp.AuthStyle
 			continue
 		}
-		if m.Protocol == "" {
-			m.Protocol = pd.Protocol
-		}
-		if m.APIBase == "" {
-			m.APIBase = pd.BaseURL
-		}
-		if m.AuthStyle == "" {
-			m.AuthStyle = pd.AuthStyle
-		}
-	}
-	return nil
-}
 
-// validateCredpoolFamilyConsistency ensures every credpool_ref is associated
-// with at most one upstream provider family. A credpool's keys belong to a
-// single provider, so the same credpool_ref showing up under two different
-// provider_ref values (or contradicting its own explicit
-// upstream_model_type tag) is always a config mistake, never a valid
-// multi-provider pool — fail the load instead of silently picking one.
-func validateCredpoolFamilyConsistency(cfg *Config) error {
-	seen := make(map[string]string, len(cfg.CredPools))
-	for name, kp := range cfg.CredPools {
-		if kp.UpstreamModelType != "" {
-			seen[name] = kp.UpstreamModelType
-		}
-	}
-	check := func(context, poolRef, provider string) error {
-		if poolRef == "" || provider == "" {
-			return nil
-		}
-		if prev, ok := seen[poolRef]; ok && prev != provider {
-			return fmt.Errorf("%s: credpool_ref %q is used with provider_ref %q, but is already associated with %q — "+
-				"a credpool's keys belong to a single upstream provider", context, poolRef, provider, prev)
-		}
-		seen[poolRef] = provider
-		return nil
-	}
-	for i, m := range cfg.ModelRoutes {
-		if m.Routing != nil {
-			for j, t := range m.Routing.Targets {
-				if err := check(fmt.Sprintf("model_routes[%d] %q routing.targets[%d]", i, m.ModelName, j), t.CredpoolRef, t.ProviderRef); err != nil {
-					return err
-				}
-			}
-			continue
-		}
-		if err := check(fmt.Sprintf("model_routes[%d] %q", i, m.ModelName), m.CredpoolRef, m.ProviderRef); err != nil {
+		// Inline credpool.
+		if err := resolvePool(fmt.Sprintf("model_routes[%d] %q credpool", i, m.ModelName), &m.CredPool); err != nil {
 			return err
 		}
+		m.ProviderRef = m.CredPool.ProviderRef
+		m.Protocol = m.CredPool.Protocol
+		m.APIBase = m.CredPool.APIBase
+		m.AuthStyle = m.CredPool.AuthStyle
 	}
 	return nil
-}
-
-// resolveCredpoolFamilies derives each credpool's upstream provider family
-// (anthropic/openai/gemini) from how model_routes reference it via
-// credpool_ref + provider_ref, so a credpool doesn't need an explicit
-// upstream_model_type tag unless it's never referenced by a static route
-// (e.g. a pool held only for provider passthrough — see LookupModel step 4).
-// An explicit upstream_model_type tag always wins over the derived value.
-// validateCredpoolFamilyConsistency has already rejected any conflicting
-// associations by the time this runs, so last-write is safe.
-func resolveCredpoolFamilies(cfg *Config) map[string]string {
-	families := make(map[string]string, len(cfg.CredPools))
-	for name, kp := range cfg.CredPools {
-		if kp.UpstreamModelType != "" {
-			families[name] = kp.UpstreamModelType
-		}
-	}
-	assign := func(poolRef, provider string) {
-		if poolRef == "" || provider == "" {
-			return
-		}
-		if _, ok := families[poolRef]; !ok {
-			families[poolRef] = provider
-		}
-	}
-	for _, m := range cfg.ModelRoutes {
-		if m.Routing != nil {
-			for _, t := range m.Routing.Targets {
-				assign(t.CredpoolRef, t.ProviderRef)
-			}
-			continue
-		}
-		assign(m.CredpoolRef, m.ProviderRef)
-	}
-	return families
 }
 
 var validLogLevels = map[string]bool{"debug": true, "info": true, "warn": true, "error": true, "fatal": true, "": true}
@@ -266,6 +213,7 @@ func validateConfig(cfg *Config) error {
 	if len(cfg.ModelRoutes) == 0 {
 		return fmt.Errorf("model_routes must have at least one entry")
 	}
+	var totalUsableKeys int
 
 	// Build set of model names for cross-reference validation.
 	modelNames := make(map[string]bool, len(cfg.ModelRoutes))
@@ -325,9 +273,14 @@ func validateConfig(cfg *Config) error {
 			if len(m.CredPool.Keys) == 0 {
 				return fmt.Errorf("model_routes[%d] %q: credpool.keys must have at least one entry (or use credpool_ref)", i, m.ModelName)
 			}
-			if err := validateKeys(i, m.ModelName, m.CredPool.Keys, m.AuthStyle); err != nil {
+			usable, err := validateKeys(i, m.ModelName, m.CredPool.Keys, m.AuthStyle)
+			if err != nil {
 				return err
 			}
+			totalUsableKeys += usable
+		}
+		if !validCredPoolStrategies[m.CredPool.Strategy] {
+			return fmt.Errorf("model_routes[%d] %q: credpool.strategy %q is invalid (round_robin | least_requests | fallback)", i, m.ModelName, m.CredPool.Strategy)
 		}
 
 		if err := validateAPIBase(i, m); err != nil {
@@ -342,20 +295,34 @@ func validateConfig(cfg *Config) error {
 			return fmt.Errorf("credpools.%s: auth_style %q is invalid — accepted: %s",
 				name, kp.AuthStyle, joinKeys(validAuthStyles))
 		}
+		if kp.RoundRobinBatchSize < 0 {
+			return fmt.Errorf("credpools.%s: round_robin_batch_size must be >= 0, got %d", name, kp.RoundRobinBatchSize)
+		}
+		if !validCredPoolStrategies[kp.Strategy] {
+			return fmt.Errorf("credpools.%s: strategy %q is invalid (round_robin | least_requests | fallback)", name, kp.Strategy)
+		}
 		if len(kp.Keys) == 0 && !cfg.Sidecar.CredSource.Enabled {
 			return fmt.Errorf("credpools.%s: must have at least one key (or enable credsource)", name)
 		}
-		if err := validateKeys(-1, "credpools."+name, kp.Keys, kp.AuthStyle); err != nil {
+		usable, err := validateKeys(-1, "credpools."+name, kp.Keys, kp.AuthStyle)
+		if err != nil {
 			return err
 		}
-		if kp.UpstreamModelType != "" && !validUpstreamModelTypes[kp.UpstreamModelType] {
-			return fmt.Errorf("credpools.%s: upstream_model_type %q is invalid — accepted values: %s",
-				name, kp.UpstreamModelType, joinKeys(validUpstreamModelTypes))
+		totalUsableKeys += usable
+		if kp.Protocol != "" && !validProtocols[kp.Protocol] {
+			return fmt.Errorf("credpools.%s: protocol %q is invalid — accepted: %s",
+				name, kp.Protocol, joinKeys(validProtocols))
 		}
-	}
-
-	if err := validateCredpoolFamilyConsistency(cfg); err != nil {
-		return err
+		if kp.NativePassthrough && !nativeVendorProtocols[kp.Protocol] {
+			return fmt.Errorf("credpools.%s: native_passthrough requires protocol to be one of %s (resolved protocol is %q)",
+				name, joinKeys(nativeVendorProtocols), kp.Protocol)
+		}
+		// Named pools may have no model_routes reference at all (e.g. a
+		// native-passthrough-only pool — see LookupModel step 4), so this is
+		// the only place their api_base/protocol consistency gets checked.
+		if err := checkAPIBaseHostConsistency(fmt.Sprintf("credpools.%s", name), kp.APIBase, kp.Protocol); err != nil {
+			return err
+		}
 	}
 
 	// Validate protocol and auth_style on providers block and model_routes.
@@ -395,6 +362,10 @@ func validateConfig(cfg *Config) error {
 		}
 	}
 
+	if totalUsableKeys == 0 && !cfg.Sidecar.CredSource.Enabled {
+		return fmt.Errorf("no credential key anywhere in config.yaml or the environment has a real value — miroxy cannot authenticate any request (enable sidecar.credsource, or set at least one key's env var)")
+	}
+
 	return nil
 }
 
@@ -425,7 +396,23 @@ func applyConfigDefaults(cfg *Config) {
 		boolDefaultTrue(&cfg.Warden.Injection)
 		boolDefaultTrue(&cfg.Warden.Jailbreak)
 	}
+	for name, kp := range cfg.CredPools {
+		if kp.Sticky && kp.StickyTTLSeconds <= 0 {
+			kp.StickyTTLSeconds = defaultStickyTTLSeconds
+			cfg.CredPools[name] = kp
+		}
+	}
+	for i := range cfg.ModelRoutes {
+		r := cfg.ModelRoutes[i].Routing
+		if r != nil && r.Sticky && r.StickyTTLSeconds <= 0 {
+			r.StickyTTLSeconds = defaultStickyTTLSeconds
+		}
+	}
 }
+
+// defaultStickyTTLSeconds is how long an idle conversation's sticky binding
+// survives when sticky is enabled but sticky_ttl_seconds is left at 0.
+const defaultStickyTTLSeconds = 1800
 
 // boolDefaultTrue sets *p to true when the config author omitted the field
 // (nil) — used for WardenConfig's per-detector toggles, which default on
@@ -440,13 +427,13 @@ func boolDefaultTrue(p **bool) {
 var (
 	validProtocols = map[string]bool{
 		"gemini": true, "openai": true, "anthropic": true,
-		"deepseek": true, "glm": true, "grok": true,
+		"deepseek": true, "glm": true, "grok": true, "bedrock": true,
 	}
 	validAuthStyles = map[string]bool{
 		"bearer": true, "api_key": true, "none": true, "query_key": true, "sigv4": true,
 	}
-	validUpstreamModelTypes = map[string]bool{
-		"anthropic": true, "openai": true, "gemini": true,
+	validCredPoolStrategies = map[string]bool{
+		"round_robin": true, "least_requests": true, "fallback": true, "": true,
 	}
 )
 
@@ -476,10 +463,11 @@ func validateRoutingEntry(idx int, m *ModelEntry, credpoolNames map[string]bool)
 	if !validStrategies[r.Strategy] {
 		return fmt.Errorf("model_routes[%d] %q: routing.strategy %q is invalid (fallback | round_robin | least_requests)", idx, m.ModelName, r.Strategy)
 	}
+	if r.Sticky && (r.Strategy == "fallback" || r.Strategy == "") {
+		slog.Warn("routing.sticky has no effect with strategy fallback (targets are already tried in fixed order)",
+			"model_name", m.ModelName)
+	}
 	for j, t := range r.Targets {
-		if t.ProviderRef == "" {
-			return fmt.Errorf("model_routes[%d] %q: routing.targets[%d].provider_ref is required", idx, m.ModelName, j)
-		}
 		if t.UpstreamModel == "" {
 			return fmt.Errorf("model_routes[%d] %q: routing.targets[%d].upstream_model is required", idx, m.ModelName, j)
 		}
@@ -496,7 +484,12 @@ func validateRoutingEntry(idx int, m *ModelEntry, credpoolNames map[string]bool)
 // validateKeys checks a credpool's key entries. authStyle selects which
 // fields are required: "sigv4" needs AccessKeyID+SecretAccessKey per entry
 // (SessionToken optional); everything else needs the plain Key string.
-func validateKeys(idx int, label string, keys []CredEntry, authStyle string) error {
+// validateKeys checks name uniqueness (a hard error) and reports, via
+// usable, how many of keys actually have real credential material. An
+// individual empty or unexpanded-${ENV_VAR} key only warns — the pool may
+// still be viable on its other keys; validateConfig hard-errors only when
+// the usable count across the entire config is zero.
+func validateKeys(idx int, label string, keys []CredEntry, authStyle string) (usable int, err error) {
 	seen := make(map[string]bool, len(keys))
 	for j := range keys {
 		k := &keys[j]
@@ -504,30 +497,18 @@ func validateKeys(idx int, label string, keys []CredEntry, authStyle string) err
 			k.Name = fmt.Sprintf("key_%d", j)
 		}
 		if seen[k.Name] {
-			return fmt.Errorf("%s: duplicate key name %q — names must be unique within a pool", label, k.Name)
+			return usable, fmt.Errorf("%s: duplicate key name %q — names must be unique within a pool", label, k.Name)
 		}
 		seen[k.Name] = true
 
-		if authStyle == "sigv4" {
-			if k.AccessKeyID == "" || k.SecretAccessKey == "" {
-				return fmt.Errorf("%s: keys[%d] %q: sigv4 entries require access_key_id and secret_access_key", label, j, k.Name)
-			}
-			for _, v := range []string{k.AccessKeyID, k.SecretAccessKey, k.SessionToken} {
-				if envVarRe.MatchString(v) {
-					return fmt.Errorf("%s: keys[%d] %q: unexpanded placeholder %q (env var not set)", label, j, k.Name, v)
-				}
-			}
+		if k.IsUsable(authStyle) {
+			usable++
 			continue
 		}
-
-		if k.Key == "" {
-			return fmt.Errorf("%s: keys[%d] %q: key is empty (check env var is set)", label, j, k.Name)
-		}
-		if envVarRe.MatchString(k.Key) {
-			return fmt.Errorf("%s: keys[%d] %q: unexpanded placeholder %q (env var not set)", label, j, k.Name, k.Key)
-		}
+		slog.Warn("credential key has no usable value — skipped (check env var is set)",
+			"pool", label, "key", k.Name)
 	}
-	return nil
+	return usable, nil
 }
 
 // validateCredSource checks the global credsource block. Only called when
@@ -554,25 +535,34 @@ func validateCredSource(cs CredSourceConfig) error {
 
 // validateAPIBase checks that api_base is a well-formed URL and is not a known
 // canonical endpoint for a different protocol than configured.
+// validateAPIBase checks that a model_routes entry's resolved api_base is
+// not a known canonical endpoint for a different protocol than resolved.
+// mode: passthrough skips this — a forced-passthrough target may
+// deliberately point at a non-standard endpoint (e.g. AWS Bedrock's own URL
+// shape).
 func validateAPIBase(idx int, m *ModelEntry) error {
-	if m.APIBase == "" {
+	if m.Mode == "passthrough" {
 		return nil
 	}
-	u, err := url.Parse(m.APIBase)
-	if err != nil || u.Scheme == "" || u.Host == "" {
-		return fmt.Errorf("model_routes[%d] %q: api_base %q is not a valid URL (need scheme://host...)", idx, m.ModelName, m.APIBase)
-	}
+	return checkAPIBaseHostConsistency(fmt.Sprintf("model_routes[%d] %q", idx, m.ModelName), m.APIBase, m.Protocol)
+}
 
-	proto := m.Protocol
-	if proto == "" {
-		proto = m.ProviderRef
+// checkAPIBaseHostConsistency reports an error if apiBase's host is a known
+// canonical endpoint for a protocol other than proto. Shared by
+// validateAPIBase (per model_routes entry) and the named-credpool
+// validation loop — a credpool may have no model_routes reference at all
+// (e.g. a native-passthrough-only pool — see LookupModel step 4), so the
+// credpool loop is the only place that would otherwise catch this.
+func checkAPIBaseHostConsistency(context, apiBase, proto string) error {
+	if apiBase == "" {
+		return nil
+	}
+	u, err := url.Parse(apiBase)
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		return fmt.Errorf("%s: api_base %q is not a valid URL (need scheme://host...)", context, apiBase)
 	}
 	if proto == "" {
 		proto = "gemini"
-	}
-
-	if m.Mode == "passthrough" {
-		return nil
 	}
 
 	type hostRule struct {
@@ -599,8 +589,8 @@ func validateAPIBase(idx int, m *ModelEntry) error {
 			}
 		}
 		return fmt.Errorf(
-			"model_routes[%d] %q: api_base %q is a %v endpoint but protocol resolves to %q — fix protocol or api_base",
-			idx, m.ModelName, m.APIBase, rule.allowed, proto,
+			"%s: api_base %q is a %v endpoint but protocol resolves to %q — fix protocol or api_base",
+			context, apiBase, rule.allowed, proto,
 		)
 	}
 	return nil

@@ -124,7 +124,7 @@ func (b *BuiltinCompressor) Compress(_ context.Context, req *ccomp.Request) (*cc
 		CompressedTokens: compTokens,
 		Strategies:       strategies,
 	}
-	b.stats.Record(result, time.Since(start).Microseconds())
+	b.stats.Record(req.Model, result, time.Since(start).Microseconds())
 	return result, nil
 }
 

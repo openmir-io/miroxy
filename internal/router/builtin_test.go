@@ -6,16 +6,16 @@ import (
 	"testing"
 	"time"
 
+	"miroxy/core/ir"
 	"miroxy/core/selector"
 	"miroxy/internal/config"
-	"miroxy/internal/types"
 )
 
 // fakeSelector is a minimal selector.Selector test double — BuiltinRouter
 // never calls its methods, it only needs to round-trip the same instance.
 type fakeSelector struct{ name string }
 
-func (f *fakeSelector) Select(context.Context, *types.MessageRequest) (*selector.ExecutionPlan, error) {
+func (f *fakeSelector) Select(context.Context, *ir.IRRequest, string) (*selector.ExecutionPlan, error) {
 	return nil, nil
 }
 func (f *fakeSelector) Release(*selector.ExecutionPlan, error) {}

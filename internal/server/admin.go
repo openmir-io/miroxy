@@ -226,20 +226,35 @@ func (s *Server) adminStatus(w http.ResponseWriter, _ *http.Request) {
 		Output   int64  `json:"output_tokens"`
 		Requests int64  `json:"requests"`
 	}
-	type modelUsage struct {
-		Name     string     `json:"model"`
+	type poolUsage struct {
+		Name     string     `json:"credpool"`
+		Provider string     `json:"provider,omitempty"`
 		Input    int64      `json:"input_tokens"`
 		Output   int64      `json:"output_tokens"`
 		Requests int64      `json:"requests"`
 		Keys     []keyUsage `json:"keys,omitempty"`
+	}
+	type modelUsage struct {
+		Name     string      `json:"model"`
+		Input    int64       `json:"input_tokens"`
+		Output   int64       `json:"output_tokens"`
+		Requests int64       `json:"requests"`
+		Pools    []poolUsage `json:"credpools,omitempty"`
 	}
 	usageModels := make([]modelUsage, 0, len(modelSnaps))
 	for _, ms := range modelSnaps {
 		mu := modelUsage{
 			Name: ms.Name, Input: ms.Input, Output: ms.Output, Requests: ms.Requests,
 		}
-		for _, k := range ms.Keys {
-			mu.Keys = append(mu.Keys, keyUsage{Name: k.Name, Input: k.Input, Output: k.Output, Requests: k.Requests})
+		for _, p := range ms.Pools {
+			pu := poolUsage{
+				Name: p.Name, Provider: namedPoolProvider(p.Name, cfg),
+				Input: p.Input, Output: p.Output, Requests: p.Requests,
+			}
+			for _, k := range p.Keys {
+				pu.Keys = append(pu.Keys, keyUsage{Name: k.Name, Input: k.Input, Output: k.Output, Requests: k.Requests})
+			}
+			mu.Pools = append(mu.Pools, pu)
 		}
 		usageModels = append(usageModels, mu)
 	}
@@ -291,15 +306,22 @@ func (s *Server) StatsText() string {
 	sep := strings.Repeat("─", 54)
 	var b strings.Builder
 
-	fmt.Fprintf(&b, "miroxy  uptime: %s  in-flight: %d\n%s\n",
-		uptime, s.inFlight.Load(), sep)
+	fmt.Fprintf(&b, "miroxy Performance Report\n%s\n", strings.Repeat("=", 54))
+	fmt.Fprintf(&b, "Uptime: %s   In-flight: %d   Config: %s\n\n",
+		uptime, s.inFlight.Load(), s.cfgPath)
 
 	// ── Token usage ──────────────────────────────────────────
 	totalIn, totalOut, totalReq, modelSnaps := s.tokenStats.Snapshot()
 	total := totalIn + totalOut
-	fmt.Fprintf(&b, "\nToken usage (session)\n%s\n", sep)
-	fmt.Fprintf(&b, "  Total   %s in / %s out = %s  (%d req)\n\n",
-		fmtTokens(totalIn), fmtTokens(totalOut), fmtTokens(total), totalReq)
+	fmt.Fprintf(&b, "Token usage (model route -> credpool -> credential)\n%s\n", sep)
+	fmt.Fprintf(&b, "  Total   %s in / %s out = %s  (%d req)\n", fmtTokens(totalIn), fmtTokens(totalOut), fmtTokens(total), totalReq)
+	if s.compressStats != nil {
+		if cs := s.compressStats.Snapshot(); cs.OriginalTokens > 0 {
+			fmt.Fprintf(&b, "  Totals above already reflect compression — %s tokens (%.1f%%) were cut before reaching the upstream\n",
+				fmtTokens(cs.SavedTokens), cs.ReductionPct())
+		}
+	}
+	fmt.Fprintln(&b)
 
 	if len(modelSnaps) > 0 {
 		fmt.Fprintf(&b, "  %-22s  %10s  %10s  %10s  %6s\n",
@@ -312,11 +334,22 @@ func (s *Server) StatsText() string {
 				fmtTokens(ms.Input), fmtTokens(ms.Output),
 				bar, fmtTokens(ms.Input+ms.Output),
 				ms.Requests)
-			for _, k := range ms.Keys {
-				fmt.Fprintf(&b, "      %-18s  %10s  %10s  %16s  %6d\n",
-					"└ "+k.Name,
-					fmtTokens(k.Input), fmtTokens(k.Output),
-					fmtTokens(k.Input+k.Output), k.Requests)
+			for _, p := range ms.Pools {
+				provider := namedPoolProvider(p.Name, cfg)
+				label := p.Name
+				if provider != "" {
+					label = p.Name + " (" + provider + ")"
+				}
+				fmt.Fprintf(&b, "    %-20s  %10s  %10s  %10s  %6d\n",
+					"├─ "+label,
+					fmtTokens(p.Input), fmtTokens(p.Output),
+					fmtTokens(p.Input+p.Output), p.Requests)
+				for _, k := range p.Keys {
+					fmt.Fprintf(&b, "        %-16s  %10s  %10s  %10s  %6d\n",
+						"└ "+k.Name,
+						fmtTokens(k.Input), fmtTokens(k.Output),
+						fmtTokens(k.Input+k.Output), k.Requests)
+				}
 			}
 		}
 	}
@@ -405,7 +438,8 @@ func (s *Server) buildConfigResponse(cfg *config.Config, sections ...string) map
 			Key  string `json:"key"`
 		}
 		type poolView struct {
-			UpstreamModelType     string     `json:"upstream_model_type,omitempty"`
+			ProviderRef           string     `json:"provider_ref,omitempty"`
+			NativePassthrough     bool       `json:"native_passthrough,omitempty"`
 			Strategy              string     `json:"strategy,omitempty"`
 			CircuitBreakThreshold int        `json:"circuit_break_threshold,omitempty"`
 			CooldownSeconds       int        `json:"cooldown_seconds,omitempty"`
@@ -415,7 +449,8 @@ func (s *Server) buildConfigResponse(cfg *config.Config, sections ...string) map
 		pools := map[string]poolView{}
 		for name, kp := range cfg.CredPools {
 			pv := poolView{
-				UpstreamModelType:     kp.UpstreamModelType,
+				ProviderRef:           kp.ProviderRef,
+				NativePassthrough:     kp.NativePassthrough,
 				Strategy:              kp.Strategy,
 				CircuitBreakThreshold: kp.CircuitBreakThreshold,
 				CooldownSeconds:       kp.CooldownSeconds,
@@ -585,7 +620,7 @@ func (s *Server) ModelInfoText() string {
 	for _, name := range sortedKeys(cfg.CredPools) {
 		kp := cfg.CredPools[name]
 		fmt.Fprintf(&b, "  %-14s provider=%-10s strategy=%-14s keys: %s\n",
-			name, orDash(kp.UpstreamModelType), orDash(kp.Strategy), keyNames(kp.Keys))
+			name, orDash(namedPoolProvider(name, cfg)), orDash(kp.Strategy), keyNames(kp.Keys))
 	}
 
 	return b.String()

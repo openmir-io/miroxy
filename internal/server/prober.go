@@ -2,15 +2,14 @@ package server
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"log/slog"
 	"sync"
 	"time"
 
 	"miroxy/core/dispatch"
+	"miroxy/core/ir"
 	"miroxy/core/selector"
-	"miroxy/internal/types"
 )
 
 // probeSchedule defines the wait before each successive all-credentials probe attempt.
@@ -126,11 +125,9 @@ func (p *keyProber) probeAll(ctx context.Context) bool {
 
 // probeKey sends a minimal 1-token request to test whether the credential is usable.
 func (p *keyProber) probeKey(ctx context.Context, plan *selector.ExecutionPlan) error {
-	content, _ := json.Marshal("hi")
-	req := &types.MessageRequest{
-		Model:     p.modelName,
-		MaxTokens: 1,
-		Messages:  []types.Message{{Role: "user", Content: content}},
+	req := &ir.IRRequest{
+		Messages: []ir.IRMessage{{Role: "user", Parts: []ir.IRContentPart{{Text: &ir.IRTextPart{Text: "hi"}}}}},
+		Gen:      ir.IRGenerationConfig{MaxTokens: 1},
 	}
 	reqCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()

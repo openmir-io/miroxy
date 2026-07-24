@@ -10,18 +10,18 @@ server:
 
 auth:
   allowed_keys:
-    - ${MIROXY_CLIENT_KEY}  # the key your clients send in Authorization: Bearer
+    - ${MIROXY_CLIENT_KEY}  # the key your clients send as Authorization: Bearer <key> or x-api-key: <key>
 
 providers:
   gemini: {}                # uses built-in defaults (generativelanguage.googleapis.com)
 
 credpools:
   my-pool:
+    provider_ref: gemini
     keys:
       - my_key: ${GEMINI_KEY}
 
 model_routes:
   - model_name: default
-    provider: gemini
-    provider_model: gemini-2.5-flash
+    upstream_model: gemini-2.5-flash
     credpool_ref: my-pool

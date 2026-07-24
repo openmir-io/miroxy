@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -117,6 +118,39 @@ func formatStat(raw []byte) string {
 			Name string `json:"name"`
 			Keys int    `json:"keys"`
 		} `json:"credpools"`
+		Usage struct {
+			TotalInputTokens  int64 `json:"total_input_tokens"`
+			TotalOutputTokens int64 `json:"total_output_tokens"`
+			TotalTokens       int64 `json:"total_tokens"`
+			TotalRequests     int64 `json:"total_requests"`
+			ByModel           []struct {
+				Name     string `json:"model"`
+				Input    int64  `json:"input_tokens"`
+				Output   int64  `json:"output_tokens"`
+				Requests int64  `json:"requests"`
+				Pools    []struct {
+					Name     string `json:"credpool"`
+					Provider string `json:"provider"`
+					Input    int64  `json:"input_tokens"`
+					Output   int64  `json:"output_tokens"`
+					Requests int64  `json:"requests"`
+					Keys     []struct {
+						Name     string `json:"name"`
+						Input    int64  `json:"input_tokens"`
+						Output   int64  `json:"output_tokens"`
+						Requests int64  `json:"requests"`
+					} `json:"keys"`
+				} `json:"credpools"`
+			} `json:"by_model"`
+		} `json:"usage"`
+		Compress struct {
+			Enabled          bool    `json:"enabled"`
+			Requests         int64   `json:"requests"`
+			OriginalTokens   int64   `json:"original_tokens"`
+			CompressedTokens int64   `json:"compressed_tokens"`
+			SavedTokens      int64   `json:"saved_tokens"`
+			ReductionPct     float64 `json:"reduction_pct"`
+		} `json:"compress"`
 	}
 	if err := json.Unmarshal(raw, &s); err != nil {
 		return prettyJSON(raw) + "\n"
@@ -131,6 +165,39 @@ func formatStat(raw []byte) string {
 	fmt.Fprintf(&b, "In-flight:  %d\n", s.InFlight)
 	if s.Config != "" {
 		fmt.Fprintf(&b, "Config:     %s\n", s.Config)
+	}
+
+	fmt.Fprintf(&b, "\nToken Usage\n%s\n", sub)
+	if s.Usage.TotalRequests == 0 && s.Usage.TotalTokens == 0 {
+		fmt.Fprintf(&b, "  (no requests yet)\n")
+	} else {
+		fmt.Fprintf(&b, "  Total:  %s in / %s out = %s tokens  (%s req)\n",
+			commaInt(s.Usage.TotalInputTokens), commaInt(s.Usage.TotalOutputTokens),
+			commaInt(s.Usage.TotalTokens), commaInt(s.Usage.TotalRequests))
+		for _, m := range s.Usage.ByModel {
+			fmt.Fprintf(&b, "\n  %-20s  in=%-14s out=%-14s total=%-14s req=%s\n",
+				m.Name, commaInt(m.Input), commaInt(m.Output), commaInt(m.Input+m.Output), commaInt(m.Requests))
+			for _, p := range m.Pools {
+				label := p.Name
+				if p.Provider != "" {
+					label = p.Name + " (" + p.Provider + ")"
+				}
+				fmt.Fprintf(&b, "    ├─ %-20s  in=%-14s out=%-14s total=%-14s req=%s\n",
+					label, commaInt(p.Input), commaInt(p.Output), commaInt(p.Input+p.Output), commaInt(p.Requests))
+				for _, k := range p.Keys {
+					fmt.Fprintf(&b, "         └ %-16s  in=%-14s out=%-14s total=%-14s req=%s\n",
+						k.Name, commaInt(k.Input), commaInt(k.Output), commaInt(k.Input+k.Output), commaInt(k.Requests))
+				}
+			}
+		}
+	}
+
+	if s.Compress.Enabled {
+		fmt.Fprintf(&b, "\nCompress enabled:\n")
+		fmt.Fprintf(&b, "Requests:     %s\n", commaInt(s.Compress.Requests))
+		fmt.Fprintf(&b, "Tokens:       %s -> %s (%.1f%% reduction)\n",
+			commaInt(s.Compress.OriginalTokens), commaInt(s.Compress.CompressedTokens), s.Compress.ReductionPct)
+		fmt.Fprintf(&b, "Total saved:  %s tokens\n", commaInt(s.Compress.SavedTokens))
 	}
 
 	fmt.Fprintf(&b, "\nModel Routing\n%s\n", sub)
@@ -156,6 +223,22 @@ func formatStat(raw []byte) string {
 
 	fmt.Fprintf(&b, "\n")
 	return b.String()
+}
+
+// commaInt formats an integer with thousands separators, e.g. 956226475 -> "956,226,475".
+func commaInt(n int64) string {
+	s := strconv.FormatInt(n, 10)
+	neg := strings.HasPrefix(s, "-")
+	if neg {
+		s = s[1:]
+	}
+	for i := len(s) - 3; i > 0; i -= 3 {
+		s = s[:i] + "," + s[i:]
+	}
+	if neg {
+		s = "-" + s
+	}
+	return s
 }
 
 // prettyJSON re-indents a JSON response for human-readable output.

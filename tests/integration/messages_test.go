@@ -2,6 +2,7 @@ package integration_test
 
 import (
 	"net/http"
+	"strings"
 	"testing"
 
 	"miroxy/internal/types"
@@ -214,5 +215,39 @@ func TestGetModels(t *testing.T) {
 	}
 	if m.DisplayName == "" {
 		t.Error("model display_name should not be empty")
+	}
+}
+
+// TestNonStreaming_BarePathAliasWithoutV1 guards that a client which builds
+// its request URL as base_url+"/messages" (omitting /v1 from base_url) still
+// reaches the same handler as the documented /v1/messages path — some
+// OpenAI-compatible tools get this detail wrong, and 404-ing them instead of
+// serving the request is the exact friction that prompted this alias.
+func TestNonStreaming_BarePathAliasWithoutV1(t *testing.T) {
+	stub := newStubGemini(t, nil, nil)
+	defer stub.Close()
+
+	miroxy := newTestServer(t, miroxyConfig{stubURL: stub.URL, keys: []string{"key-a"}})
+	defer miroxy.Close()
+
+	req, err := http.NewRequest(http.MethodPost, miroxy.URL+"/messages", strings.NewReader(nonStreamBody))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+testClientKey)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("POST /messages (no /v1): expected 200, got %d", resp.StatusCode)
+	}
+	var msg types.MessageResponse
+	decodeJSON(t, resp.Body, &msg)
+	if msg.Role != "assistant" {
+		t.Errorf("role: got %q, want assistant", msg.Role)
 	}
 }

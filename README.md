@@ -1,502 +1,406 @@
-# miroxy
+# Miroxy
 
-LLM API gateway with multi-provider routing.
+Miroxy is an Go version LLM API gateway based on [OpenMIR](https://github.com/openmir-io/openmir-spec). It accepts requests from any LLM Client and routes to any upstream providers
+Gemini, OpenAI, DeepSeek, Anthropic, GLM, Grok, and AWS Bedrock — behind a
+single endpoint. It manages API key pools (rotation, rate-limit backoff,
+circuit-breaking), translates wire protocols automatically, and falls back
+across providers or keys on failure.
 
-Accepts requests from any Anthropic or OpenAI-compatible client, routes them across upstream providers (Gemini, OpenAI, DeepSeek, Anthropic, and more), manages API key pools with rotation and 429 backoff, and translates protocols automatically.
+## Current Well tested:
+Anthropic
+OpenAI
+OpenAI-Compatible
+---
+
+## Architecture
+
+### Two-level abstraction
+
+The codebase is split into two layers:
+
+- **`core/`** — stable interfaces and pure-Go implementations with no I/O:
+  `Selector` (credential/key selection), `Router` (model → upstream target),
+  `UpstreamAdapter` (wire protocol for a provider), `DownstreamAdapter` (wire
+  protocol for a client), and the IR types. This layer is portable and
+  independently testable.
+- **`internal/`** — I/O-bound implementations that depend on the network,
+  the filesystem, or process state: the HTTP server, concrete upstream/downstream
+  adapters, config loading, credential pools, and the plugin pipeline.
+
+Adding a new upstream provider or client-facing protocol means implementing
+one adapter against a `core/` interface — no changes to routing, the server,
+or other adapters.
+
+### Request pipeline
+
+Every request flows through an ordered chain of plugins (`internal/pipeline`),
+each free to inspect or rewrite the request/response before passing it on.
+A typical chain, lowest priority first:
+
+```
+Auth → Command → Warden (content defense) → Compress (token compression) → Router → Upstream (terminal)
+```
+
+`Upstream` is always the terminal plugin — it owns the retry loop across
+credentials and targets, and is the only plugin that performs real network I/O
+to the provider. Streaming and non-streaming requests are handled by separate
+code paths throughout the pipeline; a stream is never buffered through a
+non-streaming abstraction.
+
+### Diagram
+
+**Request flow** — any LLM client, transparently adapted through IR, with
+compression, PII/secret scrubbing, and credential health all handled before
+a request ever reaches a provider:
+
+```mermaid
+flowchart LR
+    subgraph clients["LLM clients"]
+        direction TB
+        cc["Claude Code"]
+        codex["Codex"]
+        oc["OpenCode"]
+        raw["Raw client / SDK"]
+    end
+
+    subgraph miroxy["miroxy"]
+        direction TB
+        down["Downstream adapters<br/>decode → IR"]
+        warden["Warden<br/>PII / secret scrubbing"]
+        compress["Compress<br/>token compression"]
+        router["Router<br/>model_route lookup"]
+        credpool["CredPool<br/>rotation · rate-limit backoff · circuit-break"]
+        up["Upstream adapters<br/>IR → encode"]
+
+        down --> warden --> compress --> router --> credpool --> up
+    end
+
+    subgraph backends["Backend providers"]
+        direction TB
+        gemini["Gemini"]
+        anthropic["Anthropic"]
+        bedrock["AWS Bedrock"]
+        deepseek["DeepSeek"]
+        glm["GLM"]
+        grok["Grok"]
+    end
+
+    cc --> down
+    codex --> down
+    oc --> down
+    raw --> down
+
+    up --> gemini
+    up --> anthropic
+    up --> bedrock
+    up --> deepseek
+    up --> glm
+    up --> grok
+
+    classDef irNode fill:#7c9eff,stroke:#4a5ea8,color:#0b0d12,font-weight:bold;
+    class down,up irNode;
+```
+
+**Config topology** — how a client-facing `model_routes` entry resolves down
+to a real provider call. A route maps to one or more `credpools` (fan-out is
+`routing.targets`, for fallback/round-robin/least-requests); multiple
+credpools can share one `providers` entry, since a credpool is just an
+isolated set of keys and health state for that provider:
+
+```mermaid
+flowchart LR
+    subgraph routes["model_routes"]
+        direction TB
+        r1["default<br/>upstream_model: gemini-2.5-flash"]
+        r2["miroxy-claude-haiku<br/>upstream_model: claude-haiku-4-5"]
+        r3["miroxy-free<br/>routing.targets: fallback"]
+    end
+
+    subgraph pools["credpools"]
+        direction TB
+        p1["gemini-2.5<br/>keys + round_robin"]
+        p2["gemini-3.5<br/>keys"]
+        p3["anthropic<br/>keys"]
+    end
+
+    subgraph provs["providers"]
+        direction TB
+        pv1["gemini<br/>base_url, protocol"]
+        pv2["anthropic<br/>base_url, protocol"]
+    end
+
+    r1 -->|credpool_ref| p1
+    r2 -->|credpool_ref| p3
+    r3 -->|target 1| p1
+    r3 -->|target 2| p2
+
+    p1 -->|provider_ref| pv1
+    p2 -->|provider_ref| pv1
+    p3 -->|provider_ref| pv2
+```
 
 ---
 
-## Quickstart
+## Concepts & features
 
-```bash
-go build -o build/miroxy ./cmd/miroxy   # Go 1.22+
-cp config/config.yaml.example.min config/config.yaml
-# edit config.yaml — set GEMINI_KEY and MIROXY_CLIENT_KEY
-export GEMINI_KEY=AIzaSy...
-export MIROXY_CLIENT_KEY=sk-my-client-key
-./build/miroxy serve -c config/config.yaml
+### model_routes, providers, and credpools
+
+Three config sections work together to turn a client-facing model name into
+an authenticated call to a real upstream API:
+
+```
+model_routes            credpools                  providers
+────────────           ───────────                ───────────
+model_name        →     credpool_ref        →       provider_ref
+upstream_model           (keys, strategy,            (base_url,
+                          rate limits,                 protocol,
+                          circuit-break)                auth_style)
 ```
 
-### Point your client at miroxy
+- **`providers`** declares connection defaults for a provider family — its
+  `base_url`, wire `protocol`, and `auth_style`. Built-in providers (gemini,
+  openai, anthropic, deepseek, glm, grok, bedrock) already have correct
+  defaults; declare the name with `{}` unless you're overriding something
+  (a relay URL, a self-hosted server, a different auth scheme).
+- **`credpools`** holds one or more real API keys for a single provider
+  (via `provider_ref`). It owns everything about *that key set's* health:
+  rotation strategy, rate limits, circuit-break thresholds, and cooldowns —
+  isolated from every other credpool.
+- **`model_routes`** is what a client actually requests as `model`. A route
+  maps to one `upstream_model` + `credpool_ref` pair directly, or to several
+  via a `routing.targets` list with a strategy (`fallback`, `round_robin`,
+  `least_requests`) for failover or tiering across providers.
 
-**Claude Code** — add to `~/.claude/settings.json`:
+### IR (Intermediate Representation)
 
-```json
-{
-  "env": {
-    "ANTHROPIC_BASE_URL": "http://localhost:9000",
-    "ANTHROPIC_AUTH_TOKEN": "sk-my-client-key",
-    "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY": "1"
-  }
-}
-```
+Miroxy doesn't convert directly between every pair of client/provider wire
+formats. Instead, every `DownstreamAdapter` decodes a client's request into a
+common IR, and every `UpstreamAdapter` encodes that IR into its provider's
+wire format (and decodes the response back into IR). This means N client
+protocols and M upstream providers need N + M converters, not N × M — adding
+a provider or a client protocol never touches the other side.
 
-**Codex** — run the setup script once, then restart Codex:
-
-```bash
-cd /path/to/miroxy
-./scripts/enable_miroxy_for_codex.sh config/config.yaml
-```
-
-**OpenAI SDK / any OpenAI-compatible client:**
-
-```python
-client = openai.OpenAI(
-    base_url="http://localhost:9000/v1",
-    api_key="sk-my-client-key",
-)
-```
+Passthrough is the deliberate exception: when a client's own protocol already
+matches a target's protocol, miroxy can forward the original request bytes
+and headers verbatim instead of round-tripping through IR, preserving
+protocol details (e.g. Anthropic's `anthropic-version` header) that a
+canonical IR has no slot for.
 
 ---
 
-## Minimum required configuration
+## Prerequisites
 
-Every miroxy config needs these five sections.
+### config.yaml
 
-```yaml
-server:
-  default_model: miroxy      # must match a model_name in model_routes
+Copy one of the example files in `config/` to `config/config.yaml` and edit
+it. Each example covers a different scenario:
 
-auth:
-  allowed_keys:
-    - ${MIROXY_CLIENT_KEY}   # what your clients send as the Bearer token
+| File | Scenario |
+|------|----------|
+| `config.yaml.example.min` | Smallest working config — one key, one pool, one route |
+| `config.yaml.example.n-keys.1-pool` | Multiple keys in one pool (rotation within one provider) |
+| `config.yaml.example.n-keys.n-pools.1-provider` | Multiple isolated pools on one provider (e.g. tiered models) |
+| `config.yaml.example.n-keys.n-pools.n-providers` | Multiple providers with fallback routing |
+| `config.yaml.example.n-keys.n-pools.n-providers.n-routermodels` | Full multi-route setup, several named models |
+| `config.yaml.example.local.protocol` | Self-hosted servers — Ollama, LM Studio, vLLM, LocalAI |
+| `config.yaml.example.compatible.protocol` | Third-party OpenAI/Anthropic-compatible providers (DeepSeek, Grok, GLM, OpenRouter, relays) |
+| `config.yaml.example.warden` | Content defense — secrets/PII/prompt-injection/jailbreak detection |
+| `config.yaml.example.full` | Every field, fully annotated — the reference doc |
 
-providers:
-  gemini: {}                 # declare every provider used in model_routes
-                             # fields left blank use built-in defaults
+For exact field names and defaults, see `config/config.yaml.example.full`.
 
-credpools:
-  my-pool:
-    keys:
-      - my_key: ${GEMINI_KEY}
+### secrets.env
 
-model_routes:
-  - model_name: miroxy
-    provider_ref: gemini
-    upstream_model: gemini-2.5-flash
-    credpool_ref: my-pool
-```
+`config.yaml` references secrets as `${VAR_NAME}` placeholders; the actual
+values come from the process environment. You can provide them either way:
 
-See [`config/config.yaml.example.min`](config/config.yaml.example.min) for the
-smallest working config, and the other `config.yaml.example.*` files for more
-complex setups.
+- as a file — copy `config/secrets.env.example` to `config/secrets.env` and
+  fill in real values (`make run` and `make docker-run` both load this file), or
+- as environment variables passed directly to miroxy at launch, with no file
+  involved at all.
 
----
+To get running immediately: copy `config/config.yaml.example.min` to
+`config/config.yaml`, set `GEMINI_KEY` and `MIROXY_CLIENT_KEY`. See the
+`config/` directory for every other scenario.
 
-## Default ports
+### Ports
 
 | Port | Purpose |
 |------|---------|
 | **9000** | Proxy — receives LLM traffic from clients |
 | **9001** | Admin — management API, localhost only |
 
-Both can be overridden in config:
-
-```yaml
-server:
-  port: 9000
-
-admin:
-  addr: "127.0.0.1:9001"
-```
+Both are configurable (`server.port`, `admin.addr`) — check these aren't
+already bound by something else on the host before starting.
 
 ---
 
-## Proxy endpoints (port 9000)
+## Quickstart
 
-| Method | Path | Protocol |
-|--------|------|----------|
-| `POST` | `/v1/messages` | Anthropic Messages API |
-| `POST` | `/v1/responses` | OpenAI Responses API (Codex) |
-| `POST` | `/v1/chat/completions` | OpenAI Chat API |
-| `GET`  | `/v1/models` | Model list (gateway discovery) |
-
----
-
-## Admin endpoints (port 9001)
-
-Authentication: `Authorization: Bearer <token>` where token is any value from
-`auth.allowed_keys`, OR the admin session token from `POST /admin/login`.
-
-| Method | Path | Description |
-|--------|------|-------------|
-| `GET`  | `/health` | Liveness probe — no auth required |
-| `GET`  | `/stat` | Runtime stats: uptime, token usage, compress perf |
-| `GET`  | `/v1/config` | Full effective config (defaults resolved, keys masked) |
-| `GET`  | `/v1/config/providers` | Resolved provider definitions |
-| `GET`  | `/v1/config/credpools` | Credpools with masked keys |
-| `GET`  | `/v1/config/routes` | Model routes (including auto-discovered) |
-| `POST` | `/admin/reload` | Hot-reload config file |
-| `POST` | `/admin/proxy/stop` | Stop proxy listener |
-| `POST` | `/admin/proxy/start` | Start proxy listener |
-
-Full API spec: [`internal/api/admin-openapi.yaml`](internal/api/admin-openapi.yaml)
-
----
-
-## CLI reference
-
-```
-miroxy serve                    Start the proxy server
-miroxy config                   Show full effective config of running instance
-miroxy config providers         Show resolved provider definitions
-miroxy config routes            Show model routes (including auto-discovered)
-miroxy config credpools          Show credpools (keys masked)
-miroxy health                   Liveness check against running instance
-miroxy stat                     Runtime stats
-miroxy reload                   Hot-reload config file
-```
-
-### `miroxy serve`
-
-```
-miroxy serve [flags]
-
-Flags:
-  -c, --config string     path to config file (default "config/config.yaml")
-  -p, --port int          proxy listen port (overrides config)
-      --admin-port int    admin listen port (overrides config)
-      --dump              enable traffic capture to dump.jsonl
-      --log-level string  log level: trace|debug|info|warn|error
-```
-
-### `miroxy config`
-
-Acts as an API client against a running instance. Requires `MIROXY_AUTH_TOKEN`
-env var (any value from `auth.allowed_keys`):
+### Local run
 
 ```bash
-export MIROXY_AUTH_TOKEN=sk-my-client-key
-
-miroxy config                             # full effective config
-miroxy config providers                   # providers section
-miroxy config routes                      # model routes
-miroxy config credpools                    # credpools (keys masked)
-miroxy config --admin-addr 10.0.0.5:9001 routes   # remote instance
+make build   # compile ./cmd/miroxy → build/miroxy
+make test    # go test ./...
+make run     # build + run — auto-loads config/config.yaml and config/secrets.env
 ```
 
-### Admin address resolution
+`make run` fails fast with a clear error if `config/secrets.env` is missing.
 
-`health`, `stat`, `reload`, and `config` resolve the admin address in this order:
-
-1. `--admin-addr` flag
-2. `MIROXY_ADMIN_ADDR` environment variable
-3. `admin.addr` read from `-c config.yaml`
-4. Default `http://127.0.0.1:9001`
-
----
-
-## Configuration
-
-Full annotated example: [`config/config.yaml.example`](config/config.yaml.example)
-
-### Providers — must be declared
-
-Every provider referenced in `model_routes` must appear in the `providers` block.
-Built-in defaults (base_url, protocol, auth_style) are applied automatically for
-known providers — just declare the key, leave fields blank:
-
-```yaml
-providers:
-  gemini: {}       # base_url=https://generativelanguage.googleapis.com, protocol=gemini, auth_style=query_key
-  openai: {}       # base_url=https://api.openai.com/v1, protocol=openai, auth_style=bearer
-  anthropic: {}    # base_url=https://api.anthropic.com, protocol=anthropic, auth_style=api_key
-  deepseek: {}     # base_url=https://api.deepseek.com/v1, protocol=deepseek, auth_style=bearer
-  glm: {}          # base_url=https://api.z.ai/api/paas/v4, protocol=glm, auth_style=bearer
-  grok: {}         # base_url=https://api.x.ai/v1, protocol=grok, auth_style=bearer
-```
-
-Override only what you need:
-
-```yaml
-providers:
-  gemini:
-    base_url: https://gemini-relay.internal   # point at a relay
-```
-
-### Key pools
-
-```yaml
-credpools:
-  gemini-flash:
-    strategy: least_requests        # or round_robin
-    circuit_break_threshold: 5      # consecutive failures before marking key unhealthy
-    cooldown_seconds: 60
-    rate_limit_rpm: 20              # Gemini free tier: 20 req/min per key
-    rate_soft_limit: 18             # rotate proactively at 18 to stay under limit
-    keys:
-      - key_alice:   ${GEMINI_KEY_1}
-      - key_bob:     ${GEMINI_KEY_2}
-      - key_charlie: ${GEMINI_KEY_3}
-```
-
-Key name (e.g. `key_alice`) appears in `key_id` log fields on 429 and circuit-break events — makes it easy to identify which key is causing problems.
-
-**Passthrough auto-routing**: tag a credpool with `upstream_model_type: anthropic` or `upstream_model_type: openai` to enable zero-config passthrough routing for `claude-*` or `gpt-*` models respectively. This tag is optional whenever the pool is already referenced by a `model_routes` entry — its family is derived automatically from that entry's `provider_ref` — but it's required for a pool that exists only for passthrough, with no static route pointing at it:
-
-```yaml
-credpools:
-  anthropic-pool:
-    upstream_model_type: anthropic   # enables passthrough for any claude-* model
-    keys:
-      - main: ${ANTHROPIC_KEY}
-
-  openai-pool:
-    upstream_model_type: openai      # enables passthrough for gpt-*, o1*, o3*
-    keys:
-      - main: ${OPENAI_KEY}
-```
-
-With these pools configured, clients can select `claude-opus-4-8` or `gpt-5.4` and miroxy routes them automatically — no explicit `model_routes` entry needed.
-
-### Model routes
-
-```yaml
-model_routes:
-  # Simple: one provider, one model
-  - model_name: miroxy
-    provider_ref: gemini
-    upstream_model: gemini-2.5-flash
-    credpool_ref: gemini-flash
-    timeout_seconds: 30
-
-  # Routing: fallback across multiple providers
-  - model_name: miroxy-smart
-    routing:
-      strategy: fallback
-      targets:
-        - provider_ref: anthropic
-          upstream_model: claude-sonnet-4-6
-          credpool_ref: anthropic-pool
-          timeout_seconds: 60
-        - provider_ref: gemini
-          upstream_model: gemini-2.5-pro
-          credpool_ref: gemini-pro
-          timeout_seconds: 60
-```
-
-### Model name matching (LookupModel)
-
-When a request arrives with `model: "claude-opus-4-8"`, miroxy finds the route in this order:
-
-1. **Exact match** — `model_name: "claude-opus-4-8"` in config
-2. **Strip prefix** — strip `claude-`, look up `opus-4-8`
-3. **Longest prefix** — `opus` matches `opus-4-8` (next char must be `-` or end); `gpt-5.4` matches `gpt-5.4-mini` and `gpt-5.4-turbo`
-4. **Provider passthrough** — `claude-*` → anthropic credpool; `gpt-*/o1*/o3*` → openai credpool
-5. **Default model** — `server.default_model`
-
-### Routing strategies
-
-| Strategy | Behaviour |
-|----------|-----------|
-| `fallback` | Try targets in order; advance only when a pool is fully exhausted |
-| `round_robin` | Distribute requests evenly across targets |
-| `least_requests` | Send to the target with fewest active in-flight requests |
-
----
-
-## Model discovery (Claude Code / Codex)
-
-### Claude Code model picker
-
-miroxy auto-detects Claude Code requests via `User-Agent: claude-code/*` and
-adds a `claude-` prefix to model IDs in `GET /v1/models` so they appear in the
-`/model` picker. No naming convention required in config — `model_name: gemini-2.5`
-shows up as `claude-gemini-2.5` in the picker.
-
-Requirements:
-1. Set `CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1` in `~/.claude/settings.json`
-2. Point `ANTHROPIC_BASE_URL` at miroxy
-
-### Codex model picker
-
-Generate a Codex-compatible model catalog from your miroxy config:
+### Docker
 
 ```bash
-# Linux / macOS
-./scripts/enable_miroxy_for_codex.sh config/config.yaml
+make docker-build                  # builds openmir/miroxy:dev
+VERSION=1.0.0 make docker-build    # builds openmir/miroxy:1.0.0
 
-# Disable and restore original config
-./scripts/disable_miroxy_for_codex.sh
-```
-
-### Auto-discovery of upstream models
-
-With `model_discovery: auto` (default) and a provider-tagged credpool, miroxy
-calls the provider's `/v1/models` at startup and injects discovered models:
-
-```yaml
-credpools:
-  anthropic-pool:
-    upstream_model_type: anthropic   # triggers GET api.anthropic.com/v1/models on startup
-    keys:
-      - main: ${ANTHROPIC_KEY}
-```
-
-Discovered models appear in `GET /v1/models` responses and are immediately routable.
-Disable with `server.model_discovery: strict`.
-
----
-
-## In-band proxy commands (`:miroxy`)
-
-Prefix a message with `:miroxy` to execute it without consuming LLM tokens.
-Works in Claude Code, Codex, and any other client.
-
-```
-:miroxy ?              List all commands
-:miroxy stats          Uptime, token usage, credpool health, compression stats
-:miroxy health         Quick health check
-:miroxy dump on|off    Toggle traffic capture to dump.jsonl
-```
-
-**Inject into context:**
-
-```
-:miroxy stats is credpool utilization high?
-# → injects stats output, then asks the LLM the question
-```
-
-The `:miroxy dump` command requires `server.commands.allow_dump: true` in config.
-
----
-
-## Dump mode
-
-Captures all request/response traffic to JSONL for protocol debugging.
-
-```yaml
-dump:
-  enabled: true
-  path: ./log/dump.jsonl    # default path
-  include_sse: true         # write each SSE event as a separate record
-  max_size_mb: 10           # rotate at 10 MB; 0 = unlimited
-  max_backups: 2            # keep 2 rotated files (timestamped)
-```
-
-Rotated files are named `dump.jsonl.20260706132950` (UTC timestamp). Deleted files
-are automatically recreated on the next write.
-
-Filter by trace ID:
-
-```bash
-grep '"trace_id":"abc123"' log/dump.jsonl | jq .
-```
-
----
-
-## Running locally
-
-```bash
-make build                  # outputs build/miroxy
-
-cp config/config.yaml.example.min config/config.yaml
-cp config/secrets.env.example config/secrets.env
-# edit both files
-
-make run                    # loads secrets.env automatically
-```
-
-Verify:
-
-```bash
-curl http://localhost:9000/health
-curl http://localhost:9001/health
-
-export MIROXY_AUTH_TOKEN=sk-my-client-key
-./build/miroxy config       # show effective config
-./build/miroxy stat         # show runtime stats
-```
-
----
-
-## Docker
-
-```bash
-docker run -d \
-  --name miroxy \
-  --env-file config/secrets.env \
-  -v "$(pwd)/config/config.yaml:/app/config/config.yaml:ro" \
-  -p 9000:9000 \
-  -p 9001:9001 \
-  forrestisagoodman/miroxy:latest
-```
-
-```bash
-make docker-build VERSION=1.0.0
-make docker-push  VERSION=1.0.0
-make docker-run   VERSION=1.0.0   # stop old + start new
+make docker-run                    # run container (mounts config.yaml, loads secrets.env)
 make docker-logs                   # tail logs
 make docker-stop                   # stop and remove
 ```
 
 ---
 
-## Hot reload
+## Auth Configuration
+
+miroxy checks every client request against `auth.allowed_keys` in
+`config.yaml`, accepting either `Authorization: Bearer <key>` or
+`x-api-key: <key>` — whichever the client's own protocol sends. Each
+section below points a specific client at miroxy with one of those keys,
+and, where the client supports it, lets it discover `model_routes` as
+native, selectable models instead of a hardcoded model name.
+
+### Claude Code
+
+Claude Code speaks Anthropic's own protocol. Point it at miroxy and give it
+a key from `auth.allowed_keys` as either `ANTHROPIC_AUTH_TOKEN` (sent as
+`Authorization: Bearer`) or `ANTHROPIC_API_KEY` (sent as `x-api-key`) —
+miroxy accepts both.
+
+To make `model_routes` show up in Claude Code's native `/model` picker
+instead of typing a model name by hand, also set
+`CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1`. On startup Claude Code calls
+`GET /v1/models`; miroxy detects the `claude-code/*` User-Agent and
+auto-prefixes every route's `model_name` with `claude-` (Claude Code only
+lists `claude-*` models), so a route named `default` appears as
+`claude-default`.
+
+Set these in `~/.claude/settings.json` (or export them in your shell before
+launching `claude`):
+
+```json
+{
+  "env": {
+    "ANTHROPIC_BASE_URL": "http://localhost:9000",
+    "ANTHROPIC_AUTH_TOKEN": "<a key from auth.allowed_keys>",
+    "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY": "1"
+  }
+}
+```
+
+Then run `/model` inside Claude Code and pick any `claude-<model_name>`
+entry.
+
+### Codex
+
+Run `scripts/enable_miroxy_for_codex.sh`. It resolves `model_routes` — from
+a `config.yaml` path you pass as `$1`, an auto-discovered
+`config/config.yaml`, or miroxy's admin API as a last resort — and writes
+both a Codex model catalog and a provider entry:
 
 ```bash
-miroxy reload -c config/config.yaml
-# or: kill -HUP <pid>
+export OPENAI_API_KEY=<a key from auth.allowed_keys>   # Codex sends this to miroxy as the bearer token
+./scripts/enable_miroxy_for_codex.sh                    # optionally: ./scripts/enable_miroxy_for_codex.sh path/to/config.yaml
 ```
 
-What can be changed without restart:
-- Model routes, providers, credpools
-- Rate limits, circuit-break settings
-- `default_model`, `auth.allowed_keys`
+Resulting `~/.codex/config.toml`:
 
-Requires restart: `server.port`, `admin.addr`
+```toml
+model_catalog_json = "/home/you/.codex/miroxy-models.json"
+model = "default"
+model_provider = "miroxy"
 
----
+[model_providers.miroxy]
+name = "miroxy"
+base_url = "http://localhost:9000/v1"
+env_key = "OPENAI_API_KEY"
+wire_api = "responses"
+```
 
-## Running tests
+`~/.codex/miroxy-models.json` merges Codex's own model catalog with one
+entry per `model_routes` route, so they appear in Codex's model picker.
+Run `./scripts/restore_codex.sh` to undo — it restores whatever
+`config.toml` / `miroxy-models.json` existed before the enable script ran
+(or removes them if nothing did).
+
+### Open Code
+
+Run `scripts/enable_miroxy_for_opencode.sh` — same model-source resolution
+as the Codex script, writing into OpenCode's own config instead:
 
 ```bash
-go test ./...                   # full suite
-go test ./tests/unit/...        # unit tests — no network
-go test ./tests/integration/... # integration tests — stub server
+export MIROXY_AUTH_TOKEN=<a key from auth.allowed_keys>   # OpenCode sends this to miroxy as the bearer token
+./scripts/enable_miroxy_for_opencode.sh                    # optionally: ./scripts/enable_miroxy_for_opencode.sh path/to/config.yaml
 ```
 
----
+Resulting `~/.config/opencode/opencode.json`:
 
-## Project layout
+```json
+{
+  "provider": {
+    "miroxy": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "Miroxy",
+      "options": {
+        "baseURL": "http://localhost:9000/v1",
+        "apiKey": "{env:MIROXY_AUTH_TOKEN}"
+      },
+      "models": {
+        "default": { "name": "default", "description": "Routed via miroxy" }
+      }
+    }
+  },
+  "model": "miroxy/default"
+}
+```
 
+`MIROXY_AUTH_TOKEN` is read from the environment at OpenCode startup, not
+written into the file — export it in `~/.bashrc`/`~/.zshrc` or your shell
+before launching OpenCode. Select any `miroxy/<model_name>` entry as your
+model. Run `./scripts/restore_opencode.sh` to undo.
+
+### Other code agents
+
+Not yet tested against miroxy, but any agent that accepts a custom OpenAI-
+or Anthropic-compatible endpoint should work the same way as Claude Code,
+Codex, or OpenCode above:
+
+- Point its base URL at `http://localhost:9000/v1` (OpenAI-compatible) or
+  `http://localhost:9000` (Anthropic-compatible).
+- Set its API key/token field to a value from `auth.allowed_keys`.
+- If it has a "list models from server" or gateway-discovery setting,
+  enable it to pull `model_routes` directly instead of hardcoding a model
+  name.
+
+### Raw client
+
+Any HTTP client can call miroxy directly, with no client-specific setup —
+use whichever wire protocol matches the route's client protocol, and either
+auth header:
+
+```bash
+# Anthropic protocol
+curl http://localhost:9000/v1/messages \
+  -H "x-api-key: <a key from auth.allowed_keys>" \
+  -H "anthropic-version: 2023-06-01" \
+  -H "Content-Type: application/json" \
+  -d '{"model": "default", "max_tokens": 1024, "messages": [{"role": "user", "content": "hi"}]}'
+
+# OpenAI protocol
+curl http://localhost:9000/v1/chat/completions \
+  -H "Authorization: Bearer <a key from auth.allowed_keys>" \
+  -H "Content-Type: application/json" \
+  -d '{"model": "default", "messages": [{"role": "user", "content": "hi"}]}'
 ```
-miroxy/
-├── cmd/miroxy/
-│   ├── main.go           entry point
-│   ├── root.go           root Cobra command
-│   ├── serve.go          miroxy serve
-│   └── admin.go          miroxy health / stat / reload / config
-├── core/
-│   ├── cred/             Credential interface (Header, Query, SigV4)
-│   ├── selector/         CredPool, TargetSelector, RoutingSelector
-│   ├── router/           Router interface, RouteTarget
-│   └── dispatch/         Dispatcher interface
-├── internal/
-│   ├── config/           ConfigStore, YAML loader, validation, provider defaults
-│   ├── server/           HTTP handlers, retry loops, config API, passthrough selectors
-│   ├── translator/       Protocol translators (Gemini, OpenAI, DeepSeek, Grok, GLM)
-│   ├── stats/            Token usage counters (atomic, per-model, per-key)
-│   ├── pipeline/         Plugin chain, LLMContext, CommandPlugin
-│   ├── compress/         Context compression plugin
-│   └── dump/             JSONL traffic capture with rotation
-├── docs/
-│   ├── api/              admin-openapi.yaml
-│   └── dev/              DEVLOG.md, DESIGNLOG.md
-├── scripts/
-│   ├── enable_miroxy_for_codex.sh
-│   ├── disable_miroxy_for_codex.sh
-│   └── data/codex-default-models.json
-├── tests/
-│   ├── unit/
-│   └── integration/
-└── config/
-    ├── config.yaml.example                              — full annotated
-    ├── config.yaml.example.min                          — minimal 1-key setup
-    ├── config.yaml.example.n-keys.1-pool                — multiple keys, one pool
-    ├── config.yaml.example.n-keys.n-pools.1-provider    — multiple pools, one provider
-    ├── config.yaml.example.n-keys.n-pools.n-providers   — multi-provider fallback
-    ├── config.yaml.example.n-keys.n-pools.n-providers.n-routermodels — full routing
-    ├── config.yaml.example.compatible.protocol          — DeepSeek/Grok/GLM/OpenRouter/relay
-    └── config.yaml.example.local.protocol               — Ollama/LMStudio/vLLM (untested)
-```
+
+`model` is whatever the route is named in `model_routes` — it needs no
+client-specific prefix.

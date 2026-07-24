@@ -10,9 +10,9 @@ import (
 	"strings"
 
 	"miroxy/core/cred"
-	"miroxy/internal/idgen"
-	"miroxy/internal/irc"
-	"miroxy/internal/types"
+	"miroxy/core/ir"
+	coreup "miroxy/core/upstream"
+	"miroxy/internal/wireformat"
 )
 
 // OpenAICompatTranslator implements Translator for OpenAI-compatible providers
@@ -26,12 +26,10 @@ import (
 type OpenAICompatAdapter struct {
 	upstreamModel string
 	baseURL       string // trimmed of trailing slash; no path suffix
-	downstream         irc.DownstreamConverter
-	upstream       irc.UpstreamBackend
+	upstream      wireformat.UpstreamBackend
 }
 
-// interface check removed — Translator renamed, verified at build
-// var _ upstream.UpstreamAdapter = (*OpenAICompatAdapter)(nil)
+var _ coreup.UpstreamAdapter = (*OpenAICompatAdapter)(nil)
 
 // NewOpenAI creates a translator for the standard OpenAI API.
 // baseURL defaults to the official OpenAI endpoint when empty.
@@ -42,8 +40,7 @@ func NewOpenAI(upstreamModel, baseURL string) *OpenAICompatAdapter {
 	return &OpenAICompatAdapter{
 		upstreamModel: upstreamModel,
 		baseURL:       strings.TrimRight(baseURL, "/"),
-		downstream:         irc.AnthropicConverter{},
-		upstream:       irc.NewBuiltinBackend(irc.NewOpenAIConverter(upstreamModel)),
+		upstream:      wireformat.NewBuiltinBackend(wireformat.NewOpenAIConverter(upstreamModel)),
 	}
 }
 
@@ -56,15 +53,14 @@ func NewDeepSeek(upstreamModel, baseURL string) *OpenAICompatAdapter {
 	return &OpenAICompatAdapter{
 		upstreamModel: upstreamModel,
 		baseURL:       strings.TrimRight(baseURL, "/"),
-		downstream:         irc.AnthropicConverter{},
-		upstream:       irc.NewBuiltinBackend(irc.NewOpenAICompatConverter(upstreamModel, "deepseek")),
+		upstream:      wireformat.NewBuiltinBackend(wireformat.NewOpenAICompatConverter(upstreamModel, "deepseek")),
 	}
 }
 
 // NewGrok creates a translator for xAI Grok.
 // baseURL defaults to the official xAI endpoint when empty.
 // GrokConverter is used (not the generic OpenAICompatConverter) so that
-// Grok-specific overrides can be added to grok_irc.go without touching this file.
+// Grok-specific overrides can be added to grok.go without touching this file.
 func NewGrok(upstreamModel, baseURL string) *OpenAICompatAdapter {
 	if baseURL == "" {
 		baseURL = "https://api.x.ai/v1"
@@ -72,8 +68,7 @@ func NewGrok(upstreamModel, baseURL string) *OpenAICompatAdapter {
 	return &OpenAICompatAdapter{
 		upstreamModel: upstreamModel,
 		baseURL:       strings.TrimRight(baseURL, "/"),
-		downstream:    irc.AnthropicConverter{},
-		upstream:      irc.NewBuiltinBackend(irc.NewGrokConverter(upstreamModel)),
+		upstream:      wireformat.NewBuiltinBackend(wireformat.NewGrokConverter(upstreamModel)),
 	}
 }
 
@@ -87,8 +82,7 @@ func NewGLM(upstreamModel, baseURL string) *OpenAICompatAdapter {
 	return &OpenAICompatAdapter{
 		upstreamModel: upstreamModel,
 		baseURL:       strings.TrimRight(baseURL, "/"),
-		downstream:         irc.AnthropicConverter{},
-		upstream:       irc.NewBuiltinBackend(irc.NewGLMConverter(upstreamModel)),
+		upstream:      wireformat.NewBuiltinBackend(wireformat.NewGLMConverter(upstreamModel)),
 	}
 }
 
@@ -101,22 +95,17 @@ func (t *OpenAICompatAdapter) endpointURL() string {
 
 func (t *OpenAICompatAdapter) buildHTTPRequest(
 	ctx context.Context,
-	req *types.MessageRequest,
+	req *ir.IRRequest,
 	credential cred.Credential,
 ) (*http.Request, error) {
 	slog.Debug("building upstream request",
 		"upstream_model", t.upstreamModel,
 		"messages", len(req.Messages),
-		"max_tokens", req.MaxTokens,
+		"max_tokens", req.Gen.MaxTokens,
 		"has_system", len(req.System) > 0,
 		"tools", len(req.Tools),
 	)
-	irReq, err := t.downstream.RequestToIR(req)
-	if err != nil {
-		return nil, fmt.Errorf("IR conversion: %w", err)
-	}
-
-	body, err := t.upstream.RequestToProvider(irReq)
+	body, err := t.upstream.RequestToProvider(req)
 	if err != nil {
 		return nil, fmt.Errorf("upstream RequestToProvider: %w", err)
 	}
@@ -135,7 +124,7 @@ func (t *OpenAICompatAdapter) buildHTTPRequest(
 
 func (t *OpenAICompatAdapter) ToUpstream(
 	ctx context.Context,
-	req *types.MessageRequest,
+	req *ir.IRRequest,
 	credential cred.Credential,
 ) (*http.Request, error) {
 	return t.buildHTTPRequest(ctx, req, credential)
@@ -143,13 +132,13 @@ func (t *OpenAICompatAdapter) ToUpstream(
 
 func (t *OpenAICompatAdapter) ToUpstreamStream(
 	ctx context.Context,
-	req *types.MessageRequest,
+	req *ir.IRRequest,
 	credential cred.Credential,
 ) (*http.Request, error) {
 	return t.buildHTTPRequest(ctx, req, credential)
 }
 
-func (t *OpenAICompatAdapter) FromUpstream(resp *http.Response) (*types.MessageResponse, error) {
+func (t *OpenAICompatAdapter) FromUpstream(resp *http.Response) (*ir.IRResponse, error) {
 	defer resp.Body.Close()
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
@@ -159,24 +148,29 @@ func (t *OpenAICompatAdapter) FromUpstream(resp *http.Response) (*types.MessageR
 	if err != nil {
 		return nil, err // includes *UpstreamError for body-level provider errors
 	}
-	return t.downstream.ResponseFromIR(irResp, idgen.NewMsgID(), ""), nil
+	return irResp, nil
 }
 
 func (t *OpenAICompatAdapter) StreamFromUpstream(
 	ctx context.Context,
 	resp *http.Response,
 	msgID, modelAlias string,
-) (<-chan types.SSEEvent, error) {
+) (<-chan ir.StreamEvent, error) {
 	slog.Debug("stream started", "upstream_model", t.upstreamModel, "msg_id", msgID, "model_alias", modelAlias)
-	out := make(chan types.SSEEvent, 32)
+	// OpenAI SSE → neutral IR stream events — framing into the client's own
+	// wire dialect happens at the DownstreamAdapter, not here.
+	irEvents := t.upstream.StreamToIR(ctx, resp.Body)
+	out := make(chan ir.StreamEvent, 32)
 	go func() {
 		defer resp.Body.Close()
 		defer close(out)
-		go func() { <-ctx.Done(); resp.Body.Close() }()
-		// OpenAI SSE → neutral IR stream events → Anthropic SSE.
-		// StreamToIR spawns its own reader goroutine; StreamFromIR drains it into out.
-		irEvents := t.upstream.StreamToIR(ctx, resp.Body)
-		t.downstream.StreamFromIR(ctx, irEvents, out, msgID, modelAlias)
+		for ev := range irEvents {
+			select {
+			case <-ctx.Done():
+				return
+			case out <- ev:
+			}
+		}
 	}()
 	return out, nil
 }

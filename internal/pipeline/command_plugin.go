@@ -5,8 +5,7 @@ import (
 	"strings"
 	"sync/atomic"
 
-	"miroxy/internal/idgen"
-	"miroxy/internal/types"
+	"miroxy/core/ir"
 )
 
 // CommandPlugin intercepts messages starting with ":miroxy" and handles them
@@ -165,17 +164,12 @@ func (p *CommandPlugin) respond(c *LLMContext, next Handler, output, extra strin
 // and calls a.WriteResponseAsStream() on the DownstreamAdapter — keeping the
 // pipeline layer free of any protocol-specific SSE format knowledge.
 func (p *CommandPlugin) deliver(c *LLMContext, text string) {
-	model := c.Request.Model
-	if model == "" {
-		model = "miroxy"
+	if c.ClientModel == "" {
+		c.ClientModel = "miroxy"
 	}
-	c.Response = &types.MessageResponse{
-		ID:         "msg_" + idgen.NewMsgID(),
-		Type:       "message",
-		Role:       "assistant",
-		Model:      model,
-		Content:    []types.ContentBlock{{Type: "text", Text: text}},
-		StopReason: "end_turn",
+	c.Response = &ir.IRResponse{
+		Content:    []ir.IRResponseBlock{{Text: &ir.IRTextPart{Text: text}}},
+		StopReason: ir.IRStopReasonStop,
 	}
 }
 
@@ -234,23 +228,18 @@ Requires server.commands.allow_dump: true in config (restart needed).`,
 
 // ── message helpers ───────────────────────────────────────────────────────────
 
-// lastUserText returns the last text-type content block of the last user message.
-// Claude Code injects system reminders as leading blocks; the user's actual input
-// is always the final text block in the content array.
-func lastUserText(req *types.MessageRequest) (string, bool) {
+// lastUserText returns the last text-type content part of the last user message.
+// Claude Code injects system reminders as leading parts; the user's actual input
+// is always the final text part in the message.
+func lastUserText(req *ir.IRRequest) (string, bool) {
 	for i := len(req.Messages) - 1; i >= 0; i-- {
 		m := req.Messages[i]
 		if m.Role != "user" {
 			continue
 		}
-		if t, ok := m.TextContent(); ok {
-			return strings.TrimSpace(t), true
-		}
-		if blocks, ok := m.BlockContent(); ok {
-			for j := len(blocks) - 1; j >= 0; j-- {
-				if blocks[j].Type == "text" {
-					return strings.TrimSpace(blocks[j].Text), true
-				}
+		for j := len(m.Parts) - 1; j >= 0; j-- {
+			if m.Parts[j].Text != nil {
+				return strings.TrimSpace(m.Parts[j].Text.Text), true
 			}
 		}
 		return "", false
@@ -258,13 +247,20 @@ func lastUserText(req *types.MessageRequest) (string, bool) {
 	return "", false
 }
 
-// replaceLastUserText updates only the last text block of the last user message,
-// preserving all other blocks (system reminders, tool calls, etc.).
-func replaceLastUserText(req *types.MessageRequest, text string) {
+// replaceLastUserText updates only the last text part of the last user message,
+// preserving all other parts (system reminders, tool calls, etc.).
+func replaceLastUserText(req *ir.IRRequest, text string) {
 	for i := len(req.Messages) - 1; i >= 0; i-- {
-		if req.Messages[i].Role == "user" {
-			req.Messages[i].SetLastBlockText(text)
-			return
+		if req.Messages[i].Role != "user" {
+			continue
 		}
+		parts := req.Messages[i].Parts
+		for j := len(parts) - 1; j >= 0; j-- {
+			if parts[j].Text != nil {
+				parts[j].Text.Text = text
+				return
+			}
+		}
+		return
 	}
 }

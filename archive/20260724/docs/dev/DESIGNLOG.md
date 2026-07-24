@@ -1449,3 +1449,732 @@ Tests: `internal/server/server_test.go` (`TestWardenStats_PersistsAcrossRestart`
 — two independent warden instances against the same buntdb file, proving a
 flush from the first is visible to the second, and that a live increment
 after restore builds on the restored baseline rather than replacing it).
+
+---
+
+## 2026-07-18 — `NormalizeSystem` didn't strip block-array system messages, only plain-string ones
+
+### Problem
+
+Some clients (Claude Code with certain skills) inject system instructions as
+a `role: "system"` message inside `messages` rather than the dedicated
+`system` field — `NormalizeSystem()` (`internal/types/anthropic.go`) exists
+specifically to catch this before `Validate()` runs. It only recognized
+plain-string `content` via `Message.TextContent()`; when the injected
+message's `content` was a content-block array (`[{"type":"text","text":
+"..."}]` — equally valid Anthropic wire form), `TextContent()` returned
+`ok=false`, the message was never added to `extra`, and the early return
+`if len(extra) == 0 { return }` skipped reassigning `r.Messages` entirely —
+leaving the untouched `role: "system"` entry to hit `Validate()`'s strict
+`role must be "user" or "assistant"` check. Reproduced verbatim from a real
+`/v1/messages` 400 in the debug log.
+
+### Fix
+
+- `NormalizeSystem()` now also tries `Message.BlockContent()` and joins
+  `text`-type block text, mirroring the dual-form handling `SystemText()`
+  already does for the top-level `system` field.
+- Stripping a `role: "system"` message from `r.Messages` no longer depends
+  on successful text extraction — `len(keep) != len(r.Messages)` is checked
+  independently, so a system-role message with unparseable content is still
+  removed (`Validate()` must never see it), even when no text could be
+  merged into `System`.
+
+### Files
+
+`internal/types/anthropic.go` (`NormalizeSystem`). Tests:
+`internal/types/anthropic_test.go` (new — plain-string, block-array,
+unparseable-content, and no-op cases).
+
+---
+
+## 2026-07-18 — Passthrough must ship what the pipeline produced, not the client's original bytes: `RequestRewritten` + `DispatchMode`
+
+### Problem
+
+`dispatchFor`'s raw-passthrough path (2026-07-12 entry above) forwards
+`LLMContext.RawRequestBody` — captured before `Decode`, before any pipeline
+plugin runs. Warden's redactions already patch it in place
+(`sanitizeRequest`'s documented second byte-level pass), but `CompressPlugin`
+only mutated `c.Request.Messages` — any request that both (a) exceeded the
+compression threshold and (b) landed on a passthrough-eligible attempt
+(`ClientProtocol == plan.Protocol`, or `mode: passthrough`) shipped the
+client's original, *uncompressed* bytes upstream. Compression appeared to
+succeed (logged, stats recorded) while doing nothing for that request.
+Unlike Warden's edits, Compress's are structural (drops/restructures
+messages, not 1:1 substring swaps) — Warden's `bytes.ReplaceAll` technique
+doesn't generalize to it; the fix needed a full re-marshal of the current
+`Request`, not a patch.
+
+### Design
+
+- **`LLMContext.RequestRewritten` + `RefreshRawBodyIfRewritten()`**
+  (`internal/pipeline/context.go`) — a plugin that structurally rewrites
+  `Request` sets the flag; the method re-marshals `Request` into
+  `RawRequestBody` when set. `CompressPlugin.Execute` sets it only on the
+  branch that actually compresses (`internal/compress/plugin.go`).
+- **Called once, after `MaxTokens` defaulting, before the retry loop** —
+  both `executeNonStream` and `executeStream` (`internal/server/upstream.go`)
+  default `req.MaxTokens` to 1024 when absent; refreshing *before* that
+  default would bake a stale `max_tokens: 0` into the raw body for clients
+  that omit it, since nothing re-marshals a second time afterward.
+  Refreshing once, after defaulting, keeps `RawRequestBody` in sync with
+  `Request`'s final state for every attempt in the loop.
+- **`DispatchMode`** (`DispatchIR`/`DispatchRaw`) replaces `dispatchFor`'s
+  anonymous bool return, threaded through both retry loops and logged
+  (`dispatch_mode`). Motivation is forward-looking, not this bug: a future
+  provider-dialect shim tier (same protocol family, but a field-level
+  transform still has to run — see the IR-superset entry below) needs a
+  third mode, and re-deriving "was this passthrough" by pointer comparison
+  at each call site (as `executeStream` previously did) doesn't extend
+  cleanly. `core/selector.ExecutionPlan`/`Selector` were deliberately left
+  untouched — the mode is computed and consumed entirely inside
+  `dispatchFor` and its callers.
+- **Verified per-attempt correctness across heterogeneous-protocol fallback
+  chains** — `RoutingSelector.selectFallback` already calls each target's
+  own inner `Selector.Select()` independently (no protocol caching across
+  the chain), and `dispatchFor` runs fresh every retry attempt against that
+  attempt's own `ExecutionPlan`. A single `model_routes` fallback chain
+  spanning providers on different protocols already dispatches each attempt
+  on its own terms — an existing property of the retry loop, not something
+  newly built.
+
+### Files
+
+`internal/pipeline/context.go` (`RequestRewritten`, `RefreshRawBodyIfRewritten`),
+`internal/compress/plugin.go` (sets the flag), `internal/server/upstream.go`
+(`DispatchMode`, `dispatchFor` signature, both retry loops).
+Tests: `internal/pipeline/context_test.go` (new), `internal/compress/plugin_test.go`
+(new), `internal/server/upstream_test.go` (`dispatchFor` cases +
+`TestDispatchFor_HeterogeneousFallbackChain_PerAttemptModeDiffers`),
+`core/selector/routing_selector_fallback_protocol_test.go` (new — proves
+`RoutingSelector` surfaces each fallback target's own protocol independently).
+
+---
+
+## 2026-07-18 — IR-as-superset direction: evaluated against llm-rosetta and cloud-native precedent, partially scoped, mostly deferred
+
+### Problem
+
+A request to add Mistral support surfaced a real question: `core/ir.IRRequest`
+and the internal canonical `types.MessageRequest` are both Anthropic-shaped
+(only fields Anthropic's own Messages API has), not a union of every
+supported protocol's fields. Two consequences, one already real:
+
+1. **OpenAI-protocol clients lose fields today, independent of Mistral.**
+   `internal/downstream/openai.go`'s `OAIBodyToAnthropicRequest` flattens an
+   OpenAI-shaped request straight into `types.MessageRequest` before the IR
+   layer ever sees it — `seed`/`n`/`logprobs`/`top_logprobs`/
+   `frequency_penalty`/`presence_penalty`/`logit_bias`/`response_format`
+   have no field to land in and are silently dropped at that step, not at
+   IR conversion.
+2. **Genuinely vendor-exclusive fields (Mistral's `safe_prompt`/`guardrails`/
+   `prompt_mode`) have no representation anywhere** — not a bug, a missing
+   extension mechanism. No amount of IR sophistication maps a concept that
+   only exists on one side.
+
+### Findings
+
+Benchmarked against `llm-rosetta` (`~/oss/llm-rosetta`, re-indexed and read
+in full this session) and mainstream cloud-native proxies (Envoy/Istio,
+Caddy, Kubernetes, Terraform, Prometheus):
+
+- **llm-rosetta's IR is a true union** (`GenerationConfig` carries
+  temperature/top_p/top_k/max_tokens/stop/truncation/frequency_penalty/
+  presence_penalty/logit_bias/seed/logprobs/top_logprobs/n; `ReasoningConfig`
+  unifies thinking/reasoning_effort across providers; `provider_extensions:
+  dict` is a first-class, bidirectional, per-request escape bag governed by
+  a strip/preserve `ConversionContext` mode) with **4 fully symmetric
+  bidirectional converters** (any of Anthropic/Google/OpenAI-Chat/
+  OpenAI-Responses can be inbound or outbound) — miroxy's
+  `DownstreamConverter`/`UpstreamConverter` (`internal/irc/irc.go`) are
+  asymmetric by role, despite that package's own doc comment already
+  describing the symmetric target shape.
+- **llm-rosetta's provider-dialect layer (16 built-in shims: deepseek/xai/
+  qwen/moonshot/zhipu/openrouter/argo/...) is composition, not
+  inheritance** — a `ProviderShim{name, base converter, to_transforms,
+  from_transforms}` wrapping one of the 4 base converters. Directly answers
+  "how do Mistral/DeepSeek get private fields without a bespoke converter
+  each": a Go-idiomatic `ProviderShim` struct (base `Converter` +
+  `[]func(map[string]any) map[string]any` transforms) over the shared
+  `OpenAIConverter`, not a type hierarchy.
+- **A raw byte-passthrough fast path is not made optional by a lossless
+  IR.** llm-rosetta never bypasses its IR (relies entirely on
+  `provider_metadata`/preserve mode for A→A fidelity instead) — a
+  legitimate but different tradeoff for a Python gateway. miroxy has a
+  stated differentiator in KeyPool/429-retry/circuit-break and a hard
+  constraint that streaming and non-streaming are separate paths; real,
+  current use cases (an AWS-Bedrock-shaped client, or any client where
+  downstream and upstream already speak the same protocol, wanting only
+  compression/redaction/routing and explicitly not translation) need a
+  genuine zero-transformation relay: no conversion CPU tax, no risk of the
+  IR layer's deliberate normalizations (e.g. tool-orphan-pairing fixups)
+  mutating already-valid traffic, no conversion-bug surface at all.
+  Passthrough's justification shifts from "prevents data loss" (a lossless
+  IR would obsolete that) to "zero-cost identity relay + non-interference
+  guarantee for a workload that wants pooling/policy, not translation" —
+  still necessary, not a debt to retire.
+- **Pipeline (filter-chain), not a state machine, is the right shape for
+  request processing.** Envoy/Istio's HTTP filter chain, Caddy's middleware
+  chain, and Kubernetes' admission-webhook chain are all linear
+  filter/pipeline patterns for "one request through several stages." State
+  machines/reconciliation loops in all of these (k8s controllers, Envoy xDS
+  config lifecycle, Prometheus alert firing/pending/resolved) exist
+  specifically for long-lived entities that evolve across many independent,
+  time-separated observations — not single-request processing. miroxy
+  already puts a real state machine where that criterion holds (`CredPool`'s
+  health/circuit-break/cooldown tracking) and a pipeline where it doesn't
+  (the per-request plugin chain) — the existing split is correct; extending
+  it to the request path would import complexity with no precedent-backed
+  benefit. Terraform's DAG-based dependency scheduling is the more relevant
+  reference for "plugins don't need strict total ordering" (`WardenPlugin`
+  before `CompressPlugin` is a real dependency today, not arbitrary —
+  compressing before redaction risks paraphrasing PII past Warden's
+  detection patterns) — worth a declared-dependency-graph upgrade over the
+  flat `Priority() int` ordering if the plugin count grows enough to make
+  that graph genuinely tangled; not warranted at 3 plugins.
+
+### Decision
+
+- **Implemented now** (see the entry above): `DispatchMode`,
+  `RequestRewritten`/`RefreshRawBodyIfRewritten` — a passthrough correctness
+  fix, independent of everything else here.
+- **Scoped and deferred, in two tiers, not done in this pass:**
+  1. Promote `IRGenerationConfig`/`types.MessageRequest` to carry the
+     OpenAI-standard sampling superset + a unified reasoning/thinking
+     config — closes the *real, current* OpenAI-inbound field-loss gap.
+     Smaller, self-contained, no interface redesign.
+  2. Symmetric `Converter` interface (merge `DownstreamConverter`/
+     `UpstreamConverter`, operate on wire `[]byte` not
+     `types.MessageRequest`), bidirectional `provider_extensions`, and a
+     `ProviderShim` composition layer. Touches every core translation
+     interface (`internal/irc/irc.go`, `core/ir/ir.proto`) and ~1,000 lines
+     of existing tests — deliberately not started until there's a second
+     inbound protocol with real production traffic to prove the symmetric
+     design against (today's OpenAI-inbound path doesn't count — it's a
+     bilateral shortcut, not a real spoke).
+- **Not adopted:** a request-level state machine; llm-rosetta's
+  "always through IR, never bypass" policy.
+
+### Files
+
+None yet for tiers 1–2 above — discussion and evaluation only, captured
+here so the reasoning isn't re-derived from scratch next time Mistral (or
+any new provider) comes up.
+
+---
+
+## 2026-07-19 — Native vendor passthrough: provider_ref moves to the credpool
+
+### Context
+
+miroxy already had a provider-passthrough fallback (`LookupModel` step 4):
+if a client asks for a model with no matching `model_routes` entry, and its
+name is globally unique to one vendor (`claude-*`, `gpt-*`/`o1*`/`o3*`/`o4*`,
+`gemini-*` — see `inferModelProvider`), miroxy would look for a credpool
+tagged with that vendor's family and forward the request as-is. That
+family tag (`upstream_model_type`) was either set explicitly on the
+credpool, or — when absent — *derived* from however a `model_routes` entry
+happened to reference the pool (`resolveCredpoolFamilies`,
+`validateCredpoolFamilyConsistency`).
+
+This derivation was the actual problem. `provider_ref` (and the `protocol`/
+`api_base`/`auth_style` resolved from it) lived on `model_routes` entries
+and `routing.targets[]`, not on the credpool — even though a credpool's
+keys always belong to exactly one upstream provider. Two model_routes
+entries sharing one `credpool_ref` could in principle declare *conflicting*
+`provider_ref` values, which was only caught by a dedicated consistency
+check, not prevented by the schema itself. And a credpool used only for
+passthrough (no static `model_routes` entry at all) had no way to declare
+its provider except the explicit `upstream_model_type` tag — a second,
+narrower enum (anthropic/openai/gemini only) sitting alongside the broader
+`protocol` enum (which also includes deepseek/glm/grok), with no
+relationship enforced between the two.
+
+### Decision 1: `provider_ref` (and its resolved `protocol`/`api_base`/
+`auth_style`) moves from `model_routes`/`routing.targets[]` onto the
+credpool
+
+`CredPoolCfg` gains `provider_ref` (key into the top-level `providers:`
+block, required unless `protocol`+`api_base` are set directly for a
+self-contained pool) plus resolved `protocol`/`api_base` fields (`auth_style`
+already existed). `ModelEntry`/`RoutingTarget` keep their `ProviderRef`/
+`Protocol`/`APIBase`/`AuthStyle` *fields* — every existing consumer
+(`router/builtin.go`, `admin.go`, `openai_discover.go`/`anthropic_discover.go`,
+`server.go`'s selector-building) keeps reading them unchanged — but the
+fields are now `yaml:"-"` (resolved, not user-facing) and get their values
+from the entry's credpool (`credpool_ref`, or the inline `credpool:` block),
+never independently declared. `resolveProviders` now resolves every
+credpool's binding first, then propagates it onto whatever model_routes
+entry/target references that pool.
+
+This makes the "conflicting provider_ref for one credpool_ref" failure mode
+structurally impossible rather than something a validation pass has to
+catch — a credpool has exactly one `provider_ref`, full stop.
+`resolveCredpoolFamilies`/`validateCredpoolFamilyConsistency`/
+`Config.CredpoolFamilies`/`upstream_model_type` are gone.
+
+### Decision 2: explicit `native_passthrough: true` per credpool, not an
+inferred signal
+
+Considered and rejected: inferring "this pool is eligible for native
+passthrough" from whether its `providers.<name>` block was left empty
+(`{}`) plus its `provider_ref` being literally `anthropic`/`openai`/`gemini`.
+Rejected because "operator didn't override `base_url`" is not the same fact
+as "this is genuinely that vendor's own API" — a legitimate
+enterprise/regional endpoint for the real vendor (e.g. Anthropic via a
+private gateway) would need a custom `base_url` and get wrongly excluded.
+It also collapses to one eligibility value per `provider_ref`, losing the
+ability to have two credpools both tagged `provider_ref: anthropic` where
+only one should participate in native fallback. And it doesn't remove any
+hardcoding — `inferModelProvider`'s three-vendor enum is unavoidable either
+way (only Anthropic/OpenAI/Gemini have model-naming conventions unique
+enough to infer vendor identity from the bare name); it would just add a
+*second*, differently-shaped check of the same three names.
+
+Kept the explicit boolean instead: `CredPoolCfg.NativePassthrough`. Its
+validity is checked against `nativeVendorProtocols` — a var defined next to
+`inferModelProvider` specifically so there is exactly one place in the
+codebase declaring "these three protocols are the native set," not two.
+
+### Decision 3: root `native_passthrough_enable` switch, and round-robin
+across multiple native pools
+
+Added `Config.NativePassthroughEnable` (default `false`) as a second gate
+above the per-pool flag — a client's default model picker resolving to a
+native name (e.g. Claude Code choosing `claude-opus-4-8`) must not reach a
+real vendor credpool by accident; both switches have to be on.
+`buildRoutingState` now groups every `native_passthrough: true` pool by its
+resolved protocol and wraps each group in a `selector.RoutingSelector`
+(`round_robin`) — multiple real-vendor pools for the same protocol share
+load instead of only the first one ever being used.
+
+### Side effects folded in
+
+- `openai_discover.go`/`anthropic_discover.go` (model auto-discovery via the
+  vendor's real `/v1/models`) now key off `NativePassthrough &&
+  Protocol == "X"` instead of `UpstreamModelType == "X"` — this is a
+  correctness fix, not just a rename: discovery hits a *hardcoded* real
+  vendor URL with the pool's key, so the pool must genuinely be that
+  vendor's own API, which is exactly what `NativePassthrough` now asserts
+  (the old tag could be set on a same-protocol pool pointed at a different
+  `api_base` and discovery would still fire against the wrong endpoint with
+  that pool's key).
+- `internal/upstream/passthrough.go`: `rewriteModelField` was rewriting the
+  outgoing `model` field (and round-tripping the whole body through
+  JSON, reordering keys) even when the client's model already equaled
+  `upstream_model` — a no-op that broke passthrough's own byte-for-byte
+  guarantee for no reason. Added `hasModelField` to skip the rewrite when
+  nothing would change.
+
+### Migration
+
+Breaking config change, no compatibility shim (per the project's no-shims
+rule): any `provider_ref`/`protocol`/`api_base`/`auth_style` set directly
+on a `model_routes` entry or `routing.targets[]` is now silently ignored
+(the field is `yaml:"-"`). Existing configs must move those fields onto the
+credpool the entry/target references — `config/config.yaml.example` and
+`tests/unit/config_test.go` were migrated as the reference pattern.
+
+### Files
+
+`internal/config/config.go`, `internal/config/yaml.go`,
+`internal/server/server.go` (`buildRoutingState`, `namedPoolProvider`,
+`namedPoolAuthStyle`), `internal/server/openai_discover.go`,
+`internal/server/anthropic_discover.go`, `internal/server/admin.go`,
+`internal/upstream/passthrough.go`, `config/config.yaml.example`,
+`internal/api/admin-openapi.yaml`, `tests/unit/config_test.go`,
+`internal/server/server_test.go`, `internal/server/server_helpers_test.go`.
+
+---
+
+## 2026-07-19 — Client-facing usage structs must be a superset of the real vendor schema
+
+### Context
+
+A real client (`pi`, an OpenAI-compatible CLI agent) failed with a hard JSON
+deserialize error — `missing field total_tokens` — on a perfectly successful
+`/v1/chat/completions` response. miroxy's `oaiUsage` struct
+(`internal/irc/openai_irc.go`) only had `prompt_tokens`/`completion_tokens`;
+`total_tokens` is a field every real OpenAI-compatible response includes,
+and at least one real client's deserializer treats it as required, not
+optional.
+
+### Decision: audit every client-facing wire struct against the real vendor's schema; err toward more fields, not fewer
+
+There are exactly two places miroxy builds a client-facing response body
+from IR, regardless of which upstream served the request — provider
+converters (Groq/DeepSeek/GLM/Mistral/...) only ever produce IR, never wire
+JSON to the client:
+
+- `AnthropicToOAIResponseBody` / `StreamAnthropicSSEToOAI`
+  (`internal/irc/openai_irc.go`) — client speaks OpenAI protocol.
+- `AnthropicConverter.ResponseFromIR` / `StreamFromIR`
+  (`internal/irc/anthropic_irc.go`) — client speaks Anthropic protocol
+  (the canonical one).
+
+Audited both against their real vendor's documented schema:
+- `oaiUsage`: added `total_tokens` (the actual bug).
+- `types.Usage` (backs the Anthropic `MessageResponse.Usage` and
+  `StartMessage.Usage`): added `cache_creation_input_tokens` and
+  `cache_read_input_tokens` — always present in the real Anthropic Messages
+  API `usage` object, default `0` when caching isn't used (accurate, since
+  miroxy doesn't implement prompt caching yet).
+- `types.DeltaUsage` (the Anthropic streaming `message_delta.usage`): added
+  the same two fields, `omitempty` to match the existing `input_tokens`
+  field's precedent on that struct.
+
+**Rule:** a struct that gets marshaled straight to the client must match
+the real vendor's schema in full, even for fields miroxy always sends as
+zero. Never trim a wire struct down to "only the fields we currently
+populate meaningfully" — a strict third-party deserializer doesn't know or
+care that we don't use prompt caching; it just sees a missing key.
+Anthropic's real API has no `total_tokens` equivalent at all, so it wasn't
+added there — the goal is matching the real vendor, not maximizing field
+count for its own sake.
+
+### Files
+
+`internal/irc/openai_irc.go` (`oaiUsage`), `internal/types/anthropic.go`
+(`Usage`), `internal/types/sse.go` (`DeltaUsage`),
+`internal/irc/openai_irc_test.go` (regression tests for both usage-emitting
+paths).
+
+---
+
+## 2026-07-19 — DownstreamAdapter needed a request-encode direction, not just decode
+
+### Context
+
+A `pi` client sent an OpenAI-protocol request that triggered the Compress
+plugin (crushed oversized `tool_result` content), then dispatched
+`DispatchRaw` to a Mistral credpool (its resolved protocol is `openai`,
+matching the client's, so raw passthrough is normally correct and cheaper
+than a full IR round-trip). The upstream rejected it with 422: the forwarded
+body had `content: [{"type":"tool_use",...}]` / `{"type":"tool_result",...}`
+— Anthropic-shaped blocks, invalid in any OpenAI-compatible `content` field.
+
+Root cause: `pipeline.LLMContext.Request` is always Anthropic-shaped
+internally (Anthropic is the canonical downstream protocol — see the
+2026-06-30 entry). `RefreshRawBodyIfRewritten` (added 2026-07-18 to fix a
+different bug: rewritten requests shipping the client's stale original
+bytes) re-marshaled `c.Request` with a bare `json.Marshal` whenever a plugin
+set `RequestRewritten`. That's only correct for an Anthropic client — for
+every other protocol it silently re-serializes the canonical struct in the
+wrong wire shape and raw-forwards it, corrupting the request. Not a
+Mistral-compatibility gap; this would misfire for *any* OpenAI-protocol
+client whose request got rewritten by any plugin before a raw-dispatch
+attempt.
+
+### Decision: `DownstreamAdapter` gets `EncodeRequest`, the reverse of `Decode`
+
+The interface could decode wire bytes → canonical request, but had no way
+back. Added:
+
+- `DownstreamAdapter.EncodeRequest(req *types.MessageRequest) ([]byte, error)`
+  — one new interface method.
+- `AnthropicAdapter.EncodeRequest`: identity `json.Marshal` (Anthropic wire
+  *is* the canonical shape).
+- `OpenAIAdapter.EncodeRequest`: `irc.AnthropicRequestToOAIBody` (new) —
+  chains the already-existing `AnthropicConverter.RequestToIR` +
+  `OpenAIConverter.RequestToProvider`, reusing the exact code path real
+  OpenAI-upstream dispatch already uses, instead of writing a parallel
+  conversion.
+- `ResponsesAdapter.EncodeRequest`: returns an error. `Protocol()` returns
+  `"openai-responses"`, which no upstream credpool can ever resolve to, so
+  `DispatchRaw` structurally can never select this adapter — implementing a
+  correct reverse mapping here would be real effort spent on unreachable
+  code. Errors loudly instead of guessing, in case that assumption ever
+  changes.
+- `LLMContext.EncodeRequest func(*types.MessageRequest) ([]byte, error)`,
+  set from `a.EncodeRequest` in `makeHandler` (`server.go`).
+  `RefreshRawBodyIfRewritten` calls it, falling back to bare `json.Marshal`
+  only when unset (keeps hand-built test contexts working).
+
+### Rule
+
+Any interface with a decode/wire→canonical direction that a caller might
+need to re-encode later (passthrough-after-rewrite, retries against a
+different protocol target, etc.) needs the reverse method from day one, or
+every future feature that touches a rewritten request will silently assume
+the canonical shape equals every protocol's wire shape — true only for
+whichever protocol happens to be canonical.
+
+### Files
+
+`core/downstream/adapter.go`, `internal/downstream/anthropic.go`,
+`internal/downstream/openai.go`, `internal/downstream/openai_responses.go`,
+`internal/irc/openai_irc.go` (`AnthropicRequestToOAIBody`),
+`internal/pipeline/context.go`, `internal/server/server.go`,
+`internal/pipeline/context_test.go` (regression test reproducing the exact
+tool_use/tool_result leak).
+
+---
+
+## 2026-07-19 — Streaming: eliminated the forced IR→Anthropic-SSE→client-SSE double hop
+
+### Context
+
+Continuation of the same-day architecture audit (see the two entries above).
+Every upstream adapter (`internal/upstream/gemini.go`, `openai.go`) was
+constructed at startup with a hardcoded `downstream: irc.AnthropicConverter{}`
+field, used inside `StreamFromUpstream` to convert IR stream events into
+Anthropic-shaped `types.SSEEvent` — *before* the eventual client's actual
+protocol was even known. `OpenAIAdapter.WriteStream` and
+`ResponsesAdapter.WriteStream` then re-parsed that Anthropic SSE (matching on
+literal event-name strings) to re-derive their own dialect. Every streamed
+response to a non-Anthropic client paid for two full conversions where one
+would do, and the double hop was invisible unless you traced the exact call
+chain — nothing about it showed up as a bug until this audit.
+
+### Decision: streaming carries neutral IR end-to-end; framing happens once, at the DownstreamAdapter
+
+- `core/upstream.UpstreamAdapter.StreamFromUpstream` and
+  `core/downstream.DownstreamAdapter.WriteStream` now both carry
+  `<-chan ir.StreamEvent`, not `<-chan types.SSEEvent`.
+- Removed the `downstream irc.AnthropicConverter{}` field's use from every
+  upstream adapter's `StreamFromUpstream` — they now return
+  `t.upstream.StreamToIR(ctx, resp.Body)`'s channel directly (still wrapped
+  to preserve the original `resp.Body.Close()`-on-drain contract). The field
+  itself stays on the struct for now — `ToUpstream`/`FromUpstream` (the
+  non-streaming legs) still use it; that's Step 3's turn.
+- Added `AnthropicConverter`'s missing reverse direction for streaming:
+  `anthropicSSEToIR` (`internal/upstream/passthrough.go`) parses genuine
+  Anthropic-wire SSE (from `AnthropicUpstream`/`PassthroughAdapter`'s
+  defensive fallback) into neutral IR — the same asymmetry pattern as the
+  `EncodeRequest` fix earlier today, just on the streaming ingestion side.
+- `internal/irc/openai_irc.go`: replaced `StreamAnthropicSSEToOAI` (Anthropic
+  SSE → OpenAI SSE) with `StreamIRToOAI` (IR → OpenAI SSE directly, no
+  intermediate).
+- `internal/downstream/openai_responses.go`: rewrote `translateEvent` to
+  switch on `ir.StreamEvent.Kind` directly instead of matching Anthropic SSE
+  event-name strings.
+- `internal/downstream/anthropic.go`: `WriteStream` now explicitly calls
+  `irc.AnthropicConverter{}.StreamFromIR` itself — the one client protocol
+  that happens to equal the IR-adjacent wire shape now does real conversion
+  work too, at the same layer every other protocol does, instead of getting
+  it for free upstream.
+- `internal/server/upstream.go`'s `trackUsageStream` and
+  `internal/warden/plugin.go`'s `ResolveEvents` (vault-token restoration
+  mid-stream) both moved from matching `ev.Event` strings/type-asserting
+  `ev.Data` to switching on `ev.Kind` — both are now written against a
+  discriminated union instead of an `any`-typed field, which is also just
+  more correct Go.
+- Deleted `internal/server/downstream.go`'s `handleMessages` and
+  `internal/server/downstream_openai.go` in full (the latter had no other
+  live symbols) — both were already-dead handlers superseded by
+  `registerRoutes`/`makeHandler`, confirmed via `grep` before deletion, and
+  their broken signatures were noise once the interface changed.
+
+### Files
+
+`core/upstream/adapter.go`, `core/downstream/adapter.go`,
+`internal/upstream/{anthropic,gemini,openai,passthrough}.go`,
+`internal/downstream/{anthropic,openai,openai_responses}.go`,
+`internal/irc/openai_irc.go`, `internal/pipeline/context.go`,
+`internal/server/upstream.go`, `internal/warden/stream.go`,
+`internal/irc/openai_irc_test.go`, `internal/server/upstream_test.go`.
+Deleted: `internal/server/downstream_openai.go`.
+
+---
+
+## 2026-07-19 — LLMContext, plugins, and every adapter migrated to neutral IR
+
+### Context
+
+Final piece of the same-day architecture audit (see the three entries
+above). `pipeline.LLMContext.Request`/`.Response` were `*types.MessageRequest`/
+`*types.MessageResponse` — the Anthropic wire struct — so `Compress`,
+`Warden`, `CommandPlugin`, `UpstreamExecutor`'s generic retry-loop code, and
+`core/selector/affinity.go`'s session-fingerprinting all read/constructed
+Anthropic content blocks directly, regardless of which protocol the client
+actually spoke. Every upstream adapter converted wire→IR→Anthopic-wire→IR
+internally (via a hardcoded `AnthropicConverter` field) even though
+`core/ir` already existed and was designed for exactly this.
+
+### Decision: `LLMContext.Request`/`.Response` are `*ir.IRRequest`/`*ir.IRResponse`; no adapter gets a free ride
+
+- **`internal/pipeline/context.go`**: `Request`/`Response` retyped to IR.
+  Added `ClientModel string` (IR carries no model field by design — see
+  `core/ir/ir.go`) and `SetRawResponse`/`RawResponse`, the non-streaming
+  twin of the existing `SetRawStream`/`RawStream` passthrough side-channel —
+  a raw-passthrough attempt never touches `Response` at all now, matching
+  the user's own stated exception ("except passthrough").
+  `NewContext` gained a `model string` parameter.
+- **Closed the real IR gaps first** (prerequisite, see the Step-1 entry
+  above this session): cache-token usage fields, an `IRImagePart` variant,
+  `IRToolResultPart.IsError` wiring, `IRRequest.UserID`.
+- **`AnthropicConverter` gained its missing reverse conversions**:
+  `RequestFromIR` (IR→Anthropic wire, mirrors the existing `RequestToIR`)
+  and `ResponseToIR` (Anthropic wire→IR, mirrors `ResponseFromIR`) — the
+  same asymmetry pattern as the `EncodeRequest` fix earlier today, just
+  completing it for the request/response legs instead of only streaming.
+- **All three `DownstreamAdapter`s now decode straight to IR and encode
+  straight from IR** — `Decode` returns `(*ir.IRRequest, model string,
+  error)`; `EncodeRequest`/`WriteResponse`/`WriteResponseAsStream`/
+  `WriteStream` all take IR types (`msgID`/`model` as explicit params,
+  since IR carries neither). Anthropic's adapter now does real conversion
+  work too, at the same layer every other protocol always did.
+  - OpenAI (`internal/downstream/openai.go`): `EncodeRequest`/`WriteResponse`
+    now call `irc.NewOpenAIConverter(model).RequestToProvider`/
+    `irc.IRResponseToOAIBody` directly — replacing `AnthropicRequestToOAIBody`/
+    `AnthropicToOAIResponseBody` (deleted, now genuinely dead), which the
+    code's own prior comment already flagged: *"When the pipeline becomes
+    IR-native, this layer can be simplified."*
+  - `Decode` for OpenAI and Responses still chains through
+    `OAIBodyToAnthropicRequest`/hand-rolled Anthropic-types construction as
+    an internal implementation detail of that one parsing step — reusing
+    already-tested logic rather than rewriting a wire→IR parser from
+    scratch. This is a one-time hop inside a single function, not a
+    pipeline-wide privilege; nothing downstream of `Decode` ever sees it.
+- **Every upstream adapter simplified**: `GeminiAdapter`/`OpenAICompatAdapter`
+  no longer carry a `downstream irc.DownstreamConverter` field at all —
+  `ToUpstream`/`FromUpstream` call `RequestToProvider`/`ResponseToIR`
+  directly, since `req`/the parsed response are already IR. `AnthropicUpstream`
+  (genuinely Anthropic-wire) uses the new `RequestFromIR`/`ResponseToIR`.
+  `PassthroughAdapter.FromUpstream` and `ToUpstream`'s no-raw-body branch
+  now error instead of attempting a meaningless `json.Marshal` of an IR
+  struct as if it were wire bytes — matching `StreamFromUpstream`'s
+  established "unreachable, fail loud" pattern.
+- **`core/selector.Selector.Select`** gained a `model string` parameter
+  (session-affinity fingerprinting needs it now that requests don't carry
+  their own model name); `affinity.go`'s `SessionKeyFromRequest` and
+  `writeFingerprintContent` rewritten against `ir.IRMessage`/`IRContentPart`.
+- **`internal/server/upstream.go`**: non-streaming retry loop gained the
+  same `DispatchRaw` early-return the streaming loop already had —
+  `c.SetRawResponse(...)` before ever calling `dispatch.FromUpstream`,
+  instead of overloading `*types.MessageResponse`'s `RawBody` field.
+- Deleted `internal/server/downstream.go`'s `handleMessages` and
+  `internal/server/downstream_openai.go` in full — both were already-dead
+  handlers superseded by `registerRoutes`/`makeHandler` (confirmed via
+  `grep` before deletion), and their broken signatures were pure noise
+  once every interface changed.
+
+### Verification
+
+Added a genuine end-to-end regression test,
+`TestCrossProtocol_CompressedRequestRawDispatch_NoPrivilegeLeak`
+(`tests/integration/cross_protocol_no_leak_test.go`): a real HTTP round
+trip through miroxy with Compress forced on, for both protocols that can
+reach raw dispatch (Anthropic, OpenAI — Responses structurally never can,
+since no upstream ever resolves to protocol `"openai-responses"`), asserting
+each upstream receives its own protocol's native tool-call shape and never
+the other's. `go build ./...`, `go vet ./...`, and the full `go test ./...`
+are clean.
+
+### Rule
+
+A struct that gets marshaled straight to the client, or that a pipeline
+treats as its working representation, must not be one specific protocol's
+wire struct reused as "the" canonical shape — even when that protocol was
+the first one supported and its wire format happens to look almost like
+what a neutral IR would need. The moment a second protocol is added,
+whichever one was "canonical" gets a silent, permanent implicit advantage:
+free conversion, first-class field access, zero translation tax — and
+every other protocol inherits a correctness bug waiting to be found. Route
+through the actual neutral representation (`core/ir` here) from the start,
+even if it means every protocol — including the original one — has to do
+real conversion work at the boundary.
+
+### Files
+
+`core/ir/{ir,stream}.go`, `core/downstream/adapter.go`,
+`core/upstream/adapter.go`, `core/selector/{selector,affinity,credpool,
+routing_selector,target_selector}.go`, `internal/pipeline/context.go`,
+`internal/pipeline/command_plugin.go`, `internal/compress/plugin.go`,
+`internal/warden/plugin.go`, `internal/irc/{anthropic_irc,openai_irc}.go`,
+`internal/downstream/{anthropic,openai,openai_responses}.go`,
+`internal/upstream/{anthropic,gemini,openai,passthrough}.go`,
+`internal/server/{server,upstream,prober}.go`,
+`tests/integration/cross_protocol_no_leak_test.go`, plus the ~18 test
+files listed in the prior session investigation. Deleted:
+`internal/server/downstream_openai.go`.
+
+---
+
+## 2026-07-19 — Naming convention: `<domain>_sidecar.go` for optional external-service clients
+
+`internal/cred/credstone_client.go` → `internal/cred/cred_sidecar.go`
+(type/constructor names unchanged: `CredstoneClient`/`NewCredstoneClient`
+still correctly name the specific product this file talks to).
+
+**Rule:** any file that is the client-side boundary to an optional external
+sidecar dependency (per `SidecarConfig`'s own doc comment: "every optional
+external-service integration") is named `<domain>_sidecar.go`, not
+`<product>_client.go`. The domain (`cred`, and future `warden`/`compress`/
+whatever gains one) is what matters for navigation — which file owns the
+boundary — not the specific backing product, and not whether it happens to
+speak HTTP, gRPC, or an in-process WASM call. The product name stays on the
+types/functions inside, where specificity is genuinely useful.
+
+---
+
+## 2026-07-23 — AWS Bedrock: native SigV4 + EventStream, no AWS SDK; reverses the SDKDispatcher plan
+
+### Context
+
+The 2026-07-03 (`Typed Credential + Dispatcher Abstraction`) and 2026-07-11
+(`keypools → credpools rename + SigV4 schema support`) entries both assumed
+Bedrock support would arrive via a future `SDKDispatcher` — a second
+`dispatch.Dispatcher` implementation wrapping the official AWS SDK, which
+would handle SigV4 signing internally. `SigV4Credential.Apply` was left as a
+stub error pending that work. This session evaluated that assumption
+directly against the alternative — hand-rolling SigV4 signing and AWS
+EventStream decoding as plain Go, no AWS SDK — by reading `goai`'s
+(`~/oss/goai`, a multi-provider Go LLM library) actual Bedrock implementation
+(`provider/bedrock/{bedrock,eventstream,anthropic}.go`). It turned out to be
+~200 lines of stdlib `crypto/hmac`/`crypto/sha256` plus a small binary frame
+parser — no AWS SDK dependency anywhere in that codebase, for any provider.
+
+### Decision: no `SDKDispatcher`; `SigV4Credential.Apply` signs directly
+
+`SigV4Credential.Apply` (`core/cred/credential.go`) now implements SigV4
+signing directly: reads the request body via `req.GetBody()` (already
+populated for every caller in this codebase, which all build requests from
+`bytes.NewReader`), computes the payload hash, canonical request, and 4-level
+HMAC-derived signing key, and sets `Authorization` — no dispatch-layer
+involvement. `core/dispatch.Dispatcher` needed no new implementation:
+`HTTPDispatcher` covers Bedrock like every other upstream, since auth is
+fully resolved before the request reaches the Dispatcher. This retires the
+`SDKDispatcher` plan from both 2026-07-03 and 2026-07-11 — those entries are
+left as historical record, not rewritten.
+
+### Decision: dedicated `protocol: bedrock`, not `anthropic` or `mode: passthrough`
+
+The 2026-07-03 entry's Pattern 2 sketch showed two options for "Claude
+natively speaks Anthropic" on Bedrock: reuse `protocol: anthropic`, or
+`mode: passthrough`. Neither actually works: Bedrock's InvokeModel body is
+*not* byte-identical to real Anthropic's — it rejects a `"model"` field (the
+model is in the URL path instead) and requires
+`"anthropic_version": "bedrock-2023-05-31"` in the body where real Anthropic
+uses an HTTP header. `PassthroughAdapter` forwards the client's raw bytes
+with only a model-field rewrite (`internal/upstream/passthrough.go`) —
+insufficient. `AnthropicUpstream` sends `AnthropicConverter.RequestFromIR`'s
+output unmodified — also insufficient.
+
+`internal/upstream/bedrock.go` (`BedrockAdapter`, registered as `"bedrock"`
+in `registry.go`) is a dedicated `UpstreamAdapter` that reuses
+`wireformat.AnthropicConverter` for request/response conversion and the
+existing `parseAnthropicSSE`/`anthropicSSEToIR` helpers for streaming
+(`passthrough.go`) — adding only the URL shape
+(`/model/{id}/invoke[-with-response-stream]`), the small body transform
+(delete `model`, set `anthropic_version`), and, for streaming, a translator
+(`bedrock_eventstream.go`) that decodes AWS's binary EventStream frames and
+re-emits them as plain SSE so the existing Anthropic SSE parser needs no
+Bedrock-specific changes.
+
+### What this unblocks (deferred, not implemented)
+
+- Bedrock Converse API (`protocol: bedrock-converse` in the original
+  Pattern-2 sketch) — the cross-vendor unified format for non-Anthropic
+  Bedrock models (Titan, Llama, etc.). Would need its own wire converter;
+  today's `BedrockAdapter` only speaks Anthropic-on-Bedrock.
+- A Bedrock-native *downstream* adapter (a client speaking Bedrock's own
+  `/model/{id}/invoke` shape directly to miroxy) — unrelated to this change,
+  which is upstream-only.
+
+### Files
+
+`core/cred/credential.go`, `internal/upstream/{bedrock,bedrock_eventstream,
+registry}.go`, `core/dispatch/dispatcher.go`, `internal/server/{server,
+upstream}.go`, `config/config.yaml.example`.

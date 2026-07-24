@@ -1,5 +1,5 @@
 // CompressPlugin integrates BuiltinCompressor into the miroxy pipeline.
-// It runs before the upstream executor and converts types.Message ↔ compress.Message
+// It runs before the upstream executor and converts ir.IRMessage ↔ compress.Message
 // at the boundary.
 package compress
 
@@ -8,8 +8,8 @@ import (
 	"log/slog"
 
 	ccomp "miroxy/core/compress"
+	"miroxy/core/ir"
 	"miroxy/internal/pipeline"
-	"miroxy/internal/types"
 )
 
 const priorityCompress = pipeline.PriorityWarden + 50 // 350 — after warden, before rectifier
@@ -44,7 +44,8 @@ func (p *CompressPlugin) Execute(c *pipeline.LLMContext, next pipeline.Handler) 
 	}
 
 	result, err := p.comp.Compress(c.RequestCtx, &ccomp.Request{
-		System:   c.Request.SystemText(),
+		Model:    c.ClientModel,
+		System:   c.Request.System,
 		Messages: msgs,
 	})
 	if err != nil {
@@ -53,6 +54,7 @@ func (p *CompressPlugin) Execute(c *pipeline.LLMContext, next pipeline.Handler) 
 	}
 
 	c.Request.Messages = fromCompressMessages(result.Messages)
+	c.RequestRewritten = true
 	slog.Debug("compress: done",
 		"original_tokens", result.OriginalTokens,
 		"compressed_tokens", result.CompressedTokens,
@@ -63,137 +65,119 @@ func (p *CompressPlugin) Execute(c *pipeline.LLMContext, next pipeline.Handler) 
 
 // ── type conversion helpers ───────────────────────────────────────────────────
 
-// toCompressMessages converts []types.Message → []ccomp.Message.
-func toCompressMessages(in []types.Message) []ccomp.Message {
+// toCompressMessages converts []ir.IRMessage → []ccomp.Message.
+func toCompressMessages(in []ir.IRMessage) []ccomp.Message {
 	out := make([]ccomp.Message, len(in))
 	for i, m := range in {
-		out[i] = ccomp.Message{
-			Role:  m.Role,
-			Parts: toCompressParts(m),
-		}
+		out[i] = ccomp.Message{Role: m.Role, Parts: toCompressParts(m.Parts)}
 	}
 	return out
 }
 
-// toCompressParts unpacks a types.Message's content into ContentParts.
-func toCompressParts(m types.Message) []ccomp.ContentPart {
-	// Try structured content (array of ContentBlocks).
-	if blocks, ok := m.BlockContent(); ok {
-		parts := make([]ccomp.ContentPart, len(blocks))
-		for i, b := range blocks {
-			parts[i] = blockToPart(b)
-		}
-		return parts
+func toCompressParts(parts []ir.IRContentPart) []ccomp.ContentPart {
+	out := make([]ccomp.ContentPart, len(parts))
+	for i, p := range parts {
+		out[i] = partToCompress(p)
 	}
-	// Plain string content.
-	if text, ok := m.TextContent(); ok {
-		return []ccomp.ContentPart{{Type: "text", Text: text}}
-	}
-	// Unknown — preserve verbatim.
-	return []ccomp.ContentPart{{Type: "raw", Raw: m.Content}}
+	return out
 }
 
-func blockToPart(b types.ContentBlock) ccomp.ContentPart {
-	switch b.Type {
-	case "text":
-		return ccomp.ContentPart{Type: "text", Text: b.Text}
+func partToCompress(p ir.IRContentPart) ccomp.ContentPart {
+	switch {
+	case p.Text != nil:
+		return ccomp.ContentPart{Type: "text", Text: p.Text.Text}
 
-	case "tool_use":
-		raw, _ := json.Marshal(b)
+	case p.ToolUse != nil:
 		return ccomp.ContentPart{
 			Type:     "tool_use",
-			ToolID:   b.ID,
-			ToolName: b.Name,
-			Raw:      raw,
+			ToolID:   p.ToolUse.ID,
+			ToolName: p.ToolUse.Name,
+			Raw:      p.ToolUse.InputJSON,
 		}
 
-	case "tool_result":
-		text := extractToolResultText(b.Content)
+	case p.ToolResult != nil:
 		return ccomp.ContentPart{
 			Type:      "tool_result",
-			ToolUseID: b.ToolUseID,
-			Text:      text,
+			ToolUseID: p.ToolResult.ToolUseID,
+			Text:      extractToolResultText(p.ToolResult.Content),
 		}
 
+	case p.Image != nil:
+		raw, _ := json.Marshal(p.Image)
+		return ccomp.ContentPart{Type: "image", Raw: raw}
+
+	case p.Reasoning != nil:
+		// Kept in Raw, never Text: alignMessages/crushToolResults only ever
+		// touch a part's Text field, so this stays byte-for-byte untouched
+		// through compression — rewriting reasoning text would desync it
+		// from its Signature, which some providers verify cryptographically.
+		raw, _ := json.Marshal(p.Reasoning)
+		return ccomp.ContentPart{Type: "reasoning", Raw: raw}
+
 	default:
-		raw, _ := json.Marshal(b)
-		return ccomp.ContentPart{Type: b.Type, Raw: raw}
+		return ccomp.ContentPart{Type: "unknown"}
 	}
 }
 
-// extractToolResultText unwraps the content field of a tool_result block.
-// It can be a plain string or an array of text blocks.
-func extractToolResultText(content json.RawMessage) string {
-	if len(content) == 0 {
-		return ""
-	}
-	// Try plain string first.
-	var s string
-	if json.Unmarshal(content, &s) == nil {
-		return s
-	}
-	// Try array of content blocks.
-	var blocks []types.ContentBlock
-	if json.Unmarshal(content, &blocks) != nil {
-		return string(content)
-	}
+// extractToolResultText flattens a tool_result's IR content parts down to
+// their concatenated text — matches the compressor's text-only scope;
+// non-text parts (e.g. images) are dropped, same as before this migration.
+func extractToolResultText(parts []ir.IRContentPart) string {
 	var sb []byte
-	for _, b := range blocks {
-		if b.Type == "text" {
-			sb = append(sb, []byte(b.Text)...)
+	for _, p := range parts {
+		if p.Text != nil {
+			sb = append(sb, []byte(p.Text.Text)...)
 		}
 	}
 	return string(sb)
 }
 
-// fromCompressMessages converts []ccomp.Message → []types.Message.
-func fromCompressMessages(in []ccomp.Message) []types.Message {
-	out := make([]types.Message, len(in))
+// fromCompressMessages converts []ccomp.Message → []ir.IRMessage.
+func fromCompressMessages(in []ccomp.Message) []ir.IRMessage {
+	out := make([]ir.IRMessage, len(in))
 	for i, m := range in {
-		out[i] = types.Message{
-			Role:    m.Role,
-			Content: fromCompressParts(m.Parts),
-		}
+		out[i] = ir.IRMessage{Role: m.Role, Parts: fromCompressParts(m.Parts)}
 	}
 	return out
 }
 
-func fromCompressParts(parts []ccomp.ContentPart) json.RawMessage {
-	if len(parts) == 1 {
-		p := parts[0]
-		// Scalar text — serialise as a plain JSON string.
-		if p.Type == "text" && len(p.Raw) == 0 {
-			b, _ := json.Marshal(p.Text)
-			return b
-		}
+func fromCompressParts(parts []ccomp.ContentPart) []ir.IRContentPart {
+	out := make([]ir.IRContentPart, len(parts))
+	for i, p := range parts {
+		out[i] = partFromCompress(p)
 	}
-	// Otherwise build a block array.
-	blocks := make([]json.RawMessage, 0, len(parts))
-	for _, p := range parts {
-		blocks = append(blocks, partToRaw(p))
-	}
-	out, _ := json.Marshal(blocks)
 	return out
 }
 
-func partToRaw(p ccomp.ContentPart) json.RawMessage {
-	if len(p.Raw) > 0 {
-		return p.Raw
-	}
+func partFromCompress(p ccomp.ContentPart) ir.IRContentPart {
 	switch p.Type {
 	case "text":
-		b, _ := json.Marshal(types.ContentBlock{Type: "text", Text: p.Text})
-		return b
+		return ir.IRContentPart{Text: &ir.IRTextPart{Text: p.Text}}
+
+	case "tool_use":
+		inputJSON := p.Raw
+		if len(inputJSON) == 0 {
+			inputJSON = []byte("{}")
+		}
+		return ir.IRContentPart{ToolUse: &ir.IRToolUsePart{ID: p.ToolID, Name: p.ToolName, InputJSON: inputJSON}}
+
 	case "tool_result":
-		textJSON, _ := json.Marshal(p.Text)
-		b, _ := json.Marshal(types.ContentBlock{
-			Type:      "tool_result",
+		return ir.IRContentPart{ToolResult: &ir.IRToolResultPart{
 			ToolUseID: p.ToolUseID,
-			Content:   textJSON,
-		})
-		return b
+			Content:   []ir.IRContentPart{{Text: &ir.IRTextPart{Text: p.Text}}},
+		}}
+
+	case "image":
+		var img ir.IRImagePart
+		_ = json.Unmarshal(p.Raw, &img)
+		return ir.IRContentPart{Image: &img}
+
+	case "reasoning":
+		var r ir.IRReasoningPart
+		_ = json.Unmarshal(p.Raw, &r)
+		return ir.IRContentPart{Reasoning: &r}
+
 	default:
-		b, _ := json.Marshal(map[string]any{"type": p.Type, "text": p.Text})
-		return b
+		return ir.IRContentPart{Text: &ir.IRTextPart{Text: p.Text}}
 	}
 }

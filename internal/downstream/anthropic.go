@@ -9,7 +9,10 @@ import (
 	"net/http"
 
 	coredown "miroxy/core/downstream"
+	"miroxy/core/ir"
+	"miroxy/internal/idgen"
 	"miroxy/internal/types"
+	"miroxy/internal/wireformat"
 )
 
 // Ensure compile-time interface satisfaction.
@@ -22,19 +25,29 @@ type AnthropicAdapter struct{}
 func (a *AnthropicAdapter) Protocol() string { return "anthropic" }
 func (a *AnthropicAdapter) Path() string     { return "/v1/messages" }
 
-// Decode parses the Anthropic Messages request body and normalises it.
-// NormalizeSystem extracts any role="system" message into the top-level
-// system field — some client skills inject it that way (OpenAI convention).
-func (a *AnthropicAdapter) Decode(r *http.Request) (*types.MessageRequest, error) {
+// Decode parses the Anthropic Messages request body, normalises it, and
+// converts it to the canonical IR. NormalizeSystem extracts any
+// role="system" message into the top-level system field — some client
+// skills inject it that way (OpenAI convention).
+func (a *AnthropicAdapter) Decode(r *http.Request) (*ir.IRRequest, string, error) {
 	var req types.MessageRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		return nil, fmt.Errorf("invalid request body: %w", err)
+		return nil, "", fmt.Errorf("invalid request body: %w", err)
 	}
 	req.NormalizeSystem()
 	if err := req.Validate(); err != nil {
-		return nil, err
+		return nil, "", err
 	}
-	return &req, nil
+	irReq, err := (wireformat.AnthropicConverter{}).RequestToIR(&req)
+	if err != nil {
+		return nil, "", fmt.Errorf("request to IR: %w", err)
+	}
+	return irReq, req.Model, nil
+}
+
+// EncodeRequest is the reverse of Decode.
+func (a *AnthropicAdapter) EncodeRequest(req *ir.IRRequest, model string) ([]byte, error) {
+	return json.Marshal((wireformat.AnthropicConverter{}).RequestFromIR(req, model))
 }
 
 func (a *AnthropicAdapter) WriteError(w http.ResponseWriter, status int, errType, msg string) {
@@ -44,15 +57,17 @@ func (a *AnthropicAdapter) WriteError(w http.ResponseWriter, status int, errType
 	})
 }
 
-func (a *AnthropicAdapter) WriteResponse(w http.ResponseWriter, resp *types.MessageResponse) {
-	writeJSON(w, http.StatusOK, resp)
+func (a *AnthropicAdapter) WriteResponse(w http.ResponseWriter, resp *ir.IRResponse, msgID, model string) {
+	writeJSON(w, http.StatusOK, (wireformat.AnthropicConverter{}).ResponseFromIR(resp, msgID, model))
 }
 
 // WriteResponseAsStream emits the response as Anthropic SSE events.
-func (a *AnthropicAdapter) WriteResponseAsStream(ctx context.Context, w http.ResponseWriter, resp *types.MessageResponse) {
+func (a *AnthropicAdapter) WriteResponseAsStream(ctx context.Context, w http.ResponseWriter, resp *ir.IRResponse, msgID, model string) {
+	wire := (wireformat.AnthropicConverter{}).ResponseFromIR(resp, msgID, model)
+
 	flusher, ok := w.(http.Flusher)
 	if !ok {
-		a.WriteResponse(w, resp)
+		writeJSON(w, http.StatusOK, wire)
 		return
 	}
 	w.Header().Set("Content-Type", "text/event-stream")
@@ -70,13 +85,13 @@ func (a *AnthropicAdapter) WriteResponseAsStream(ctx context.Context, w http.Res
 	send("message_start", map[string]any{
 		"type": "message_start",
 		"message": map[string]any{
-			"id": resp.ID, "type": "message",
-			"role": "assistant", "model": resp.Model,
+			"id": wire.ID, "type": "message",
+			"role": "assistant", "model": wire.Model,
 			"content": []any{},
 			"usage":   map[string]any{"input_tokens": 0},
 		},
 	})
-	for i, block := range resp.Content {
+	for i, block := range wire.Content {
 		if block.Type != "text" {
 			continue
 		}
@@ -93,13 +108,13 @@ func (a *AnthropicAdapter) WriteResponseAsStream(ctx context.Context, w http.Res
 	send("message_delta", map[string]any{
 		"type":  "message_delta",
 		"delta": map[string]any{"stop_reason": "end_turn", "stop_sequence": nil},
-		"usage": map[string]any{"output_tokens": resp.Usage.OutputTokens},
+		"usage": map[string]any{"output_tokens": wire.Usage.OutputTokens},
 	})
 	send("message_stop", map[string]any{"type": "message_stop"})
 }
 
 // WriteStream delivers Anthropic SSE events to the client.
-func (a *AnthropicAdapter) WriteStream(ctx context.Context, w http.ResponseWriter, _ *types.MessageRequest, src <-chan types.SSEEvent) error {
+func (a *AnthropicAdapter) WriteStream(ctx context.Context, w http.ResponseWriter, model string, src <-chan ir.StreamEvent) error {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		return fmt.Errorf("streaming not supported by server configuration")
@@ -110,11 +125,17 @@ func (a *AnthropicAdapter) WriteStream(ctx context.Context, w http.ResponseWrite
 	w.Header().Set("X-Accel-Buffering", "no")
 	w.WriteHeader(http.StatusOK)
 
+	wire := make(chan types.SSEEvent, 32)
+	go func() {
+		defer close(wire)
+		(wireformat.AnthropicConverter{}).StreamFromIR(ctx, src, wire, idgen.NewMsgID(), model)
+	}()
+
 	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case ev, ok := <-src:
+		case ev, ok := <-wire:
 			if !ok {
 				return nil
 			}

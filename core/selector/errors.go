@@ -39,3 +39,27 @@ func (e *ServerOverloadError) Is(target error) bool {
 }
 
 var ErrServerOverload error = &ServerOverloadError{}
+
+// DeadlineExhaustedError is passed to Release when the shared retry-loop
+// context deadline ran out before this credential's request could complete.
+// It reflects the request's timeout budget, not the credential's health, so
+// Release must leave failure and rate-limit counters untouched.
+type DeadlineExhaustedError struct {
+	Err error // the underlying context/network error, for logging
+}
+
+func (e *DeadlineExhaustedError) Error() string {
+	if e.Err != nil {
+		return "retry budget exhausted: " + e.Err.Error()
+	}
+	return "retry budget exhausted"
+}
+
+func (e *DeadlineExhaustedError) Unwrap() error { return e.Err }
+
+func (e *DeadlineExhaustedError) Is(target error) bool {
+	_, ok := target.(*DeadlineExhaustedError)
+	return ok
+}
+
+var ErrDeadlineExhausted error = &DeadlineExhaustedError{}

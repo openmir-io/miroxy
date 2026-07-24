@@ -37,7 +37,7 @@ providers:
 
   # ── OpenRouter (third-party aggregator) ───────────────────────────────────
   # OpenRouter exposes an OpenAI-compatible API and routes to many providers.
-  # Set provider_model to the OpenRouter model name (e.g. "anthropic/claude-3-5-sonnet").
+  # Set upstream_model to the OpenRouter model name (e.g. "anthropic/claude-3-5-sonnet").
   openrouter:
     base_url: https://openrouter.ai/api/v1
     protocol: openai
@@ -62,20 +62,24 @@ providers:
 
 credpools:
   deepseek-pool:
+    provider_ref: deepseek
     strategy: round_robin
     keys:
       - main:   ${DEEPSEEK_KEY_1}
       - backup: ${DEEPSEEK_KEY_2}
 
   grok-pool:
+    provider_ref: grok
     keys:
       - main_key: ${GROK_KEY}
 
   glm-pool:
+    provider_ref: glm
     keys:
       - main_key: ${GLM_KEY}
 
   openrouter-pool:
+    provider_ref: openrouter
     keys:
       - main_key: ${OPENROUTER_KEY}
 
@@ -84,23 +88,19 @@ model_routes:
     routing:
       strategy: fallback
       targets:
-        - provider: deepseek
-          provider_model: deepseek-chat
+        - upstream_model: deepseek-chat
           credpool_ref: deepseek-pool
           timeout_seconds: 30
-        - provider: grok
-          provider_model: grok-3-mini
+        - upstream_model: grok-3-mini
           credpool_ref: grok-pool
           timeout_seconds: 30
 
   - model_name: miroxy-reasoning
-    provider: deepseek
-    provider_model: deepseek-reasoner
+    upstream_model: deepseek-reasoner
     credpool_ref: deepseek-pool
     timeout_seconds: 120
 
   - model_name: miroxy-openrouter
-    provider: openrouter
-    provider_model: anthropic/claude-sonnet-4-5   # OpenRouter model name
+    upstream_model: anthropic/claude-sonnet-4-5   # OpenRouter model name
     credpool_ref: openrouter-pool
     timeout_seconds: 60

@@ -9,8 +9,14 @@ import (
 	"time"
 )
 
-// Stats accumulates compression statistics across all requests.
-// Safe for concurrent use.
+// Stats accumulates compression statistics across all requests, with a
+// per-model-route breakdown. Safe for concurrent use.
+//
+// There is no per-provider/credpool/credential breakdown: compression runs
+// before credential selection in the pipeline (CompressPlugin at priority
+// 350, UpstreamExecutor's Select() at 1000) — a given compression pass
+// cannot yet know which of a pool's credentials will end up serving the
+// request. Model route is the deepest dimension that is causally meaningful.
 type Stats struct {
 	mu sync.Mutex
 
@@ -19,13 +25,22 @@ type Stats struct {
 	CompressedTokens atomic.Int64
 
 	// strategy counters: strategy label → (count, tokens_saved)
-	strategyCount  map[string]int64
-	strategySaved  map[string]int64
+	strategyCount map[string]int64
+	strategySaved map[string]int64
 
 	// latency histogram (microseconds)
 	latencies []int64
 
+	models map[string]*modelCounter
+
 	startedAt time.Time
+}
+
+// modelCounter holds compression counters for one model route.
+type modelCounter struct {
+	requests         int64
+	originalTokens   int64
+	compressedTokens int64
 }
 
 // NewStats creates a zeroed Stats tracker.
@@ -33,13 +48,14 @@ func NewStats() *Stats {
 	return &Stats{
 		strategyCount: make(map[string]int64),
 		strategySaved: make(map[string]int64),
+		models:        make(map[string]*modelCounter),
 		startedAt:     time.Now(),
 	}
 }
 
-// Record registers one compression result.
+// Record registers one compression result for model.
 // latencyUs is the compression duration in microseconds.
-func (s *Stats) Record(result *Result, latencyUs int64) {
+func (s *Stats) Record(model string, result *Result, latencyUs int64) {
 	s.Requests.Add(1)
 	s.OriginalTokens.Add(int64(result.OriginalTokens))
 	s.CompressedTokens.Add(int64(result.CompressedTokens))
@@ -56,6 +72,17 @@ func (s *Stats) Record(result *Result, latencyUs int64) {
 	if latencyUs > 0 {
 		s.latencies = append(s.latencies, latencyUs)
 	}
+	if s.models == nil {
+		s.models = make(map[string]*modelCounter)
+	}
+	mc, ok := s.models[model]
+	if !ok {
+		mc = &modelCounter{}
+		s.models[model] = mc
+	}
+	mc.requests++
+	mc.originalTokens += int64(result.OriginalTokens)
+	mc.compressedTokens += int64(result.CompressedTokens)
 	s.mu.Unlock()
 }
 
@@ -90,6 +117,22 @@ func (s *Stats) Snapshot() StatsSnapshot {
 		maxLat = lats[len(lats)-1]
 	}
 
+	names := make([]string, 0, len(s.models))
+	for name := range s.models {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	models := make([]ModelSnapshot, 0, len(names))
+	for _, name := range names {
+		mc := s.models[name]
+		models = append(models, ModelSnapshot{
+			Name:             name,
+			Requests:         mc.requests,
+			OriginalTokens:   mc.originalTokens,
+			CompressedTokens: mc.compressedTokens,
+		})
+	}
+
 	orig := s.OriginalTokens.Load()
 	comp := s.CompressedTokens.Load()
 	reqs := s.Requests.Load()
@@ -104,9 +147,53 @@ func (s *Stats) Snapshot() StatsSnapshot {
 		LatencyP50Us:     p50,
 		LatencyP95Us:     p95,
 		LatencyMaxUs:     maxLat,
+		Models:           models,
 		StartedAt:        s.startedAt,
 		SnapshotAt:       time.Now(),
 	}
+}
+
+// Restore reseeds global and per-model counters from a prior snapshot (e.g.
+// loaded from persistence at startup). Strategy/latency history is not
+// restored — those are session-scoped diagnostics, not billing-relevant
+// totals. Call once, before any concurrent Record calls begin.
+func (s *Stats) Restore(totalReqs, totalOriginal, totalCompressed int64, models []ModelSnapshot) {
+	s.Requests.Store(totalReqs)
+	s.OriginalTokens.Store(totalOriginal)
+	s.CompressedTokens.Store(totalCompressed)
+
+	s.mu.Lock()
+	if s.models == nil {
+		s.models = make(map[string]*modelCounter)
+	}
+	for _, msnap := range models {
+		s.models[msnap.Name] = &modelCounter{
+			requests:         msnap.Requests,
+			originalTokens:   msnap.OriginalTokens,
+			compressedTokens: msnap.CompressedTokens,
+		}
+	}
+	s.mu.Unlock()
+}
+
+// ModelSnapshot is a point-in-time copy of one model route's compression
+// counters.
+type ModelSnapshot struct {
+	Name             string
+	Requests         int64
+	OriginalTokens   int64
+	CompressedTokens int64
+}
+
+// SavedTokens returns OriginalTokens - CompressedTokens.
+func (m ModelSnapshot) SavedTokens() int64 { return m.OriginalTokens - m.CompressedTokens }
+
+// ReductionPct returns the percentage of tokens removed (0–100) for this model.
+func (m ModelSnapshot) ReductionPct() float64 {
+	if m.OriginalTokens == 0 {
+		return 0
+	}
+	return float64(m.SavedTokens()) / float64(m.OriginalTokens) * 100
 }
 
 // StatsSnapshot is an immutable point-in-time view of Stats.
@@ -125,6 +212,9 @@ type StatsSnapshot struct {
 	LatencyP50Us int64
 	LatencyP95Us int64
 	LatencyMaxUs int64
+
+	// Models is the per-model-route breakdown, sorted by name.
+	Models []ModelSnapshot
 
 	StartedAt  time.Time
 	SnapshotAt time.Time
@@ -153,6 +243,16 @@ func (s StatsSnapshot) Format() string {
 	fmt.Fprintf(&b, "Tokens:      %s -> %s (%.1f%% reduction)\n",
 		commaInt(s.OriginalTokens), commaInt(s.CompressedTokens), s.ReductionPct())
 	fmt.Fprintf(&b, "Total saved: %s tokens\n\n", commaInt(s.SavedTokens))
+
+	if len(s.Models) > 0 {
+		fmt.Fprintf(&b, "Per-Model Breakdown\n")
+		fmt.Fprintf(&b, "%s\n", strings.Repeat("-", 40))
+		for _, m := range s.Models {
+			fmt.Fprintf(&b, "  %-22s %5d reqs, %s -> %s saved (%.1f%%)\n",
+				m.Name+":", m.Requests, commaInt(m.OriginalTokens), commaInt(m.SavedTokens()), m.ReductionPct())
+		}
+		fmt.Fprintf(&b, "\n")
+	}
 
 	if len(s.StrategyCount) > 0 {
 		fmt.Fprintf(&b, "Strategy Breakdown\n")

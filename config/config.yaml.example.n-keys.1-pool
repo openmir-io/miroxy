@@ -16,6 +16,7 @@ providers:
 
 credpools:
   gemini-pool:
+    provider_ref: gemini
     strategy: least_requests       # pick key with fewest in-flight requests
     circuit_break_threshold: 5     # mark key unhealthy after 5 consecutive failures
     cooldown_seconds: 60
@@ -28,7 +29,6 @@ credpools:
 
 model_routes:
   - model_name: miroxy
-    provider: gemini
-    provider_model: gemini-2.5-flash
+    upstream_model: gemini-2.5-flash
     credpool_ref: gemini-pool
     timeout_seconds: 30

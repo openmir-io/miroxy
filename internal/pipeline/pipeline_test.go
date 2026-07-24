@@ -5,9 +5,9 @@ import (
 	"errors"
 	"testing"
 
+	"miroxy/core/ir"
 	"miroxy/core/router"
 	"miroxy/internal/pipeline"
-	"miroxy/internal/types"
 )
 
 // stub plugin for testing
@@ -24,8 +24,8 @@ func (s *stubPlugin) Execute(c *pipeline.LLMContext, next pipeline.Handler) erro
 }
 
 func newCtx() *pipeline.LLMContext {
-	req := &types.MessageRequest{Model: "test", MaxTokens: 100}
-	return pipeline.NewContext(context.Background(), req, router.RouteTarget{})
+	req := &ir.IRRequest{Gen: ir.IRGenerationConfig{MaxTokens: 100}}
+	return pipeline.NewContext(context.Background(), req, "test", router.RouteTarget{})
 }
 
 // TestPipeline_OrdersByPriority verifies plugins run in ascending priority order

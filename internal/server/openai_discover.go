@@ -34,6 +34,7 @@ func tryInjectOpenAIModels(cfg *config.Config) {
 		configured[m.ModelName] = true
 	}
 
+	pool := cfg.CredPools[poolName]
 	injected := 0
 	for _, m := range models {
 		if configured[m.ID] {
@@ -46,7 +47,10 @@ func tryInjectOpenAIModels(cfg *config.Config) {
 		cfg.ModelRoutes = append(cfg.ModelRoutes, config.ModelEntry{
 			ModelName:     m.ID,
 			DisplayName:   display,
-			ProviderRef:   "openai",
+			ProviderRef:   pool.ProviderRef,
+			Protocol:      pool.Protocol,
+			APIBase:       pool.APIBase,
+			AuthStyle:     pool.AuthStyle,
 			UpstreamModel: m.ID,
 			CredpoolRef:   poolName,
 		})
@@ -56,47 +60,25 @@ func tryInjectOpenAIModels(cfg *config.Config) {
 	slog.Info("model_discovery: injected OpenAI models", "count", injected, "pool", poolName)
 }
 
-// findOpenAIPoolKey returns the first credpool configured for OpenAI.
-// Checks in order:
-//  1. Credpools with upstream_model_type: "openai" tag (explicit, no model_routes needed)
-//  2. Model routes with provider_ref: "openai" referencing a named credpool (legacy)
+// findOpenAIPoolKey returns the first credpool that opted into
+// native_passthrough for the openai protocol — the same signal that marks a
+// pool as genuinely holding OpenAI's own keys (see
+// CredPoolCfg.NativePassthrough), since discovery calls the real
+// api.openai.com/v1/models endpoint with this pool's key.
 func findOpenAIPoolKey(cfg *config.Config) (poolName, key, baseURL string) {
-	// 1. Explicit credpool tag.
 	for name, pool := range cfg.CredPools {
-		if pool.UpstreamModelType == "openai" && len(pool.Keys) > 0 {
-			base := resolveOpenAIBaseFromPool(cfg, name)
-			return name, pool.Keys[0].Key, base
+		if pool.NativePassthrough && pool.Protocol == "openai" && len(pool.Keys) > 0 {
+			return name, pool.Keys[0].Key, resolveOpenAIBase(cfg, name)
 		}
-	}
-	// 2. Infer from model_routes (backward compat).
-	for _, m := range cfg.ModelRoutes {
-		if m.ProviderRef != "openai" || m.CredpoolRef == "" {
-			continue
-		}
-		pool, ok := cfg.CredPools[m.CredpoolRef]
-		if !ok || len(pool.Keys) == 0 {
-			continue
-		}
-		base := resolveOpenAIBase(cfg, m)
-		return m.CredpoolRef, pool.Keys[0].Key, base
 	}
 	return "", "", ""
 }
 
-// resolveOpenAIBaseFromPool resolves the base URL for a pool identified by name
-// (used when the pool has no associated model_route to read api_base from).
-func resolveOpenAIBaseFromPool(cfg *config.Config, _ string) string {
-	if p, ok := cfg.Providers["openai"]; ok && p.BaseURL != "" {
-		return strings.TrimRight(p.BaseURL, "/")
-	}
-	return "https://api.openai.com/v1"
-}
-
 // resolveOpenAIBase returns the base URL for the OpenAI-compatible endpoint,
-// checking the model entry's api_base, then the providers block, then the default.
-func resolveOpenAIBase(cfg *config.Config, m config.ModelEntry) string {
-	if m.APIBase != "" {
-		return strings.TrimRight(m.APIBase, "/")
+// checking the pool's resolved api_base, then the providers block, then the default.
+func resolveOpenAIBase(cfg *config.Config, poolName string) string {
+	if kp, ok := cfg.CredPools[poolName]; ok && kp.APIBase != "" {
+		return strings.TrimRight(kp.APIBase, "/")
 	}
 	if p, ok := cfg.Providers["openai"]; ok && p.BaseURL != "" {
 		return strings.TrimRight(p.BaseURL, "/")

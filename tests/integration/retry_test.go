@@ -252,3 +252,119 @@ func TestRetry_RateLimitCooldown_KeyNotReusedDuringWindow(t *testing.T) {
 		t.Errorf("bad-key hit %d times — should be exactly 1 (in 60 s cooldown for request 2)", hitCount["bad-key"])
 	}
 }
+
+// TestRetry_NonStream_404OnFirstKey_RetriesToSecondKey verifies that a
+// non-429/5xx error (404 — e.g. a deprecated model on this one target) also
+// triggers a transparent failover, not just 429/5xx. Before this fix, any
+// status outside {429, 5xx} was passed straight through to the client on
+// the very first attempt, even with other keys/targets still available.
+func TestRetry_NonStream_404OnFirstKey_RetriesToSecondKey(t *testing.T) {
+	const (
+		goodKey = "good-key"
+		badKey  = "bad-key"
+	)
+
+	stub := newStubGemini(t, map[string]http.HandlerFunc{
+		badKey: gemini404Handler,
+	}, nil)
+	defer stub.Close()
+
+	miroxy := newTestServer(t, miroxyConfig{
+		keys:    []string{goodKey, badKey}, // round-robin picks badKey first
+		stubURL: stub.URL,
+	})
+	defer miroxy.Close()
+
+	resp := doPost(t, miroxy.URL, nonStreamBody)
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 after transparent failover past 404, got %d", resp.StatusCode)
+	}
+
+	var msg types.MessageResponse
+	decodeJSON(t, resp.Body, &msg)
+	if msg.Role != "assistant" {
+		t.Errorf("role after failover: got %q, want assistant", msg.Role)
+	}
+}
+
+// TestRetry_Stream_404OnFirstKey_RetriesToSecondKey is the streaming
+// counterpart of TestRetry_NonStream_404OnFirstKey_RetriesToSecondKey.
+func TestRetry_Stream_404OnFirstKey_RetriesToSecondKey(t *testing.T) {
+	const (
+		goodKey = "good-key"
+		badKey  = "bad-key"
+	)
+
+	streamHandler := func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("key") == badKey {
+			gemini404Handler(w, r)
+			return
+		}
+		defaultStreamResp(w, r)
+	}
+
+	stub := newStubGemini(t, nil, streamHandler)
+	defer stub.Close()
+
+	miroxy := newTestServer(t, miroxyConfig{
+		keys:    []string{goodKey, badKey},
+		stubURL: stub.URL,
+	})
+	defer miroxy.Close()
+
+	resp := doPost(t, miroxy.URL, streamBody)
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 streaming response after failover past 404, got %d", resp.StatusCode)
+	}
+
+	events := readSSEEvents(t, resp.Body)
+	hasStop := false
+	for _, e := range events {
+		if e.event == "message_stop" {
+			hasStop = true
+		}
+	}
+	if !hasStop {
+		t.Errorf("missing message_stop; got %d events", len(events))
+	}
+}
+
+// TestRetry_AllKeys404_Returns503 verifies that when every key/target is
+// exhausted on non-429/5xx errors too (not just 429), the server still
+// reaches the same allKeysFailed aggregation path and returns 503 — the
+// retry loop must not hang or return a bare 404 once truly nothing is left.
+func TestRetry_AllKeys404_Returns503(t *testing.T) {
+	const (
+		keyA = "key-a"
+		keyB = "key-b"
+	)
+
+	stub := newStubGemini(t, map[string]http.HandlerFunc{
+		keyA: gemini404Handler,
+		keyB: gemini404Handler,
+	}, nil)
+	defer stub.Close()
+
+	miroxy := newTestServer(t, miroxyConfig{
+		keys:    []string{keyA, keyB},
+		stubURL: stub.URL,
+	})
+	defer miroxy.Close()
+
+	resp := doPost(t, miroxy.URL, nonStreamBody)
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503 when all keys/targets exhausted, got %d", resp.StatusCode)
+	}
+
+	var errResp types.ErrorResponse
+	decodeJSON(t, resp.Body, &errResp)
+	if errResp.Error.Type != "overloaded_error" {
+		t.Errorf("error type: got %q, want overloaded_error", errResp.Error.Type)
+	}
+}

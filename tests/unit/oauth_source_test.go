@@ -130,7 +130,7 @@ func TestCredPool_SourceError_ReturnsError(t *testing.T) {
 		Cooldown:  5 * time.Second,
 	})
 
-	_, err := pool.Select(context.Background(), nil)
+	_, err := pool.Select(context.Background(), nil, "test-model")
 	if err == nil {
 		t.Fatal("expected error when source fails, got nil")
 	}
@@ -145,9 +145,9 @@ func TestCredPool_SourceError_CircuitBreaks(t *testing.T) {
 		Cooldown:  5 * time.Second,
 	})
 
-	_, _ = pool.Select(context.Background(), nil) // triggers circuit break at threshold=1
+	_, _ = pool.Select(context.Background(), nil, "test-model") // triggers circuit break at threshold=1
 
-	_, err := pool.Select(context.Background(), nil)
+	_, err := pool.Select(context.Background(), nil, "test-model")
 	if !errors.Is(err, selector.ErrNoSelection) {
 		t.Errorf("expected ErrNoSelection after circuit break, got %v", err)
 	}

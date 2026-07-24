@@ -4,9 +4,11 @@ import (
 	"context"
 	"errors"
 	"sort"
+	"strconv"
 	"sync/atomic"
+	"time"
 
-	"miroxy/internal/types"
+	"miroxy/core/ir"
 )
 
 // routingTarget is one upstream candidate within a RoutingSelector.
@@ -29,29 +31,50 @@ type RoutingSelector struct {
 	strategy string
 	targets  []*routingTarget
 	rrIdx    atomic.Uint64
+
+	affinity *affinityMap // nil unless Sticky was set; no-op for "fallback"
 }
 
-// NewRoutingSelector creates a RoutingSelector with the given strategy and selectors.
-// strategy defaults to "fallback" when empty.
-func NewRoutingSelector(strategy string, selectors []Selector) *RoutingSelector {
+// RoutingSelectorConfig configures a RoutingSelector.
+type RoutingSelectorConfig struct {
+	Strategy  string // fallback | round_robin | least_requests; default fallback
+	Selectors []Selector
+
+	// Sticky keeps a conversation on the same target across calls. No
+	// effect on "fallback", which is already fixed-order every time.
+	Sticky    bool
+	StickyTTL time.Duration // idle expiry for a sticky binding; default 30m
+}
+
+// NewRoutingSelector creates a RoutingSelector from cfg.
+func NewRoutingSelector(cfg RoutingSelectorConfig) *RoutingSelector {
+	strategy := cfg.Strategy
 	if strategy == "" {
 		strategy = "fallback"
 	}
-	targets := make([]*routingTarget, len(selectors))
-	for i, s := range selectors {
+	targets := make([]*routingTarget, len(cfg.Selectors))
+	for i, s := range cfg.Selectors {
 		targets[i] = &routingTarget{sel: s}
 	}
-	return &RoutingSelector{strategy: strategy, targets: targets}
+	r := &RoutingSelector{strategy: strategy, targets: targets}
+	if cfg.Sticky {
+		ttl := cfg.StickyTTL
+		if ttl <= 0 {
+			ttl = 30 * time.Minute
+		}
+		r.affinity = newAffinityMap(ttl)
+	}
+	return r
 }
 
-func (r *RoutingSelector) Select(ctx context.Context, req *types.MessageRequest) (*ExecutionPlan, error) {
+func (r *RoutingSelector) Select(ctx context.Context, req *ir.IRRequest, model string) (*ExecutionPlan, error) {
 	switch r.strategy {
 	case "round_robin":
-		return r.selectRoundRobin(ctx, req)
+		return r.selectRoundRobin(ctx, req, model)
 	case "least_requests":
-		return r.selectLeastRequests(ctx, req)
+		return r.selectLeastRequests(ctx, req, model)
 	default:
-		return r.selectFallback(ctx, req)
+		return r.selectFallback(ctx, req, model)
 	}
 }
 
@@ -63,9 +86,9 @@ func (r *RoutingSelector) Release(plan *ExecutionPlan, err error) {
 	}
 }
 
-func (r *RoutingSelector) selectFallback(ctx context.Context, req *types.MessageRequest) (*ExecutionPlan, error) {
+func (r *RoutingSelector) selectFallback(ctx context.Context, req *ir.IRRequest, model string) (*ExecutionPlan, error) {
 	for _, t := range r.targets {
-		plan, err := t.sel.Select(ctx, req)
+		plan, err := t.sel.Select(ctx, req, model)
 		if errors.Is(err, ErrNoSelection) {
 			continue
 		}
@@ -77,24 +100,42 @@ func (r *RoutingSelector) selectFallback(ctx context.Context, req *types.Message
 	return nil, ErrNoSelection
 }
 
-func (r *RoutingSelector) selectRoundRobin(ctx context.Context, req *types.MessageRequest) (*ExecutionPlan, error) {
+func (r *RoutingSelector) selectRoundRobin(ctx context.Context, req *ir.IRRequest, model string) (*ExecutionPlan, error) {
+	key := r.sessionKey(req, model)
+	if key != "" {
+		if plan, ok := r.trySticky(ctx, req, model, key); ok {
+			return plan, nil
+		}
+	}
+
 	n := uint64(len(r.targets))
 	startIdx := r.rrIdx.Add(1) % n
 	for i := uint64(0); i < n; i++ {
-		t := r.targets[(startIdx+i)%n]
-		plan, err := t.sel.Select(ctx, req)
+		idx := (startIdx + i) % n
+		t := r.targets[idx]
+		plan, err := t.sel.Select(ctx, req, model)
 		if errors.Is(err, ErrNoSelection) {
 			continue
 		}
 		if err != nil {
 			return nil, err
 		}
+		if key != "" {
+			r.affinity.Set(key, strconv.Itoa(int(idx)))
+		}
 		return r.wrapPlan(plan, t), nil
 	}
 	return nil, ErrNoSelection
 }
 
-func (r *RoutingSelector) selectLeastRequests(ctx context.Context, req *types.MessageRequest) (*ExecutionPlan, error) {
+func (r *RoutingSelector) selectLeastRequests(ctx context.Context, req *ir.IRRequest, model string) (*ExecutionPlan, error) {
+	key := r.sessionKey(req, model)
+	if key != "" {
+		if plan, ok := r.trySticky(ctx, req, model, key); ok {
+			return plan, nil
+		}
+	}
+
 	// Sort by current inFlight ascending, try in that order.
 	order := make([]int, len(r.targets))
 	for i := range order {
@@ -105,16 +146,47 @@ func (r *RoutingSelector) selectLeastRequests(ctx context.Context, req *types.Me
 	})
 	for _, idx := range order {
 		t := r.targets[idx]
-		plan, err := t.sel.Select(ctx, req)
+		plan, err := t.sel.Select(ctx, req, model)
 		if errors.Is(err, ErrNoSelection) {
 			continue
 		}
 		if err != nil {
 			return nil, err
 		}
+		if key != "" {
+			r.affinity.Set(key, strconv.Itoa(idx))
+		}
 		return r.wrapPlan(plan, t), nil
 	}
 	return nil, ErrNoSelection
+}
+
+// sessionKey returns "" when sticky is disabled, so callers can use it
+// directly as the "skip stickiness" sentinel.
+func (r *RoutingSelector) sessionKey(req *ir.IRRequest, model string) string {
+	if r.affinity == nil {
+		return ""
+	}
+	return SessionKeyFromRequest(req, model)
+}
+
+// trySticky attempts the target bound to key. ok is false on no binding, an
+// out-of-range index, or nothing available — callers fall through on false.
+func (r *RoutingSelector) trySticky(ctx context.Context, req *ir.IRRequest, model, key string) (*ExecutionPlan, bool) {
+	idxStr, ok := r.affinity.Get(key)
+	if !ok {
+		return nil, false
+	}
+	idx, err := strconv.Atoi(idxStr)
+	if err != nil || idx < 0 || idx >= len(r.targets) {
+		return nil, false
+	}
+	t := r.targets[idx]
+	plan, err := t.sel.Select(ctx, req, model)
+	if err != nil {
+		return nil, false
+	}
+	return r.wrapPlan(plan, t), true
 }
 
 // wrapPlan increments the target's inFlight counter and sets plan.ReleaseHook

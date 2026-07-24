@@ -23,8 +23,7 @@ LLM providers (Gemini, DeepSeek, Anthropic, Bedrock, and more).
   • Hot reload config without dropping in-flight requests
 
 Examples:
-    miroxy serve                          Start with default config path
-    miroxy serve -c /etc/miroxy.yaml      Start with explicit config
+    miroxy serve -c config.yaml           Start the proxy server
     miroxy serve --port 9090              Override listen port
     miroxy health                         Check running instance health
     miroxy stat                           Show credpool and routing stats

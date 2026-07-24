@@ -1,7 +1,7 @@
 // Package upstream defines the south-side protocol adapter interface.
-// An UpstreamAdapter converts between the canonical Anthropic IR
-// (types.MessageRequest / types.MessageResponse / types.SSEEvent) and a
-// specific upstream provider's wire format.
+// An UpstreamAdapter converts between the canonical request/response types
+// and a specific upstream provider's wire format. Its streaming leg speaks
+// the neutral core/ir.StreamEvent — no client protocol is privileged here.
 //
 // Implementations live in internal/upstream/ and are injected into
 // ExecutionPlan at routing time.
@@ -12,7 +12,7 @@ import (
 	"net/http"
 
 	"miroxy/core/cred"
-	"miroxy/internal/types"
+	"miroxy/core/ir"
 )
 
 // UpstreamAdapter is the south-side protocol seam.
@@ -21,18 +21,16 @@ import (
 type UpstreamAdapter interface {
 	// ToUpstream builds the non-streaming HTTP request for this provider.
 	// The credential is applied before returning.
-	ToUpstream(ctx context.Context, req *types.MessageRequest, credential cred.Credential) (*http.Request, error)
+	ToUpstream(ctx context.Context, req *ir.IRRequest, credential cred.Credential) (*http.Request, error)
 
 	// ToUpstreamStream builds the streaming HTTP request for this provider.
 	// The credential is applied before returning.
-	ToUpstreamStream(ctx context.Context, req *types.MessageRequest, credential cred.Credential) (*http.Request, error)
+	ToUpstreamStream(ctx context.Context, req *ir.IRRequest, credential cred.Credential) (*http.Request, error)
 
 	// FromUpstream reads and closes resp.Body, returning a canonical response.
-	FromUpstream(resp *http.Response) (*types.MessageResponse, error)
+	FromUpstream(resp *http.Response) (*ir.IRResponse, error)
 
-	// StreamFromUpstream reads the provider SSE stream and emits canonical
-	// SSE events on the returned channel.  The channel is closed when the
-	// stream ends or ctx is cancelled.  The implementation is responsible for
-	// closing resp.Body.
-	StreamFromUpstream(ctx context.Context, resp *http.Response, msgID, modelAlias string) (<-chan types.SSEEvent, error)
+	// StreamFromUpstream reads the provider SSE stream and emits neutral IR
+	// stream events; closes the channel on stream end or ctx cancel, and owns closing resp.Body.
+	StreamFromUpstream(ctx context.Context, resp *http.Response, msgID, modelAlias string) (<-chan ir.StreamEvent, error)
 }
